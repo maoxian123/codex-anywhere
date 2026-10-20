@@ -64,3 +64,18 @@ test("both live native errors and completed-turn errors are extracted", () => {
     undefined,
   );
 });
+
+test("transient native errors that Codex will retry never become persistent operation errors", () => {
+  const event: HubEvent = {
+    type: "event",
+    id: 1,
+    thread_id: "t1",
+    method: "error",
+    params: { willRetry: true, error: { message: "Transient upstream error" } },
+  };
+  assert.equal(eventFailure(event), undefined);
+  assert.equal(
+    eventFailure({ ...event, params: { ...event.params, willRetry: false } }),
+    "Transient upstream error",
+  );
+});

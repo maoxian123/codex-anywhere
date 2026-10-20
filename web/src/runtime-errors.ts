@@ -24,7 +24,10 @@ export function commandFailure(command: Command): string | undefined {
 }
 
 export function eventFailure(event: HubEvent): string | undefined {
-  if (event.method === "error") return nativeErrorText(event.params.error);
+  if (event.method === "error")
+    return event.params.willRetry === true
+      ? undefined
+      : nativeErrorText(event.params.error);
   if (event.method === "turn/completed")
     return nativeErrorText(object(event.params.turn).error);
   if (event.method === "anywhere/command_completed") {

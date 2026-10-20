@@ -5,7 +5,10 @@ import base64
 import io
 import json
 import os
+import signal
+import struct
 import sys
+import zlib
 
 import httpx
 import pytest
@@ -69,6 +72,15 @@ for line in sys.stdin.buffer:
         emit({"id":rpc_id,"result":{"calls":calls,"params":call_params}})
     elif method == "die":
         os._exit(3)
+    elif method == "stopReading":
+        emit({"id":rpc_id,"result":{}})
+        time.sleep(30)
+    elif method in {"inheritPipes", "inheritPipesAndExit"}:
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL)
+        emit({"id":rpc_id,"result":{"childPid":child.pid}})
+        if method == "inheritPipesAndExit":
+            os._exit(3)
     elif rpc_id is not None:
         emit({"id":rpc_id,"result":{}})
 """
@@ -830,3 +842,198 @@ def test_outbox_retries_only_after_timeout_and_stops_after_ack(tmp_path, monkeyp
             service.store.close()
 
     asyncio.run(scenario())
+
+
+def test_rpc_deadline_includes_stdin_backpressure(peer):
+    async def scenario():
+        async def event(*args):
+            pass
+
+        runtime = CodexRuntime(peer, event, timeout=3)
+        await runtime.start()
+        try:
+            await runtime.request("stopReading", {})
+            runtime.timeout = 0.05
+            before = asyncio.get_running_loop().time()
+            with pytest.raises(RuntimeGone, match="timed out"):
+                await asyncio.wait_for(
+                    runtime.request("echo", {"text": "x" * (2 * 1024 * 1024)}), 1
+                )
+            assert asyncio.get_running_loop().time() - before < 0.8
+            assert not runtime.pending
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_request_notification_and_answer_deadlines_include_writer_lock(peer):
+    async def scenario():
+        async def event(*args):
+            pass
+
+        runtime = CodexRuntime(peer, event, timeout=3)
+        await runtime.start()
+        runtime.timeout = 0.03
+        await runtime._write_lock.acquire()
+        try:
+            with pytest.raises(RuntimeGone, match="timed out"):
+                await asyncio.wait_for(runtime.request("echo", {}), 1)
+            with pytest.raises(RuntimeGone, match="timed out"):
+                await asyncio.wait_for(runtime.notify("notice", {}), 1)
+            runtime.server_requests["42"] = {"id": 42}
+            with pytest.raises(RuntimeGone, match="timed out"):
+                await asyncio.wait_for(runtime.answer(42, {"decision": "decline"}), 1)
+            assert not runtime.pending
+        finally:
+            runtime._write_lock.release()
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("callback_hangs", [False, True])
+def test_exit_callback_cannot_prevent_runtime_stopped(peer, monkeypatch, callback_hangs):
+    from codex_anywhere.node import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "PIPE_CLOSE_TIMEOUT", 0.05)
+
+    async def scenario():
+        called = asyncio.Event()
+
+        async def event(*args):
+            pass
+
+        async def exit_callback(*args):
+            called.set()
+            if callback_hangs:
+                await asyncio.Event().wait()
+            raise OSError("simulated persistence failure")
+
+        runtime = CodexRuntime(peer, event, exit_callback, timeout=3)
+        await runtime.start()
+        await asyncio.wait_for(runtime.close(), 1)
+        assert called.is_set() and runtime.stopped.is_set()
+        assert runtime._reader.done() and runtime._stderr.done()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_close_is_bounded_when_tool_child_inherits_output(peer, monkeypatch):
+    from codex_anywhere.node import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "PROCESS_STOP_TIMEOUT", 0.1)
+    monkeypatch.setattr(runtime_module, "PIPE_CLOSE_TIMEOUT", 0.2)
+
+    async def scenario():
+        async def event(*args):
+            pass
+
+        runtime = CodexRuntime(peer, event, timeout=3)
+        child_pid = None
+        try:
+            await runtime.start()
+            child_pid = (await runtime.request("inheritPipes", {}))["childPid"]
+            await asyncio.wait_for(runtime.close(), 1)
+            assert runtime.stopped.is_set()
+            assert runtime._reader.done() and runtime._stderr.done()
+            assert runtime.process.returncode is not None
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_detects_spontaneous_exit_despite_inherited_child_pipes(peer, monkeypatch):
+    from codex_anywhere.node import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "PROCESS_STOP_TIMEOUT", 0.05)
+    monkeypatch.setattr(runtime_module, "PIPE_CLOSE_TIMEOUT", 0.2)
+
+    async def scenario():
+        exits = []
+
+        async def event(*args):
+            pass
+
+        async def on_exit(epoch, code):
+            exits.append(code)
+
+        runtime = CodexRuntime(peer, event, on_exit, timeout=3)
+        child_pid = None
+        try:
+            await runtime.start()
+            child_pid = (await runtime.request("inheritPipesAndExit", {}))["childPid"]
+            await asyncio.wait_for(runtime.stopped.wait(), 1)
+            assert runtime.process.returncode == 3 and exits == [3]
+            assert runtime._reader.done()
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_output_image_batch_has_count_and_memory_limits(tmp_path, monkeypatch):
+    from codex_anywhere.node import assets as node_assets
+
+    data = png_bytes()
+    files = []
+    for index in range(5):
+        path = tmp_path / f"{index}.png"
+        path.write_bytes(data)
+        files.append(path)
+    text = "\n".join(f"![image](<{path}>)" for path in files)
+    monkeypatch.setattr(node_assets, "MAX_OUTPUT_IMAGES", 2)
+    assert len(extract_images({"type": "agentMessage", "text": text}, [str(tmp_path)])) == 2
+    monkeypatch.setattr(node_assets, "MAX_OUTPUT_IMAGES", 16)
+    monkeypatch.setattr(node_assets, "MAX_OUTPUT_BYTES", len(data) * 2)
+    sources = extract_images({"type": "agentMessage", "text": text}, [str(tmp_path)])
+    assert len(sources) == 2 and sum(len(source.data) for source in sources) == len(data) * 2
+
+
+def test_local_image_read_is_bounded_even_if_file_grows(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from codex_anywhere.node import assets as node_assets
+
+    image = tmp_path / "growing.png"
+    image.write_bytes(png_bytes())
+    limit = len(png_bytes()) + 5
+    monkeypatch.setattr(node_assets, "MAX_IMAGE_BYTES", limit)
+    original_open = Path.open
+    reads = []
+
+    class GrowingFile(io.BytesIO):
+        def read(self, size=-1):
+            reads.append(size)
+            return super().read(size)
+
+    def growing_open(path, *args, **kwargs):
+        if path == image:
+            return GrowingFile(png_bytes() + b"extra bytes" * 100)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", growing_open)
+    assert extract_images({"type": "imageView", "path": str(image)}, [str(tmp_path)]) == []
+    assert reads == [limit + 1]
+
+
+def test_image_pixel_limit_matches_hub_before_pixel_decode():
+    from codex_anywhere.node.assets import verified_image
+
+    data = bytearray(png_bytes())
+    # Amend only IHDR dimensions and CRC; no large pixel buffer is allocated.
+    data[16:24] = struct.pack(">II", 5001, 5000)
+    data[29:33] = struct.pack(">I", zlib.crc32(data[12:29]))
+    with pytest.raises(ValueError, match="25 megapixel"):
+        verified_image(bytes(data), "large.png")

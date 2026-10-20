@@ -20,6 +20,9 @@ from .store import NodeStore
 
 log = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 25_000_000
+MAX_OUTPUT_IMAGES = 16
+MAX_OUTPUT_BYTES = 40 * 1024 * 1024
 
 
 @dataclass
@@ -80,6 +83,8 @@ def verified_image(data: bytes, name: str, source_path: str | None = None) -> Im
         raise ValueError("Image exceeds the 20 MiB limit or is empty")
     try:
         with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                raise ValueError("Image exceeds the 25 megapixel limit")
             image_format = image.format
             image.verify()
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
@@ -108,13 +113,49 @@ def _base64_image(value: str, name: str) -> ImageSource:
 
 def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list[ImageSource]:
     result: list[ImageSource] = []
+    seen_paths: set[str] = set()
+    seen_images: set[tuple[str, str | None]] = set()
+    total_bytes = 0
+    warned = False
+
+    def warn_limit() -> None:
+        nonlocal warned
+        if not warned:
+            log.warning("Output image count or total size limit reached; excess images skipped")
+            warned = True
+
+    def append(source: ImageSource) -> None:
+        nonlocal total_bytes
+        key = (hashlib.sha256(source.data).hexdigest(), source.source_path)
+        if key in seen_images:
+            return
+        if len(result) >= MAX_OUTPUT_IMAGES or total_bytes + len(source.data) > MAX_OUTPUT_BYTES:
+            warn_limit()
+            return
+        seen_images.add(key)
+        total_bytes += len(source.data)
+        result.append(source)
 
     def local(value: str) -> None:
+        remaining = min(MAX_IMAGE_BYTES, MAX_OUTPUT_BYTES - total_bytes)
+        if len(result) >= MAX_OUTPUT_IMAGES or remaining <= 0:
+            warn_limit()
+            return
         try:
             path = checked_path(value, roots, base=cwd)
-            if path.stat().st_size > MAX_IMAGE_BYTES:
+            if str(path) in seen_paths:
                 return
-            result.append(verified_image(path.read_bytes(), path.name, str(path)))
+            seen_paths.add(str(path))
+            if path.stat().st_size > remaining:
+                warn_limit()
+                return
+            # A file can grow after stat(). Bound the read itself as well.
+            with path.open("rb") as stream:
+                data = stream.read(remaining + 1)
+            if len(data) > remaining:
+                warn_limit()
+                return
+            append(verified_image(data, path.name, str(path)))
         except (ValueError, OSError):
             # Missing and unauthorized files are intentionally not read or uploaded.
             return
@@ -126,15 +167,18 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
             local(item["savedPath"])
         if not result and isinstance(item.get("result"), str):
             try:
-                result.append(_base64_image(item["result"], "generated.png"))
+                append(_base64_image(item["result"], "generated.png"))
             except ValueError:
                 pass
 
     def visit(value) -> None:
+        if len(result) >= MAX_OUTPUT_IMAGES:
+            warn_limit()
+            return
         if isinstance(value, dict):
             if value.get("type") == "image" and isinstance(value.get("data"), str):
                 try:
-                    result.append(_base64_image(value["data"], "tool-image.png"))
+                    append(_base64_image(value["data"], "tool-image.png"))
                 except ValueError:
                     pass
             image_key = {"inputImage": "imageUrl", "input_image": "image_url"}.get(
@@ -146,7 +190,7 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
                 # bridge only accepts embedded bytes and never fetches a URL.
                 if encoded.startswith("data:image/"):
                     try:
-                        result.append(_base64_image(encoded, "tool-image.png"))
+                        append(_base64_image(encoded, "tool-image.png"))
                     except ValueError:
                         pass
             # Only output text fields, never arguments/code/paths, are parsed.
@@ -175,11 +219,7 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
                 visit(block)
 
     visit(item)
-    unique = {}
-    for source in result:
-        key = (hashlib.sha256(source.data).hexdigest(), source.source_path)
-        unique[key] = source
-    return list(unique.values())
+    return result
 
 
 class AssetBridge:

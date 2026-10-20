@@ -126,6 +126,10 @@ function Workspace({
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
   const threadFetchRef = useRef(0);
+  const listFetchRef = useRef(0);
+  const threadRequests = useRef(
+    new Map<string, { again: boolean; promise: Promise<void> }>(),
+  );
   const liveRef = useRef(true);
   const commandWatches = useRef(new Set<string>());
   const eventRef = useRef<(event: HubEvent) => void>(() => {});
@@ -192,61 +196,83 @@ function Workspace({
   }, []);
 
   const refreshList = useCallback(async () => {
+    const request = ++listFetchRef.current;
     try {
       const query = searchRef.current;
       const [hostData, threadData] = await Promise.all([
         api<{ hosts: Host[] }>("/hosts"),
         api<{ threads: Thread[] }>(`/threads?q=${encodeURIComponent(query)}`),
       ]);
-      if (liveRef.current && query === searchRef.current) {
+      if (
+        liveRef.current &&
+        request === listFetchRef.current &&
+        query === searchRef.current
+      ) {
         setHosts(hostData.hosts);
         setThreads(threadData.threads);
         setNetworkError("");
       }
     } catch (reason) {
-      if (liveRef.current) setNetworkError(errorText(reason));
+      if (liveRef.current && request === listFetchRef.current)
+        setNetworkError(errorText(reason));
     } finally {
-      if (liveRef.current) setLoading(false);
+      if (liveRef.current && request === listFetchRef.current)
+        setLoading(false);
     }
   }, []);
   const refreshThread = useCallback(async (id = selectedRef.current) => {
     if (!id) return;
-    const request = ++threadFetchRef.current;
-    try {
-      const value = await api<ThreadDetail>(
-        `/threads/${encodeURIComponent(id)}`,
-      );
-      if (
-        liveRef.current &&
-        id === selectedRef.current &&
-        request === threadFetchRef.current
-      ) {
-        setDetail(value);
-        setThreadError("");
-        setStreams((current) =>
-          Object.fromEntries(
-            Object.entries(current).filter(
-              ([key]) => !completedStreams.current.has(key),
-            ),
-          ),
-        );
-        completedStreams.current.clear();
-      }
-    } catch (reason) {
-      if (
-        liveRef.current &&
-        id === selectedRef.current &&
-        request === threadFetchRef.current
-      )
-        setThreadError(errorText(reason));
-    } finally {
-      if (
-        liveRef.current &&
-        id === selectedRef.current &&
-        request === threadFetchRef.current
-      )
-        setLoadingThread(false);
+    const existing = threadRequests.current.get(id);
+    if (existing) {
+      existing.again = true;
+      return existing.promise;
     }
+    const entry = { again: false, promise: Promise.resolve() };
+    threadRequests.current.set(id, entry);
+    entry.promise = (async () => {
+      do {
+        entry.again = false;
+        const request = ++threadFetchRef.current;
+        try {
+          const value = await api<ThreadDetail>(
+            `/threads/${encodeURIComponent(id)}`,
+          );
+          if (
+            liveRef.current &&
+            id === selectedRef.current &&
+            request === threadFetchRef.current
+          ) {
+            setDetail(value);
+            setThreadError("");
+            setStreams((current) =>
+              Object.fromEntries(
+                Object.entries(current).filter(
+                  ([key]) => !completedStreams.current.has(key),
+                ),
+              ),
+            );
+            completedStreams.current.clear();
+          }
+        } catch (reason) {
+          if (
+            liveRef.current &&
+            id === selectedRef.current &&
+            request === threadFetchRef.current
+          )
+            setThreadError(errorText(reason));
+        } finally {
+          if (
+            liveRef.current &&
+            id === selectedRef.current &&
+            request === threadFetchRef.current
+          )
+            setLoadingThread(false);
+        }
+      } while (entry.again && liveRef.current && id === selectedRef.current);
+    })().finally(() => {
+      threadRequests.current.delete(id);
+    });
+    return entry.promise;
   }, []);
   const scheduleRefresh = useCallback(
     (listOnly = false) => {
@@ -304,8 +330,7 @@ function Workspace({
     if (!method.includes("/delta") && !method.endsWith("/outputDelta"))
       scheduleRefresh(true);
     const failure = eventFailure(event);
-    if (failure && (current || method === "anywhere/command_completed"))
-      setError(failure);
+    if (failure && current) setError(failure);
   };
 
   useEffect(() => {
@@ -365,7 +390,7 @@ function Workspace({
   }, [cursorKey, refreshList, refreshThread]);
 
   const watchCommand = useCallback(
-    (command: Command) => {
+    (command: Command, threadId = selectedRef.current) => {
       if (commandWatches.current.has(command.id)) return;
       commandWatches.current.add(command.id);
       const poll = async (attempt = 0) => {
@@ -389,7 +414,7 @@ function Workspace({
             ].includes(value.status)
           ) {
             const failure = commandFailure(value);
-            if (failure) setError(failure);
+            if (failure && threadId === selectedRef.current) setError(failure);
             scheduleRefresh();
             scheduleRefresh(true);
             commandWatches.current.delete(command.id);
@@ -397,7 +422,8 @@ function Workspace({
           }
         } catch (reason) {
           if (attempt >= 10) {
-            setError(errorText(reason));
+            if (liveRef.current && threadId === selectedRef.current)
+              setError(errorText(reason));
             commandWatches.current.delete(command.id);
             return;
           }
@@ -420,8 +446,8 @@ function Workspace({
       `/threads/${route.id}/${steer ? "steer" : "messages"}`,
       payload,
     );
-    watchCommand(result.command);
-    setError("");
+    watchCommand(result.command, route.id);
+    if (route.id === selectedRef.current) setError("");
     scheduleRefresh();
     scheduleRefresh(true);
   };
@@ -430,7 +456,7 @@ function Workspace({
       `/threads/${route.id}/interrupt`,
       {},
     );
-    watchCommand(result.command);
+    watchCommand(result.command, route.id);
     scheduleRefresh();
   };
   const logout = async () => {
@@ -750,7 +776,7 @@ function Workspace({
                 <Interactions
                   interactions={detail.interactions}
                   onCommand={(command) => {
-                    watchCommand(command);
+                    watchCommand(command, detail.thread.id);
                     scheduleRefresh();
                   }}
                 />
@@ -937,7 +963,7 @@ function Workspace({
               ...current.filter((entry) => entry.id !== thread.id),
             ]);
             navigate(thread.id);
-            watchCommand(command);
+            watchCommand(command, thread.id);
           }}
         />
       )}

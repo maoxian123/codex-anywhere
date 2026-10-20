@@ -7,9 +7,12 @@ import random
 import time
 from uuid import uuid4
 
+import pytest
 from PIL import Image
 from test_e2e import eventually
 from test_e2e import live_system as live_system
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.sync.client import connect
 
 
 def test_large_image_command_reaches_native_peer_without_heartbeat_reconnect(live_system):
@@ -69,3 +72,44 @@ def test_large_image_command_reaches_native_peer_without_heartbeat_reconnect(liv
     assert base64.b64decode(received.split(",", 1)[1]) == image
     assert system["node"]["service"].runtime.runtime_id == runtime_id
     assert system["node"]["service"].ws is connection
+
+
+def test_logout_closes_the_existing_browser_websocket(live_system):
+    system = live_system
+    cookie = "; ".join(f"{name}={value}" for name, value in system["client"].cookies.items())
+    url = system["url"].replace("http://", "ws://") + "/ws/client"
+    with connect(
+        url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
+    ) as ws:
+        assert json.loads(ws.recv(timeout=2))["type"] == "ready"
+        assert system["post"]("/api/auth/logout", json={}).status_code == 200
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=2)
+        assert closed.value.rcvd.code == 1008
+    with pytest.raises(InvalidStatus) as denied:
+        with connect(url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None):
+            pytest.fail("Logged-out cookie unexpectedly opened a WebSocket")
+    assert denied.value.response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "subscribe", "thread_id": {"invalid": "id"}, "after": 0},
+        {"type": "subscribe", "after": 2**100},
+        {"type": "subscribe", "after": True},
+    ],
+)
+def test_invalid_subscription_closes_cleanly_without_sql_error(live_system, frame, caplog):
+    system = live_system
+    cookie = "; ".join(f"{name}={value}" for name, value in system["client"].cookies.items())
+    url = system["url"].replace("http://", "ws://") + "/ws/client"
+    with connect(
+        url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
+    ) as ws:
+        assert json.loads(ws.recv(timeout=2))["type"] == "ready"
+        ws.send(json.dumps(frame))
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=2)
+        assert closed.value.rcvd.code == 1000
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]

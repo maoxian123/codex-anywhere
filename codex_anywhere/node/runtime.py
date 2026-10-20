@@ -12,6 +12,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 log = logging.getLogger(__name__)
+PROCESS_STOP_TIMEOUT = 5.0
+PIPE_CLOSE_TIMEOUT = 1.0
 
 
 class RpcError(Exception):
@@ -40,6 +42,8 @@ class CodexRuntime:
         self.server_requests: dict[str, dict] = {}
         self._reader: asyncio.Task | None = None
         self._stderr: asyncio.Task | None = None
+        self._watcher: asyncio.Task | None = None
+        self._closing = False
         self._write_lock = asyncio.Lock()
         self._counter = 0
         self.loaded_threads: set[str] = set()
@@ -72,6 +76,7 @@ class CodexRuntime:
         )
         self._reader = asyncio.create_task(self._read_stdout(), name="codex-stdout")
         self._stderr = asyncio.create_task(self._drain_stderr(), name="codex-stderr")
+        self._watcher = asyncio.create_task(self._watch_process(), name="codex-process-exit")
         self.version = await self.request(
             "initialize",
             {
@@ -110,9 +115,12 @@ class CodexRuntime:
         future = asyncio.get_running_loop().create_future()
         self.pending[rpc_id] = future
         try:
-            await self._write({"id": rpc_id, "method": method, "params": params})
             try:
-                return await asyncio.wait_for(future, timeout=self.timeout)
+                # Include waiting for the write lock and pipe backpressure in
+                # the deadline; an unresponsive peer may never drain stdin.
+                async with asyncio.timeout(self.timeout):
+                    await self._write({"id": rpc_id, "method": method, "params": params})
+                    return await future
             except TimeoutError as exc:
                 raise RuntimeGone(
                     "Codex response timed out; execution outcome is uncertain"
@@ -123,12 +131,62 @@ class CodexRuntime:
                 future.cancel()
 
     async def notify(self, method: str, params: dict) -> None:
-        await self._write({"method": method, "params": params})
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._write({"method": method, "params": params})
+        except TimeoutError as exc:
+            raise RuntimeGone("Codex notification write timed out") from exc
 
     async def answer(self, rpc_id, response: dict) -> dict:
         key = json.dumps(rpc_id)
-        await self._write({"id": rpc_id, "result": response}, server_request_key=key)
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._write({"id": rpc_id, "result": response}, server_request_key=key)
+        except TimeoutError as exc:
+            raise RuntimeGone(
+                "Codex approval write timed out; execution outcome is uncertain"
+            ) from exc
         return {"answered": True}
+
+    def _close_transport(self) -> None:
+        # asyncio.Process.wait also waits for inherited stdout/stderr handles.
+        # A surviving tool child can retain those after Codex exits. Process has
+        # no public pipe-close API, so close its owning transport at the deadline.
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+            transport.close()
+
+    async def _stop_process(self) -> None:
+        assert self.process
+        if self.process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.process.terminate()
+        try:
+            await asyncio.wait_for(self.process.wait(), PROCESS_STOP_TIMEOUT)
+        except TimeoutError:
+            self._close_transport()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.process.wait(), PIPE_CLOSE_TIMEOUT)
+
+    async def _watch_process(self) -> None:
+        assert self.process
+        # Process.wait can remain pending after the direct process exits if a
+        # child retains its pipes. returncode is updated independently of EOF.
+        while self.process.returncode is None:
+            await asyncio.sleep(0.1)
+        if self._closing or not self._reader:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._reader), PROCESS_STOP_TIMEOUT)
+        except TimeoutError:
+            if self._closing:
+                return
+            self._close_transport()
+            self._reader.cancel()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(self._reader, return_exceptions=True), PIPE_CLOSE_TIMEOUT
+                )
 
     async def _read_stdout(self) -> None:
         assert self.process and self.process.stdout
@@ -166,22 +224,24 @@ class CodexRuntime:
             failure = "Codex event stream failed"
             log.exception(failure)
         finally:
-            if self.process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    self.process.terminate()
             try:
-                await asyncio.wait_for(self.process.wait(), 5)
-            except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
-            for future in list(self.pending.values()):
-                if not future.done():
-                    future.set_exception(RuntimeGone(failure))
-            self.server_requests.clear()
-            self.loaded_threads.clear()
-            if self.on_exit:
-                await self.on_exit(self.runtime_id, self.process.returncode)
-            self.stopped.set()
+                await self._stop_process()
+            finally:
+                for future in list(self.pending.values()):
+                    if not future.done():
+                        future.set_exception(RuntimeGone(failure))
+                self.server_requests.clear()
+                self.loaded_threads.clear()
+                try:
+                    if self.on_exit:
+                        await asyncio.wait_for(
+                            self.on_exit(self.runtime_id, self.process.returncode),
+                            PIPE_CLOSE_TIMEOUT,
+                        )
+                except Exception:  # noqa: BLE001 - ensure recovery even when persistence fails
+                    log.error("Codex exit callback failed; runtime has stopped")
+                finally:
+                    self.stopped.set()
 
     async def _drain_stderr(self) -> None:
         assert self.process and self.process.stderr
@@ -190,21 +250,30 @@ class CodexRuntime:
             pass
 
     async def close(self) -> None:
+        self._closing = True
+        if self._watcher:
+            self._watcher.cancel()
+            await asyncio.gather(self._watcher, return_exceptions=True)
         if self.process and self.process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self.process.terminate()
-        if self._reader:
+        if self._reader and not self._reader.cancelled():
             try:
-                await asyncio.wait_for(asyncio.shield(self._reader), 8)
+                await asyncio.wait_for(asyncio.shield(self._reader), PROCESS_STOP_TIMEOUT)
             except TimeoutError:
-                if self.process and self.process.returncode is None:
-                    self.process.kill()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._reader
+                self._close_transport()
+                self._reader.cancel()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.gather(self._reader, return_exceptions=True), PIPE_CLOSE_TIMEOUT
+                    )
             except asyncio.CancelledError:
-                if self.process and self.process.returncode is None:
-                    self.process.kill()
+                self._close_transport()
                 raise
-        if self._stderr:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._stderr
+        if self._stderr and not self._stderr.cancelled():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._stderr), PIPE_CLOSE_TIMEOUT)
+            except TimeoutError:
+                self._close_transport()
+                self._stderr.cancel()
+                await asyncio.gather(self._stderr, return_exceptions=True)

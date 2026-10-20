@@ -6,6 +6,8 @@ This is the implementation contract. The hub stores a projection; Codex on each 
 
 JSON errors: `{ "error": "human readable message" }`. GET `/api/auth/me` returns `{ authenticated, username?, csrf_token }` and creates a session. Every mutating browser request includes `X-CSRF-Token` from that response. POST `/api/auth/login` accepts `{username,password}`, returns the same session shape. POST `/api/auth/logout` clears login. Credentials are session cookies, HttpOnly, SameSite=Lax.
 
+Authenticated cookies also require a live process-local session nonce. Logout revokes that nonce for copied cookies and existing browser WebSockets; expiration closes the socket with code 1008. A hub restart requires a new browser login. Node credentials are independent of browser sessions.
+
 - GET `/api/hosts` -> `{hosts:[{id,name,platform,online,roots:[string],version,last_seen_at}]}`.
 - POST `/api/pairings` -> `{code,expires_at}`. Node pairing is separate below.
 - GET `/api/threads?q=...` -> `{threads:[Thread]}`. Thread = `{id,host_id,native_id,title,cwd,status,active_turn_id,last_error,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts.
@@ -42,10 +44,16 @@ Node durably marks command in SQLite before sending RPC, sends `{type:'command_s
 
 Node forwards Codex notifications and server requests as `{type:'event',event_id:uuid,runtime_id,seq:integer,method,params,rpc_id?}`. Persist these in SQLite outbox before sending. Server ACK `{type:'event_ack',event_id}` ONLY after DB commit, duplicate events deduplicated by event_id. Preserve raw params. Incoming native `threadId` is mapped by hub to hub thread ID. For server requests, rpc_id is the ORIGINAL request ID (int or string), never replace it. Browser approval response is an RPC result, not a new turn. Unknown events retained and displayed in generic tool card. Reconnect does not restart Codex.
 
+Native errors with `willRetry:true` remain in event history without making the task terminal. Late command results and old turn completions must not replace a newer active turn or clear its error. A task remains waiting until all current-process pending or answering interactions settle; ending the turn or process expires both states. User message display metadata is bound to the matching native input, including steer inputs, rather than guessed from the latest command.
+
 Each connection has at most 100 unacknowledged events in flight. An ACK frees a slot without retransmitting the entire window; unacknowledged events retry after at least five seconds. Duplicate ACKs do not wake the sender. Reconnect resets the in-flight window and replays durable unacknowledged events. Native `serverRequest/resolved` expires cached approval IDs, and a queued answer rechecks validity under the runtime write lock before replying.
 
 Node output image bridge: POST `/api/node/assets` using bearer auth, multipart `file` and `thread_id` (native thread ID), `item_id`, returns `{asset}`. Publish a durable event `anywhere/assets` with `{threadId,itemId,assets:[Asset]}`. Extract images from imageView.path, imageGeneration.savedPath / base64 result, MCP image blocks and local Markdown images. Only read files inside configured project roots and Codex artifact roots (explicit node --asset-root). Never serve arbitrary remote paths. Asset metadata uses hub authenticated URL.
 
+Output extraction is bounded to 16 images and 40 MiB per native item, with 20 MiB and 25 million pixels per image. Excess output images are skipped with a log warning. Reads themselves are capped even if a file grows after its metadata check. Hub attachment reads and downloads must resolve inside its asset directory and handle missing files without an internal error.
+
 ## Runtime and permissions
 
 Run `codex app-server --listen stdio://`, initialize once, then `initialized`. Default new threads use `approvalPolicy:'on-request'`, `sandbox:'workspace-write'`; never silently disable approvals. Do not send a hardcoded model by default. Drain stderr separately. Treat stdout as JSONL. On Codex process exit, fail pending RPCs and mark interactions expired through `anywhere/runtime_stopped`. Starting a new Codex process changes runtime_id. Browser disconnect does not stop node or Codex.
+
+RPC deadlines cover write-lock acquisition, pipe backpressure and response waiting. Notification and approval writes also have deadlines. Process shutdown and exit callbacks have bounded waits; inherited tool pipes cannot prevent the direct Codex process exit from being observed.

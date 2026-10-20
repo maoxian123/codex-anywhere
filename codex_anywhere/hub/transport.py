@@ -44,6 +44,42 @@ def _assets(item):
     return result
 
 
+def _input_identity(values):
+    if not isinstance(values, list):
+        return None
+    result = []
+    for value in values:
+        if not isinstance(value, dict):
+            return None
+        kind = value.get("type")
+        if kind == "text":
+            if value.get("text"):
+                result.append((kind, value["text"]))
+        elif kind == "image":
+            result.append((kind, value.get("url")))
+        else:
+            return None
+    return result
+
+
+def _open_interactions(thread):
+    host = db.session.get(Host, thread.host_id)
+    return Interaction.query.filter(
+        Interaction.thread_id == thread.id,
+        Interaction.runtime_id == host.runtime_id,
+        Interaction.status.in_(["pending", "answering"]),
+    )
+
+
+def _refresh_waiting(thread):
+    if thread.status not in {"active", "waiting"}:
+        return
+    if _open_interactions(thread).first():
+        thread.status = "waiting"
+    else:
+        thread.status = "active" if thread.active_turn_id else "idle"
+
+
 def _put_item(thread, data, turn_id):
     native_id = data.get("id")
     if not native_id:
@@ -68,14 +104,19 @@ def _put_item(thread, data, turn_id):
         value["_assets"] = attached_assets
     if item.type == "userMessage" and "_displayText" not in value:
         commands = (
-            Command.query.filter_by(thread_id=thread.id, kind="turn.start")
-            .order_by(Command.created_at.desc())
-            .limit(5)
+            Command.query.filter(
+                Command.thread_id == thread.id,
+                Command.kind.in_(["turn.start", "turn.steer"]),
+                Command.status != "failed",
+                Command.payload["_attached_item"].as_string().is_(None),
+            )
+            .order_by(Command.created_at, Command.id)
             .all()
         )
+        identity = _input_identity(data.get("content"))
         for command in commands:
             payload = command.payload
-            if payload.get("_attached_item") not in (None, native_id):
+            if identity is None or _input_identity(payload.get("input")) != identity:
                 continue
             if payload.get("_display_text") is not None:
                 value["_displayText"] = payload["_display_text"]
@@ -125,10 +166,16 @@ def _project(thread, method, params, live=True):
         thread.active_turn_id = params.get("turn", {}).get("id")
         thread.status = "active"
         thread.last_error = None
-    elif method == "turn/completed" and live:
+    elif method == "turn/completed":
         turn = params.get("turn", {})
         for item in turn.get("items", []):
             _put_item(thread, item, turn.get("id"))
+        if (
+            not live
+            or (thread.active_turn_id and thread.active_turn_id != turn.get("id"))
+            or (thread.status in {"active", "waiting"} and thread.active_turn_id != turn.get("id"))
+        ):
+            return
         thread.status = {"failed": "error", "interrupted": "interrupted"}.get(
             turn.get("status"), "idle"
         )
@@ -139,13 +186,13 @@ def _project(thread, method, params, live=True):
         elif turn.get("status") == "completed":
             thread.last_error = None
         thread.active_turn_id = None
-        for interaction in Interaction.query.filter_by(thread_id=thread.id, status="pending"):
+        for interaction in _open_interactions(thread):
             interaction.status = "expired"
     elif method == "serverRequest/resolved" and live:
-        for interaction in Interaction.query.filter_by(thread_id=thread.id, status="pending"):
+        for interaction in _open_interactions(thread):
             if interaction.rpc_id == params.get("requestId"):
                 interaction.status = "resolved"
-        thread.status = "active" if thread.active_turn_id else "idle"
+        _refresh_waiting(thread)
     elif method == "anywhere/assets":
         item = Item.query.filter_by(
             thread_id=thread.id, native_id=str(params.get("itemId"))
@@ -159,6 +206,10 @@ def _project(thread, method, params, live=True):
                     value["source_path"] = source_path[:4000]
             item.data = dict(item.data, _assets=values)
     elif method == "error" and live:
+        if params.get("willRetry") is True or (
+            turn_id and thread.active_turn_id and turn_id != thread.active_turn_id
+        ):
+            return
         thread.status = "error"
         thread.last_error = _error_detail(params.get("error", params), "Codex 执行失败")
 
@@ -203,7 +254,10 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
             host.version = str(message.get("version", host.version))[:120]
             # Roots are granted at pairing, never silently expanded through hello.
             if changed:
-                for interaction in Interaction.query.filter_by(host_id=host_id, status="pending"):
+                for interaction in Interaction.query.filter(
+                    Interaction.host_id == host_id,
+                    Interaction.status.in_(["pending", "answering"]),
+                ):
                     interaction.status = "expired"
                 for thread in Thread.query.filter_by(host_id=host_id):
                     if thread.status in {"active", "waiting"}:
@@ -268,6 +322,15 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 and thread.native_id is None
                 and thread.last_error == command.error
             )
+            if thread and command.kind == "turn.start":
+                # A result can arrive after its turn's events and even after
+                # another turn has started on the same process.
+                newer_start = Command.query.filter(
+                    Command.thread_id == thread.id,
+                    Command.kind == "turn.start",
+                    Command.created_at > command.created_at,
+                ).first()
+                project_result = project_result and newer_start is None
             command.updated_at = time.time()
             if kind == "command_started":
                 command.status = "running"
@@ -293,9 +356,9 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                             if project_result:
                                 thread.status = "idle"
                                 thread.last_error = None
-                    elif command.kind in {"turn.start", "turn.steer"} and project_result:
+                    elif command.kind == "turn.start" and project_result:
                         turn = result.get("turn", {})
-                        if thread.status in {"active", "waiting"}:
+                        if thread.status in {"active", "waiting"} and not thread.active_turn_id:
                             thread.active_turn_id = (
                                 turn.get("id") or result.get("turnId") or thread.active_turn_id
                             )
@@ -311,8 +374,8 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         interaction.status = (
                             "resolved" if command.status == "completed" else "expired"
                         )
-                        if thread and thread.status == "waiting" and project_result:
-                            thread.status = "active" if thread.active_turn_id else "idle"
+                        if thread and project_result:
+                            _refresh_waiting(thread)
                 emit(
                     "anywhere/command_completed",
                     {"command": command.as_dict()},
@@ -364,15 +427,26 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 rpc_id=message["rpc_id"],
                 method=method,
                 params=params,
-                status="pending" if live else "expired",
+                status="pending"
+                if live
+                and not (
+                    thread
+                    and thread.active_turn_id
+                    and params.get("turnId")
+                    and params["turnId"] != thread.active_turn_id
+                )
+                else "expired",
             )
             db.session.add(interaction)
-            if thread and live:
+            if thread and interaction.status == "pending":
+                thread.active_turn_id = thread.active_turn_id or params.get("turnId")
                 thread.status = "waiting"
             emit("anywhere/interaction", {"method": method}, thread.id if thread else None, host_id)
         if method == "anywhere/runtime_stopped" and live:
-            for interaction in Interaction.query.filter_by(
-                host_id=host_id, runtime_id=epoch, status="pending"
+            for interaction in Interaction.query.filter(
+                Interaction.host_id == host_id,
+                Interaction.runtime_id == epoch,
+                Interaction.status.in_(["pending", "answering"]),
             ):
                 interaction.status = "expired"
             for active in Thread.query.filter_by(host_id=host_id):

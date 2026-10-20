@@ -65,10 +65,60 @@ def node_host():
 
 
 def _json():
-    data = request.get_json(silent=True)
+    try:
+        data = request.get_json(silent=True)
+    except RecursionError as exc:
+        raise ValueError("JSON 嵌套层级过深") from exc
     if not isinstance(data, dict):
         raise ValueError("请求必须是 JSON 对象")
+    pending = [data]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("文本包含无效的 Unicode 字符") from exc
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
     return data
+
+
+def _identifier(value, name):
+    if not isinstance(value, str) or not 1 <= len(value) <= 250 or "\x00" in value:
+        raise ValueError(f"{name} 必须是有效的字符串 ID")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} 包含无效字符") from exc
+    return value
+
+
+def _reference_shapes(references):
+    if not isinstance(references, list) or len(references) > 8:
+        raise ValueError("最多引用 8 个任务或网页")
+    for reference in references:
+        if not isinstance(reference, dict):
+            raise ValueError("引用格式错误")
+        if reference.get("kind") == "task":
+            _identifier(reference.get("thread_id"), "thread_id")
+            if reference.get("item_id") is not None:
+                _identifier(reference["item_id"], "item_id")
+    return references
+
+
+def _asset_file(asset):
+    root = Path(current_app.config["ASSET_DIR"]).resolve()
+    try:
+        path = Path(asset.path).resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError("附件文件已丢失或不可访问，请重新上传")
+    except OSError as exc:
+        raise ValueError("附件文件已丢失或不可访问，请重新上传") from exc
+    return path
 
 
 def _get_thread(thread_id):
@@ -192,6 +242,10 @@ def create_app(test_config=None):
     app.extensions["broker"] = Broker()
     app.extensions["login_attempts"] = {}
     app.extensions["login_lock"] = threading.Lock()
+    # This single-process hub can revoke a signed cookie and an already-open
+    # WebSocket together. Restarting the hub intentionally requires a new login.
+    app.extensions["auth_sessions"] = {}
+    app.extensions["auth_lock"] = threading.Lock()
     with app.app_context():
         if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
 
@@ -207,6 +261,23 @@ def create_app(test_config=None):
             db.create_all()
     sock = Sock(app)
 
+    def authenticated():
+        nonce = session.get("auth_nonce")
+        if not session.get("authenticated") or not isinstance(nonce, str):
+            return False
+        with app.extensions["auth_lock"]:
+            expires = app.extensions["auth_sessions"].get(nonce)
+            if expires is None or expires <= time.time():
+                app.extensions["auth_sessions"].pop(nonce, None)
+                return False
+            return True
+
+    def revoke_current_session():
+        nonce = session.get("auth_nonce")
+        if isinstance(nonce, str):
+            with app.extensions["auth_lock"]:
+                app.extensions["auth_sessions"].pop(nonce, None)
+
     @app.before_request
     def protect_api():
         if request.path in {"/healthz", "/api/auth/me", "/api/hosts/pair"}:
@@ -216,7 +287,7 @@ def create_app(test_config=None):
                 return jsonify(error="节点认证失败"), 401
             return
         if request.path.startswith("/api/") or request.path == "/ws/client":
-            if request.path != "/api/auth/login" and not session.get("authenticated"):
+            if request.path != "/api/auth/login" and not authenticated():
                 return jsonify(error="请先登录"), 401
             if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
                 csrf = request.headers.get("X-CSRF-Token", "")
@@ -257,9 +328,11 @@ def create_app(test_config=None):
         return jsonify(status="ok", version="0.1.0")
 
     def auth_state():
+        if session.get("authenticated") and not authenticated():
+            session.clear()
         session.setdefault("csrf_token", secrets.token_urlsafe(32))
         return dict(
-            authenticated=bool(session.get("authenticated")),
+            authenticated=authenticated(),
             username=session.get("username"),
             csrf_token=session["csrf_token"],
         )
@@ -287,13 +360,22 @@ def create_app(test_config=None):
         )
         if not (user_ok and password_ok):
             return jsonify(error="用户名或密码错误"), 401
+        revoke_current_session()
         session.clear()
         session.permanent = True
-        session.update(authenticated=True, username=app.config["ADMIN_USERNAME"])
+        nonce = secrets.token_urlsafe(32)
+        now = time.time()
+        with app.extensions["auth_lock"]:
+            registry = app.extensions["auth_sessions"]
+            for expired in [key for key, until in registry.items() if until <= now]:
+                registry.pop(expired, None)
+            registry[nonce] = now + app.permanent_session_lifetime.total_seconds()
+        session.update(authenticated=True, username=app.config["ADMIN_USERNAME"], auth_nonce=nonce)
         return jsonify(auth_state())
 
     @app.post("/api/auth/logout")
     def logout():
+        revoke_current_session()
         session.clear()
         return jsonify(auth_state())
 
@@ -319,7 +401,10 @@ def create_app(test_config=None):
         data = _json()
         code = str(data.get("code", "")).strip().upper()
         roots = data.get("roots", [])
-        name = str(data.get("name", "")).strip()
+        name = data.get("name", "")
+        if not isinstance(name, str):
+            raise ValueError("节点名称必须是字符串")
+        name = name.strip()
         if not name or len(name) > 120 or not isinstance(roots, list) or not 1 <= len(roots) <= 32:
             raise ValueError("请提供节点名称和 1–32 个工作目录")
         if not all(isinstance(r, str) and valid_cwd(r, [r]) for r in roots):
@@ -360,7 +445,7 @@ def create_app(test_config=None):
     @app.post("/api/threads")
     def create_thread():
         data = _json()
-        host = db.session.get(Host, data.get("host_id"))
+        host = db.session.get(Host, _identifier(data.get("host_id"), "host_id"))
         if not host:
             return jsonify(error="节点不存在"), 404
         if not app.extensions["broker"].is_online(host.id):
@@ -400,6 +485,9 @@ def create_app(test_config=None):
             raise ValueError("消息文本无效或超过 10 万字符")
         if not isinstance(assets_ids, list) or len(assets_ids) > 4:
             raise ValueError("每条消息最多附加 4 张图片")
+        for asset_id in assets_ids:
+            _identifier(asset_id, "asset_id")
+        _reference_shapes(refs)
         if not text.strip() and not assets_ids and not refs:
             raise ValueError("请输入消息或添加图片、引用")
         client_id = data.get("client_request_id")
@@ -439,7 +527,13 @@ def create_app(test_config=None):
                 size += asset.size
                 if size > 20 * 1024 * 1024:
                     raise ValueError("单条消息的图片合计不能超过 20 MiB")
-                raw = Path(asset.path).read_bytes()
+                try:
+                    with _asset_file(asset).open("rb") as stream:
+                        raw = stream.read(20 * 1024 * 1024 + 1)
+                except OSError as exc:
+                    raise ValueError("附件无法读取，请重新上传") from exc
+                if len(raw) > 20 * 1024 * 1024:
+                    raise ValueError("附件文件超过 20 MiB，请重新上传")
                 inputs.append(
                     dict(
                         type="image",
@@ -550,15 +644,22 @@ def create_app(test_config=None):
     @app.get("/api/assets/<asset_id>")
     def download(asset_id):
         asset = db.session.get(Asset, asset_id)
-        if not asset or not Path(asset.path).is_file():
+        if not asset:
             return jsonify(error="附件不存在"), 404
-        return send_file(
-            asset.path, mimetype=asset.mime, download_name=asset.name, conditional=True, max_age=0
-        )
+        try:
+            return send_file(
+                _asset_file(asset),
+                mimetype=asset.mime,
+                download_name=asset.name,
+                conditional=True,
+                max_age=0,
+            )
+        except (ValueError, OSError):
+            return jsonify(error="附件不存在"), 404
 
     @app.post("/api/references/resolve")
     def resolve():
-        references = resolve_references(_json().get("references", []))
+        references = resolve_references(_reference_shapes(_json().get("references", [])))
         db.session.commit()
         return jsonify(references=references)
 
@@ -581,13 +682,21 @@ def create_app(test_config=None):
         cursor = None
         thread_id = None
         while ws.connected:
+            if not authenticated():
+                ws.close(reason=1008, message="Session expired")
+                return
             raw = ws.receive(timeout=0.15)
             if raw:
                 try:
                     frame = json.loads(raw)
                     if frame.get("type") == "subscribe":
-                        cursor = max(0, int(frame.get("after", 0)))
+                        after = frame.get("after", 0)
+                        if type(after) is not int or not 0 <= after <= 2**63 - 1:
+                            raise ValueError("Invalid event cursor")
+                        cursor = after
                         thread_id = frame.get("thread_id")
+                        if thread_id is not None:
+                            _identifier(thread_id, "thread_id")
                 except (ValueError, TypeError, AttributeError):
                     ws.close()
                     return
@@ -599,6 +708,9 @@ def create_app(test_config=None):
             if thread_id:
                 query = query.filter((Event.thread_id == thread_id) | Event.thread_id.is_(None))
             for event in query.order_by(Event.id).limit(100).all():
+                if not authenticated():
+                    ws.close(reason=1008, message="Session expired")
+                    return
                 ws.send(json.dumps(event.as_dict(), ensure_ascii=False))
                 cursor = event.id
 

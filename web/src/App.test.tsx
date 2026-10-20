@@ -54,6 +54,14 @@ function setup(threadOverride: Partial<Thread> = {}) {
     value: FakeWebSocket,
   });
   let refreshes = 0;
+  let sequence = 0;
+  const threads = [thread];
+  let intercept:
+    | ((
+        path: string,
+        init?: RequestInit,
+      ) => Response | Promise<Response> | undefined)
+    | undefined;
   const authentication = {
     authenticated: true,
     username: "test",
@@ -62,6 +70,8 @@ function setup(threadOverride: Partial<Thread> = {}) {
   const loginHeaders: Headers[] = [];
   globalThis.fetch = async (input, init) => {
     const path = String(input);
+    const overridden = intercept?.(path, init);
+    if (overridden) return overridden;
     let result: unknown;
     if (path === "/api/auth/me") result = authentication;
     else if (path === "/api/auth/login") {
@@ -87,10 +97,16 @@ function setup(threadOverride: Partial<Thread> = {}) {
       };
     else if (path.startsWith("/api/threads?")) {
       refreshes += 1;
-      result = { threads: [thread] };
+      result = { threads };
     } else if (path === "/api/threads/t1")
       result = { thread, items: [], interactions: [] };
-    else throw new Error(`Unexpected test request: ${path}`);
+    else if (path.startsWith("/api/threads/")) {
+      const found = threads.find(
+        (entry) => path === `/api/threads/${entry.id}`,
+      );
+      if (!found) throw new Error(`Unexpected test request: ${path}`);
+      result = { thread: found, items: [], interactions: [] };
+    } else throw new Error(`Unexpected test request: ${path}`);
     return new Response(JSON.stringify(result), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -102,12 +118,20 @@ function setup(threadOverride: Partial<Thread> = {}) {
     thread,
     authentication,
     loginHeaders,
+    threads,
+    intercept: (handler: typeof intercept) => {
+      intercept = handler;
+    },
     refreshes: () => refreshes,
-    event: (method: string, params: Record<string, unknown>) => {
+    event: (
+      method: string,
+      params: Record<string, unknown>,
+      threadId = "t1",
+    ) => {
       const event: HubEvent = {
         type: "event",
-        id: Date.now(),
-        thread_id: "t1",
+        id: ++sequence,
+        thread_id: threadId,
         method,
         params,
       };
@@ -183,4 +207,210 @@ test("WebSocket reconnection resubscribes and returns to live status", async () 
     timeout: 2000,
   });
   await screen.findByText("实时连接");
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+function response(value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+test("continuous streaming still paints snapshots when requests take longer than the refresh interval", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  let inFlight = 0;
+  let peak = 0;
+  server.intercept((path) => {
+    if (path !== "/api/threads/t1") return undefined;
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    return new Promise<Response>((resolve) =>
+      setTimeout(() => {
+        inFlight -= 1;
+        resolve(
+          response({
+            thread: server.thread,
+            interactions: [],
+            items: [
+              {
+                id: "i1",
+                native_id: "i1",
+                thread_id: "t1",
+                type: "agentMessage",
+                data: { text: "持续流的中间结果" },
+              },
+            ],
+          }),
+        );
+      }, 450),
+    );
+  });
+  const emit = () =>
+    server.event("item/agentMessage/delta", { itemId: "i1", delta: "chunk" });
+  emit();
+  const timer = setInterval(emit, 180);
+  try {
+    await screen.findByText("持续流的中间结果", {}, { timeout: 1400 });
+    assert.equal(
+      peak,
+      1,
+      "a selected thread must have at most one snapshot request in flight",
+    );
+  } finally {
+    clearInterval(timer);
+  }
+});
+
+test("out-of-order list responses cannot replace a newer host online state", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  const old = deferred<Response>();
+  let calls = 0;
+  server.intercept((path) => {
+    if (path !== "/api/hosts") return undefined;
+    calls += 1;
+    if (calls === 1) return old.promise;
+    return response({
+      hosts: [
+        {
+          id: "h1",
+          name: "恢复后的设备",
+          platform: "windows",
+          online: true,
+          roots: ["C:\\work"],
+        },
+      ],
+    });
+  });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await waitFor(() => assert.equal(calls, 1));
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await screen.findAllByText("恢复后的设备");
+  await act(async () => {
+    old.resolve(
+      response({
+        hosts: [
+          {
+            id: "h1",
+            name: "过期离线设备",
+            platform: "windows",
+            online: false,
+            roots: ["C:\\work"],
+          },
+        ],
+      }),
+    );
+    await old.promise;
+  });
+  assert.equal(screen.queryByText("过期离线设备") === null, true);
+  fireEvent.change(screen.getByRole("textbox", { name: "发送消息给 Codex" }), {
+    target: { value: "device is online" },
+  });
+  assert.equal(
+    (screen.getByRole("button", { name: "发送消息" }) as HTMLButtonElement)
+      .disabled,
+    false,
+  );
+});
+
+test("late commands and errors from a previous task cannot clear or overwrite the current task error", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  server.threads.push({ ...server.thread, id: "t2", title: "第二任务" });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await screen.findByRole("link", { name: /第二任务/ });
+  const send = deferred<Response>();
+  let polled = false;
+  server.intercept((path) => {
+    if (path === "/api/threads/t1/messages") return send.promise;
+    if (path === "/api/commands/old-command") {
+      polled = true;
+      return response({
+        command: {
+          id: "old-command",
+          kind: "turn.start",
+          status: "failed",
+          error: "Old task command failed",
+        },
+      });
+    }
+    return undefined;
+  });
+  fireEvent.change(screen.getByRole("textbox", { name: "发送消息给 Codex" }), {
+    target: { value: "old task input" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  fireEvent.click(screen.getByRole("link", { name: /第二任务/ }));
+  await screen.findByRole("heading", { name: "第二任务" });
+  server.event("error", { error: { message: "Current task error" } }, "t2");
+  await screen.findByText("Current task error");
+  await act(async () => {
+    send.resolve(
+      response(
+        {
+          command: { id: "old-command", kind: "turn.start", status: "queued" },
+        },
+        202,
+      ),
+    );
+    await send.promise;
+  });
+  await waitFor(() => assert.equal(polled, true));
+  server.event(
+    "anywhere/command_completed",
+    { status: "failed", error: "Old task event failed" },
+    "t1",
+  );
+  assert.ok(screen.getByText("Current task error"));
+  assert.equal(screen.queryByText("Old task command failed") === null, true);
+  assert.equal(screen.queryByText("Old task event failed") === null, true);
+});
+
+test("switching tasks does not wait for or display an older pending snapshot", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  server.threads.push({ ...server.thread, id: "t2", title: "新选择的任务" });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await screen.findByRole("link", { name: /新选择的任务/ });
+  const old = deferred<Response>();
+  let started = false;
+  server.intercept((path) => {
+    if (path === "/api/threads/t1") {
+      started = true;
+      return old.promise;
+    }
+    return undefined;
+  });
+  server.event("item/agentMessage/delta", { itemId: "old-item", delta: "old" });
+  await waitFor(() => assert.equal(started, true));
+  fireEvent.click(screen.getByRole("link", { name: /新选择的任务/ }));
+  await screen.findByRole("heading", { name: "新选择的任务" });
+  await act(async () => {
+    old.resolve(
+      response({
+        thread: server.thread,
+        interactions: [],
+        items: [
+          {
+            id: "old-item",
+            native_id: "old-item",
+            thread_id: "t1",
+            type: "agentMessage",
+            data: { text: "过期的旧任务内容" },
+          },
+        ],
+      }),
+    );
+    await old.promise;
+  });
+  assert.ok(screen.getByRole("heading", { name: "新选择的任务" }));
+  assert.equal(screen.queryByText("过期的旧任务内容") === null, true);
 });
