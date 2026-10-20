@@ -85,15 +85,21 @@ class CodexRuntime:
         )
         await self.notify("initialized", {})
 
-    async def _write(self, message: dict) -> None:
+    async def _write(self, message: dict, *, server_request_key: str | None = None) -> None:
         data = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
             "utf-8"
         )
         async with self._write_lock:
             if not self.process or self.process.returncode is not None or not self.process.stdin:
                 raise RuntimeGone("Codex process is not running")
+            if server_request_key is not None and server_request_key not in self.server_requests:
+                raise ValueError("The interaction has expired or has already been answered")
             try:
                 self.process.stdin.write(data)
+                if server_request_key is not None:
+                    # Reserve the answer before yielding to drain; resolved
+                    # notifications and concurrent answers can arrive meanwhile.
+                    self.server_requests.pop(server_request_key, None)
                 await self.process.stdin.drain()
             except (BrokenPipeError, ConnectionError, OSError) as exc:
                 raise RuntimeGone("Codex process closed its input") from exc
@@ -121,10 +127,7 @@ class CodexRuntime:
 
     async def answer(self, rpc_id, response: dict) -> dict:
         key = json.dumps(rpc_id)
-        if key not in self.server_requests:
-            raise ValueError("The interaction has expired or has already been answered")
-        await self._write({"id": rpc_id, "result": response})
-        self.server_requests.pop(key)
+        await self._write({"id": rpc_id, "result": response}, server_request_key=key)
         return {"answered": True}
 
     async def _read_stdout(self) -> None:
@@ -144,6 +147,8 @@ class CodexRuntime:
                 if "method" in message:
                     method, params = message["method"], message.get("params", {})
                     rpc_id = message.get("id")
+                    if method == "serverRequest/resolved" and "requestId" in params:
+                        self.server_requests.pop(json.dumps(params["requestId"]), None)
                     if rpc_id is not None:
                         self.server_requests[json.dumps(rpc_id)] = message
                     await self.on_event(method, params, rpc_id)

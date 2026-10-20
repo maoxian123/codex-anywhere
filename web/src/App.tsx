@@ -32,6 +32,7 @@ import {
 } from "./Dialogs";
 import Interactions from "./Interactions";
 import Timeline from "./Timeline";
+import { commandFailure, eventFailure } from "./runtime-errors";
 import type {
   Command,
   Host,
@@ -115,6 +116,7 @@ function Workspace({
     null,
   );
   const [error, setError] = useState("");
+  const [networkError, setNetworkError] = useState("");
   const [threadError, setThreadError] = useState("");
   const [connection, setConnection] = useState<
     "connecting" | "connected" | "reconnecting"
@@ -199,10 +201,10 @@ function Workspace({
       if (liveRef.current && query === searchRef.current) {
         setHosts(hostData.hosts);
         setThreads(threadData.threads);
-        setError("");
+        setNetworkError("");
       }
     } catch (reason) {
-      if (liveRef.current) setError(errorText(reason));
+      if (liveRef.current) setNetworkError(errorText(reason));
     } finally {
       if (liveRef.current) setLoading(false);
     }
@@ -270,6 +272,7 @@ function Workspace({
     setDetail(null);
     setStreams({});
     setThreadError("");
+    setError("");
     completedStreams.current.clear();
     if (route.id) {
       setLoadingThread(true);
@@ -300,11 +303,9 @@ function Workspace({
     if (current) scheduleRefresh();
     if (!method.includes("/delta") && !method.endsWith("/outputDelta"))
       scheduleRefresh(true);
-    if (
-      method === "anywhere/command_completed" &&
-      typeof event.params.error === "string"
-    )
-      setError(event.params.error);
+    const failure = eventFailure(event);
+    if (failure && (current || method === "anywhere/command_completed"))
+      setError(failure);
   };
 
   useEffect(() => {
@@ -376,6 +377,7 @@ function Workspace({
           const value = (
             await api<{ command: Command }>(`/commands/${command.id}`)
           ).command;
+          if (!liveRef.current) return;
           if (
             [
               "completed",
@@ -386,9 +388,8 @@ function Workspace({
               "unknown",
             ].includes(value.status)
           ) {
-            if (value.error) setError(value.error);
-            else if (value.status === "unknown")
-              setError("指令执行结果未知。请检查会话状态，避免重复发送。");
+            const failure = commandFailure(value);
+            if (failure) setError(failure);
             scheduleRefresh();
             scheduleRefresh(true);
             commandWatches.current.delete(command.id);
@@ -420,6 +421,7 @@ function Workspace({
       payload,
     );
     watchCommand(result.command);
+    setError("");
     scheduleRefresh();
     scheduleRefresh(true);
   };
@@ -651,7 +653,19 @@ function Workspace({
             </button>
           </div>
         </header>
-        {error && (
+        {networkError && (
+          <div className="global-error">
+            <ErrorMessage>{networkError}</ErrorMessage>
+            <button
+              className="icon-button"
+              onClick={() => setNetworkError("")}
+              aria-label="关闭网络提示"
+            >
+              <X size={15} />
+            </button>
+          </div>
+        )}
+        {error && error !== detail?.thread.last_error && (
           <div className="global-error">
             <ErrorMessage>{error}</ErrorMessage>
             <button
@@ -699,6 +713,11 @@ function Workspace({
                     按需审批
                   </span>
                 </div>
+              </div>
+            )}
+            {detail?.thread.last_error && (
+              <div className="thread-error">
+                <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
               </div>
             )}
             {threadError && (

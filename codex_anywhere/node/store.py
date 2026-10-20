@@ -21,6 +21,8 @@ class NodeStore:
                 event_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL,
                 acknowledged INTEGER NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS ix_node_events_pending
+                ON events(seq) WHERE acknowledged=0;
             CREATE TABLE IF NOT EXISTS commands (
                 id TEXT PRIMARY KEY, body TEXT NOT NULL,
                 status TEXT NOT NULL, response TEXT
@@ -131,12 +133,14 @@ class NodeStore:
             )
         ]
 
-    def acknowledge(self, event_id: str) -> None:
+    def acknowledge(self, event_id: str) -> bool:
         with self.db:
             # Retain the monotonic sequence while bounding the journal's content size.
-            self.db.execute(
-                "UPDATE events SET acknowledged=1,body='{}' WHERE event_id=?", (event_id,)
+            changed = self.db.execute(
+                "UPDATE events SET acknowledged=1,body='{}' WHERE event_id=? AND acknowledged=0",
+                (event_id,),
             )
+        return changed.rowcount == 1
 
     def save_thread(self, thread_id: str, cwd: str) -> None:
         with self.db:

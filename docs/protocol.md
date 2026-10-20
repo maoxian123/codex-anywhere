@@ -8,7 +8,7 @@ JSON errors: `{ "error": "human readable message" }`. GET `/api/auth/me` returns
 
 - GET `/api/hosts` -> `{hosts:[{id,name,platform,online,roots:[string],version,last_seen_at}]}`.
 - POST `/api/pairings` -> `{code,expires_at}`. Node pairing is separate below.
-- GET `/api/threads?q=...` -> `{threads:[Thread]}`. Thread = `{id,host_id,native_id,title,cwd,status,active_turn_id,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting.
+- GET `/api/threads?q=...` -> `{threads:[Thread]}`. Thread = `{id,host_id,native_id,title,cwd,status,active_turn_id,last_error,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts.
 - POST `/api/threads` `{host_id,title,cwd,model?}` -> HTTP 202 `{thread,command}`. `cwd` must be inside node-advertised roots.
 - GET `/api/threads/<id>` -> `{thread,items:[Item],interactions:[Interaction]}`. Item = `{id,native_id,thread_id,turn_id,type,data,created_at}`. `data` preserves the native Codex item, with optional `_assets:[Asset]` / `_references:[Reference]` added by the platform. GET history must survive reload.
 - POST `/api/threads/<id>/messages` `{text,asset_ids:[],references:[],client_request_id}` -> 202 `{command}`. References are `{kind:'task',thread_id,item_id?}` or `{kind:'web',url,title?,excerpt?}`. Resolved immutable snapshots are stored and model-visible quoted text is built by hub. Web content is user-provided excerpt; hub MUST NOT fetch arbitrary URLs.
@@ -28,17 +28,21 @@ POST `/api/hosts/pair` (no browser auth or CSRF) `{code,name,platform,roots:[abs
 
 Node sends `{type:'hello',runtime_id:string,version,roots:[absolute_path],platform}`. runtime_id is the Codex PROCESS epoch, stable across network reconnects, changes on process restart. Hub sends `{type:'welcome',host_id,protocol:1}`. Heartbeat `{type:'ping'}` -> `{type:'pong'}` every 15 seconds. Single live node owner per host; duplicate rejected.
 
+The connection becomes online only after welcome and durable pending command replay finish. HTTP handlers enqueue without writing sockets; the connection owner drains a bounded queue. Queue overflow disconnects that owner, retaining durable commands for reconnect. Frame writes complete with `sendall` and serialize application and control frames. Replay socket I/O runs outside the global command lock and is bound to the original connection.
+
 Hub sends `{type:'command',command:{id,kind,thread_id,payload}}`.
 
 Kinds:
 - `thread.start`: payload `{cwd,model?,title}`. Return raw thread/start result.
-- `turn.start` / `turn.steer`: payload `{native_thread_id,input:[native Codex UserInput],expected_turn_id?}`. Images already expressed as `{type:'image',url:'data:image/...;base64,...'}`. First resume if not loaded. Return raw RPC result.
+- `turn.start` / `turn.steer`: payload `{native_thread_id,input:[native Codex UserInput],expected_turn_id?}`. Images already expressed as `{type:'image',url:'data:image/...;base64,...'}`. A new turn resumes the node-owned thread with `excludeTurns:true` if it is not loaded. Steer and interrupt address the active native turn without waiting for a start/resume RPC. Return raw RPC result.
 - `turn.interrupt`: payload `{native_thread_id,turn_id}`.
 - `interaction.answer`: payload `{rpc_id,runtime_id,response}`. Reply to original Codex server request only if epoch still matches.
 
 Node durably marks command in SQLite before sending RPC, sends `{type:'command_started',id}` then `{type:'command_result',id,result:object}` or `{type:'command_result',id,error:string}`. Replayed completed commands return cached result. A command with uncertain outcome after process death is `unknown` and MUST NOT execute again automatically.
 
 Node forwards Codex notifications and server requests as `{type:'event',event_id:uuid,runtime_id,seq:integer,method,params,rpc_id?}`. Persist these in SQLite outbox before sending. Server ACK `{type:'event_ack',event_id}` ONLY after DB commit, duplicate events deduplicated by event_id. Preserve raw params. Incoming native `threadId` is mapped by hub to hub thread ID. For server requests, rpc_id is the ORIGINAL request ID (int or string), never replace it. Browser approval response is an RPC result, not a new turn. Unknown events retained and displayed in generic tool card. Reconnect does not restart Codex.
+
+Each connection has at most 100 unacknowledged events in flight. An ACK frees a slot without retransmitting the entire window; unacknowledged events retry after at least five seconds. Duplicate ACKs do not wake the sender. Reconnect resets the in-flight window and replays durable unacknowledged events. Native `serverRequest/resolved` expires cached approval IDs, and a queued answer rechecks validity under the runtime write lock before replying.
 
 Node output image bridge: POST `/api/node/assets` using bearer auth, multipart `file` and `thread_id` (native thread ID), `item_id`, returns `{asset}`. Publish a durable event `anywhere/assets` with `{threadId,itemId,assets:[Asset]}`. Extract images from imageView.path, imageGeneration.savedPath / base64 result, MCP image blocks and local Markdown images. Only read files inside configured project roots and Codex artifact roots (explicit node --asset-root). Never serve arbitrary remote paths. Asset metadata uses hub authenticated URL.
 

@@ -30,6 +30,8 @@ from .store import NodeStore
 
 log = logging.getLogger(__name__)
 VERSION = "0.1.0"
+OUTBOX_RETRY_SECONDS = 5.0
+OUTBOX_WINDOW = 100
 
 
 def pair_node(
@@ -171,13 +173,36 @@ class NodeService:
                 await self.ws.close(code=1012, reason="Codex runtime restarted")
 
     async def _outbox(self) -> None:
+        # This state belongs to one connection. A reconnect starts with an
+        # empty window and replays every unacknowledged durable event.
+        in_flight: dict[str, float] = {}
+        loop = asyncio.get_running_loop()
         while True:
             self.event_wake.clear()
-            for event in self.store.pending_events():
+            pending = self.store.pending_events(limit=OUTBOX_WINDOW)
+            pending_ids = {event["event_id"] for event in pending}
+            in_flight = {key: sent_at for key, sent_at in in_flight.items() if key in pending_ids}
+            sent = 0
+            for event in pending:
+                event_id = event["event_id"]
+                last_sent = in_flight.get(event_id)
+                if last_sent is not None and loop.time() - last_sent < OUTBOX_RETRY_SECONDS:
+                    continue
                 if not await self._send(event):
                     return
+                in_flight[event_id] = loop.time()
+                sent += 1
+                if sent % 16 == 0:
+                    # ws.send may complete without yielding. Let the reader
+                    # persist ACKs and accept control commands between batches.
+                    await asyncio.sleep(0)
+            timeout = (
+                max(0.001, min(in_flight.values()) + OUTBOX_RETRY_SECONDS - loop.time())
+                if in_flight
+                else OUTBOX_RETRY_SECONDS
+            )
             try:
-                await asyncio.wait_for(self.event_wake.wait(), 3)
+                await asyncio.wait_for(self.event_wake.wait(), timeout)
             except TimeoutError:
                 pass
 
@@ -242,8 +267,8 @@ class NodeService:
                         self.command_tasks.add(task)
                         task.add_done_callback(self._command_done)
                     elif message.get("type") == "event_ack":
-                        self.store.acknowledge(message.get("event_id", ""))
-                        self.event_wake.set()
+                        if self.store.acknowledge(message.get("event_id", "")):
+                            self.event_wake.set()
                     elif message.get("type") == "pong":
                         self.last_pong = asyncio.get_running_loop().time()
             finally:
@@ -323,6 +348,10 @@ class NodeService:
         key = payload.get("native_thread_id") or command.get("thread_id") or command["id"]
         if command.get("kind") == "interaction.answer":
             key = "interaction:" + str(payload.get("rpc_id"))
+        elif command.get("kind") in {"turn.interrupt", "turn.steer"}:
+            # Control an active turn even while its start/resume RPC is pending.
+            # Identical deliveries still share a lock and the durable journal.
+            key = "control:" + command["id"]
         lock = self.command_locks.setdefault(str(key), asyncio.Lock())
         async with lock:
             try:
@@ -404,7 +433,7 @@ class NodeService:
         if cwd is None:
             raise ValueError("Thread was not created by this node")
         checked_path(cwd, self.roots, directory=True)
-        if thread_id not in runtime.loaded_threads:
+        if kind == "turn.start" and thread_id not in runtime.loaded_threads:
             await runtime.request(
                 "thread/resume",
                 {
@@ -412,6 +441,7 @@ class NodeService:
                     "cwd": cwd,
                     "approvalPolicy": "on-request",
                     "sandbox": "workspace-write",
+                    "excludeTurns": True,
                 },
             )
             runtime.loaded_threads.add(thread_id)

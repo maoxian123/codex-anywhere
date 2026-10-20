@@ -21,6 +21,7 @@ import {
 } from "./components";
 import type { Asset, Item, Reference, StreamItem } from "./types";
 import { json, list, object, safeLink, string, timeLabel } from "./utils";
+import { galleryAssets } from "./markdown-assets";
 
 export type TimelineProps = {
   items: Item[];
@@ -154,7 +155,11 @@ function TimelineItem({
         </div>
         <div className="agent-body">
           <Markdown text={text} assets={assets} {...common} />
-          {footer}
+          <References references={references} onNavigate={onNavigate} />
+          <AssetGallery
+            assets={galleryAssets(text, assets)}
+            onImage={onImage}
+          />
           {stream && <span className="stream-cursor" aria-label="正在生成" />}
         </div>
       </article>

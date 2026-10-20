@@ -5,6 +5,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
+from alembic import command as migration_command
+from alembic.autogenerate import compare_metadata
+from alembic.config import Config
+from alembic.migration import MigrationContext
 from PIL import Image
 
 from codex_anywhere.hub.models import Event, Item, Pairing, Snapshot, db
@@ -349,6 +354,11 @@ def test_definitive_late_result_resolves_an_unknown_command(app, api, paired_hos
         },
     )
     assert api("GET", f"/api/commands/{command_id}").get_json()["command"]["status"] == "completed"
+    thread_id = created.get_json()["thread"]["id"]
+    resolved = api("GET", f"/api/threads/{thread_id}").get_json()["thread"]
+    assert resolved["native_id"] == "late-native-thread"
+    assert resolved["status"] == "idle"
+    assert resolved["last_error"] is None
 
 
 def test_approval_uses_original_rpc_id_and_only_advertised_decision(
@@ -380,3 +390,179 @@ def test_approval_uses_original_rpc_id_and_only_advertised_decision(
     assert wire["payload"]["rpc_id"] == 24
     assert wire["payload"]["runtime_id"] == host["runtime_id"]
     assert wire["payload"]["response"] == {"decision": "decline"}
+
+
+def native_event(app, host, thread, method, params, runtime_id=None):
+    handle_node_message(
+        app,
+        host["host"]["id"],
+        {
+            "type": "event",
+            "event_id": str(uuid4()),
+            "runtime_id": runtime_id or host["runtime_id"],
+            "seq": 1,
+            "method": method,
+            "params": {"threadId": thread["native_id"], **params},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "expected"),
+    [
+        (
+            "error",
+            {"error": {"message": "Model quota exhausted", "additionalDetails": "Retry tomorrow"}},
+            "Model quota exhausted\nRetry tomorrow",
+        ),
+        (
+            "turn/completed",
+            {
+                "turn": {
+                    "id": "failed-turn",
+                    "status": "failed",
+                    "error": {"message": "Tool denied"},
+                }
+            },
+            "Tool denied",
+        ),
+    ],
+)
+def test_native_failure_detail_survives_history_reload(
+    app, api, paired_host, create_thread, method, params, expected
+):
+    host = paired_host()
+    thread = create_thread(host)
+    native_event(app, host, thread, method, params)
+    # Each request opens a fresh ORM scope; no WebSocket or in-memory UI state is required.
+    for _ in range(2):
+        history = api("GET", f"/api/threads/{thread['id']}").get_json()
+        assert history["thread"]["status"] == "error"
+        assert history["thread"]["last_error"] == expected
+    listed = api("GET", "/api/threads").get_json()["threads"]
+    assert next(row for row in listed if row["id"] == thread["id"])["last_error"] == expected
+
+
+@pytest.mark.parametrize("kind", ["thread.start", "turn.start"])
+def test_failed_command_detail_is_persisted_on_its_task(app, api, paired_host, create_thread, kind):
+    host = paired_host()
+    if kind == "thread.start":
+        created = api(
+            "POST",
+            "/api/threads",
+            json={"host_id": host["host"]["id"], "cwd": host["root"], "title": "Fail creation"},
+        ).get_json()
+        thread_id = created["thread"]["id"]
+    else:
+        thread = create_thread(host)
+        thread_id = thread["id"]
+        created = api(
+            "POST",
+            f"/api/threads/{thread_id}/messages",
+            json={"text": "Run task", "client_request_id": uuid4().hex},
+        ).get_json()
+    handle_node_message(
+        app,
+        host["host"]["id"],
+        {"type": "command_result", "id": created["command"]["id"], "error": "Native RPC rejected"},
+    )
+    result = api("GET", f"/api/threads/{thread_id}").get_json()["thread"]
+    assert result["status"] == "error"
+    assert result["last_error"] == "Native RPC rejected"
+
+
+def test_new_native_turn_clears_old_error(app, api, paired_host, create_thread):
+    host = paired_host()
+    thread = create_thread(host)
+    native_event(app, host, thread, "error", {"error": {"message": "Old failure"}})
+    native_event(app, host, thread, "turn/started", {"turn": {"id": "new-turn"}})
+    result = api("GET", f"/api/threads/{thread['id']}").get_json()["thread"]
+    assert result["status"] == "active"
+    assert result["active_turn_id"] == "new-turn"
+    assert result["last_error"] is None
+
+
+def test_new_message_clears_old_error_before_the_native_turn_starts(
+    app, api, paired_host, create_thread
+):
+    host = paired_host()
+    thread = create_thread(host)
+    native_event(app, host, thread, "error", {"error": {"message": "Previous failure"}})
+    accepted = api(
+        "POST",
+        f"/api/threads/{thread['id']}/messages",
+        json={"text": "Try again", "client_request_id": uuid4().hex},
+    )
+    assert accepted.status_code == 202
+    result = api("GET", f"/api/threads/{thread['id']}").get_json()["thread"]
+    assert result["status"] == "active"
+    assert result["last_error"] is None
+
+
+def test_old_epoch_cannot_overwrite_live_error_or_status(app, api, paired_host, create_thread):
+    host = paired_host()
+    thread = create_thread(host)
+    pending = api(
+        "POST",
+        f"/api/threads/{thread['id']}/messages",
+        json={"text": "Old runtime command", "client_request_id": uuid4().hex},
+    ).get_json()["command"]
+    epoch = uuid4().hex
+    handle_node_message(
+        app, host["host"]["id"], {"type": "hello", "runtime_id": epoch, "version": "test"}
+    )
+    interrupted = api("GET", f"/api/threads/{thread['id']}").get_json()["thread"]
+    assert interrupted["status"] == "interrupted"
+    assert "未知" in interrupted["last_error"]
+    native_event(app, host, thread, "error", {"error": {"message": "Current failure"}}, epoch)
+    native_event(app, host, thread, "error", {"error": {"message": "Stale failure"}})
+    native_event(app, host, thread, "turn/started", {"turn": {"id": "stale-turn"}})
+    native_event(
+        app,
+        host,
+        thread,
+        "turn/completed",
+        {"turn": {"id": "stale-turn", "status": "completed", "items": []}},
+    )
+    handle_node_message(
+        app,
+        host["host"]["id"],
+        {"type": "command_result", "id": pending["id"], "result": {"turn": {"id": "old-turn"}}},
+    )
+    result = api("GET", f"/api/threads/{thread['id']}").get_json()["thread"]
+    assert result["status"] == "error"
+    assert result["last_error"] == "Current failure"
+    assert result["active_turn_id"] is None
+    outcome = api("GET", f"/api/commands/{pending['id']}").get_json()["command"]
+    assert outcome["status"] == "completed"
+
+
+def test_last_error_migration_preserves_existing_tasks_and_matches_models(app):
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(__file__).resolve().parents[1] / "codex_anywhere" / "migrations"),
+    )
+    with app.app_context():
+        db.drop_all()
+        with db.engine.begin() as connection:
+            config.attributes["connection"] = connection
+            migration_command.upgrade(config, "0001_initial")
+            connection.execute(
+                sa.text(
+                    "INSERT INTO host (id, name, platform, roots, token_hash) "
+                    "VALUES ('host-old', 'Old host', 'test', '[]', 'old-token-hash')"
+                )
+            )
+            connection.execute(
+                sa.text(
+                    "INSERT INTO thread (id, host_id, title, cwd, status, created_at, updated_at) "
+                    "VALUES ('task-old', 'host-old', 'Existing task', '/project', 'idle', 1, 1)"
+                )
+            )
+            migration_command.upgrade(config, "head")
+            row = connection.execute(
+                sa.text("SELECT title, last_error FROM thread WHERE id = 'task-old'")
+            ).one()
+            assert row.title == "Existing task" and row.last_error is None
+            assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []

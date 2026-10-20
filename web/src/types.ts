@@ -21,6 +21,7 @@ export type Thread = {
   cwd: string;
   status: string;
   active_turn_id?: string;
+  last_error?: string | null;
   created_at: string;
   updated_at: string;
 };

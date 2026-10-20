@@ -18,9 +18,11 @@ from codex_anywhere.node.service import NodeService, pair_node
 from codex_anywhere.node.store import NodeStore
 
 FAKE_CODEX = r"""
-import json, os, sys
+import json, os, sys, time
 pending = None
+pending_resume = None
 calls = []
+call_params = {}
 def emit(value):
     raw = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
     # Split bytes inside multibyte UTF-8 as well as JSON tokens.
@@ -32,6 +34,7 @@ for line in sys.stdin.buffer:
     method, rpc_id = message.get("method"), message.get("id")
     if method:
         calls.append(method)
+        call_params.setdefault(method, []).append(message.get("params"))
     if method == "initialize":
         emit({"id":rpc_id,"result":{"userAgent":"fake-test-peer"}})
     elif method == "echo":
@@ -40,18 +43,30 @@ for line in sys.stdin.buffer:
     elif method == "needsApproval":
         pending = rpc_id
         emit({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"native-1","availableDecisions":["accept","decline"]}})
+    elif method == "needsApprovalThenResolve":
+        emit({"id":"approval-original","method":"item/commandExecution/requestApproval","params":{"threadId":"native-1","availableDecisions":["accept","decline"]}})
+        time.sleep(0.05)
+        emit({"method":"serverRequest/resolved","params":{"threadId":"native-1","requestId":"approval-original"}})
+        emit({"id":rpc_id,"result":{"expired":True}})
     elif method is None and rpc_id == 42:
         emit({"id":pending,"result":{"approval_id":rpc_id,"response":message["result"]}})
     elif method == "thread/start":
         emit({"id":rpc_id,"result":{"thread":{"id":"native-1","cwd":message["params"]["cwd"]}}})
     elif method == "thread/resume":
-        emit({"id":rpc_id,"result":{"thread":{"id":"native-1"}}})
+        if message["params"]["threadId"] == "slow-thread":
+            pending_resume = rpc_id
+            emit({"method":"test/resumePending","params":{"threadId":"slow-thread"}})
+        else:
+            emit({"id":rpc_id,"result":{"thread":{"id":"native-1"}}})
+    elif method == "releaseResume":
+        emit({"id":pending_resume,"result":{"thread":{"id":"slow-thread"}}})
+        emit({"id":rpc_id,"result":{}})
     elif method == "turn/start":
         if message["params"]["input"][0].get("text") == "DIE":
             os._exit(3)
         emit({"id":rpc_id,"result":{"turn":{"id":"turn-1"}}})
     elif method == "inspect":
-        emit({"id":rpc_id,"result":{"calls":calls}})
+        emit({"id":rpc_id,"result":{"calls":calls,"params":call_params}})
     elif method == "die":
         os._exit(3)
     elif rpc_id is not None:
@@ -478,3 +493,340 @@ def test_pair_stores_token_locally_without_returning_it(tmp_path, monkeypatch):
     assert json.loads((config_dir / "node.json").read_text())["token"] == "secret-token"
     if os.name != "nt":
         assert (config_dir / "node.json").stat().st_mode & 0o077 == 0
+
+
+def test_resolved_request_cannot_be_answered_after_waiting_for_writer(peer):
+    async def scenario():
+        approval, resolved = asyncio.Event(), asyncio.Event()
+
+        async def event(method, params, rpc_id):
+            if rpc_id == "approval-original":
+                approval.set()
+            elif method == "serverRequest/resolved":
+                resolved.set()
+
+        runtime = CodexRuntime(peer, event, timeout=3)
+        await runtime.start()
+        try:
+            request = asyncio.create_task(runtime.request("needsApprovalThenResolve", {}))
+            await asyncio.wait_for(approval.wait(), 3)
+            # Hold the writer until Codex resolves the request independently.
+            await runtime._write_lock.acquire()
+            answer = asyncio.create_task(
+                runtime.answer("approval-original", {"decision": "accept"})
+            )
+            try:
+                await asyncio.wait_for(resolved.wait(), 3)
+            finally:
+                runtime._write_lock.release()
+            with pytest.raises(ValueError, match="expired"):
+                await answer
+            assert await request == {"expired": True}
+            assert not runtime.server_requests
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_answers_write_only_one_response(peer):
+    async def scenario():
+        approval = asyncio.Event()
+
+        async def event(method, params, rpc_id):
+            if rpc_id == 42:
+                approval.set()
+
+        runtime = CodexRuntime(peer, event, timeout=3)
+        await runtime.start()
+        try:
+            request = asyncio.create_task(runtime.request("needsApproval", {}))
+            await asyncio.wait_for(approval.wait(), 3)
+            results = await asyncio.gather(
+                runtime.answer(42, {"decision": "accept"}),
+                runtime.answer(42, {"decision": "decline"}),
+                return_exceptions=True,
+            )
+            assert sum(isinstance(result, ValueError) for result in results) == 1
+            assert {"answered": True} in results
+            assert (await request)["approval_id"] == 42
+            assert not runtime.server_requests
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_controls_and_approval_do_not_wait_for_slow_thread_resume(peer, tmp_path):
+    async def scenario():
+        service = NodeService(
+            {
+                "server": "http://127.0.0.1:9876",
+                "token": "test-token",
+                "host_id": "host",
+                "roots": [str(tmp_path)],
+            },
+            tmp_path,
+        )
+        resuming, approval = asyncio.Event(), asyncio.Event()
+
+        async def event(method, params, rpc_id):
+            await service._native_event(method, params, rpc_id)
+            if method == "test/resumePending":
+                resuming.set()
+            if rpc_id == 42:
+                approval.set()
+
+        runtime = CodexRuntime(peer, event, service._runtime_exit, timeout=3)
+        service.runtime = runtime
+        service.store.save_thread("slow-thread", str(tmp_path))
+        await runtime.start()
+        start_command = {
+            "id": "slow-start",
+            "kind": "turn.start",
+            "thread_id": "hub-thread",
+            "payload": {
+                "native_thread_id": "slow-thread",
+                "input": [{"type": "text", "text": "Continue"}],
+            },
+        }
+        start = asyncio.create_task(service.handle_command(start_command))
+        try:
+            await asyncio.wait_for(resuming.wait(), 3)
+            for kind, extra in [
+                ("turn.interrupt", {"turn_id": "active-turn"}),
+                (
+                    "turn.steer",
+                    {
+                        "expected_turn_id": "active-turn",
+                        "input": [{"type": "text", "text": "Change direction"}],
+                    },
+                ),
+            ]:
+                result = await asyncio.wait_for(
+                    service.handle_command(
+                        {
+                            "id": kind,
+                            "kind": kind,
+                            "thread_id": "hub-thread",
+                            "payload": {"native_thread_id": "slow-thread", **extra},
+                        }
+                    ),
+                    1,
+                )
+                assert "error" not in result
+                assert not start.done()
+            approval_request = asyncio.create_task(runtime.request("needsApproval", {}))
+            await asyncio.wait_for(approval.wait(), 3)
+            answer = await asyncio.wait_for(
+                service.handle_command(
+                    {
+                        "id": "answer-during-resume",
+                        "kind": "interaction.answer",
+                        "thread_id": "hub-thread",
+                        "payload": {
+                            "runtime_id": runtime.runtime_id,
+                            "rpc_id": 42,
+                            "response": {"decision": "decline"},
+                        },
+                    }
+                ),
+                1,
+            )
+            assert answer["result"] == {"answered": True}
+            assert not start.done()
+            assert (await approval_request)["response"] == {"decision": "decline"}
+            await runtime.request("releaseResume", {})
+            assert (await start)["result"]["turn"]["id"] == "turn-1"
+            inspected = await runtime.request("inspect", {})
+            assert inspected["calls"].count("thread/resume") == 1
+            assert inspected["params"]["thread/resume"][0]["excludeTurns"] is True
+            assert "slow-thread" in runtime.loaded_threads
+        finally:
+            if not start.done():
+                start.cancel()
+                await asyncio.gather(start, return_exceptions=True)
+            await runtime.close()
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_restart_resumes_owned_thread_once_without_loading_history(peer, tmp_path):
+    async def scenario():
+        config = {
+            "server": "http://127.0.0.1:9876",
+            "token": "test-token",
+            "host_id": "host",
+            "roots": [str(tmp_path)],
+        }
+        first = NodeService(config, tmp_path)
+        runtime = CodexRuntime(peer, first._native_event, first._runtime_exit, timeout=3)
+        first.runtime = runtime
+        await runtime.start()
+        await first.handle_command(
+            {
+                "id": "initial-start",
+                "kind": "thread.start",
+                "thread_id": "hub-thread",
+                "payload": {"cwd": str(tmp_path)},
+            }
+        )
+        epoch = runtime.runtime_id
+        await runtime.close()
+        first.store.close()
+
+        second = NodeService(config, tmp_path)
+        runtime = CodexRuntime(peer, second._native_event, second._runtime_exit, timeout=3)
+        second.runtime = runtime
+        await runtime.start()
+        try:
+            assert runtime.runtime_id != epoch and not runtime.loaded_threads
+            for number in range(2):
+                result = await second.handle_command(
+                    {
+                        "id": f"restarted-turn-{number}",
+                        "kind": "turn.start",
+                        "thread_id": "hub-thread",
+                        "payload": {
+                            "native_thread_id": "native-1",
+                            "input": [{"type": "text", "text": "Continue"}],
+                        },
+                    }
+                )
+                assert "error" not in result
+            inspected = await runtime.request("inspect", {})
+            assert inspected["calls"].count("thread/resume") == 1
+            assert inspected["calls"].count("turn/start") == 2
+            params = inspected["params"]["thread/resume"][0]
+            assert params == {
+                "threadId": "native-1",
+                "cwd": str(tmp_path),
+                "approvalPolicy": "on-request",
+                "sandbox": "workspace-write",
+                "excludeTurns": True,
+            }
+        finally:
+            await runtime.close()
+            second.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_outbox_window_sends_each_event_once_while_acks_arrive_individually(tmp_path):
+    async def scenario():
+        service = NodeService(
+            {
+                "server": "http://127.0.0.1:9876",
+                "token": "test-token",
+                "host_id": "host",
+                "roots": [str(tmp_path)],
+            },
+            tmp_path,
+        )
+        events = [service.store.record_event("epoch", "delta", {"index": i}) for i in range(100)]
+        sent, active = [], set()
+        max_active = 0
+        yields = 0
+
+        async def send(event):
+            nonlocal max_active
+            assert event["event_id"] not in active, (
+                "An in-flight event was sent again before timeout"
+            )
+            active.add(event["event_id"])
+            max_active = max(max_active, len(active))
+            sent.append(event["event_id"])
+            return True
+
+        async def ticker():
+            nonlocal yields
+            while True:
+                yields += 1
+                await asyncio.sleep(0)
+
+        async def reached(count):
+            while len(sent) < count:
+                await asyncio.sleep(0)
+
+        def acknowledge(event_id):
+            if service.store.acknowledge(event_id):
+                active.discard(event_id)
+                service.event_wake.set()
+
+        service._send = send
+        ticker_task = asyncio.create_task(ticker())
+        task = asyncio.create_task(service._outbox())
+        try:
+            await asyncio.wait_for(reached(100), 2)
+            assert yields >= 6  # Sending a full batch yields to the reader regularly.
+            # New deltas and repeated wakeups must not replay the existing window.
+            for index in range(40):
+                events.append(service.store.record_event("epoch", "delta", {"index": index + 100}))
+                service.event_wake.set()
+                await asyncio.sleep(0)
+            assert len(sent) == 100
+            # Every ACK frees exactly one slot, without resending its 99 peers.
+            for index, event in enumerate(events[:40]):
+                acknowledge(event["event_id"])
+                assert service.store.acknowledge(event["event_id"]) is False
+                await asyncio.wait_for(reached(101 + index), 2)
+                assert len(sent) == 101 + index
+            for event in events[40:]:
+                acknowledge(event["event_id"])
+                await asyncio.sleep(0)
+            assert service.store.pending_events() == []
+            assert len(sent) == len(set(sent)) == 140
+            assert max_active == 100
+            assert service.store.acknowledge("unknown-event") is False
+        finally:
+            task.cancel()
+            ticker_task.cancel()
+            await asyncio.gather(task, ticker_task, return_exceptions=True)
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_outbox_retries_only_after_timeout_and_stops_after_ack(tmp_path, monkeypatch):
+    from codex_anywhere.node import service as node_service
+
+    assert node_service.OUTBOX_RETRY_SECONDS >= 5
+    monkeypatch.setattr(node_service, "OUTBOX_RETRY_SECONDS", 0.05)
+
+    async def scenario():
+        service = NodeService(
+            {
+                "server": "http://127.0.0.1:9876",
+                "token": "test-token",
+                "host_id": "host",
+                "roots": [str(tmp_path)],
+            },
+            tmp_path,
+        )
+        event = service.store.record_event("epoch", "delta", {})
+        sent_at = []
+        resent = asyncio.Event()
+
+        async def send(value):
+            assert value["event_id"] == event["event_id"]
+            sent_at.append(asyncio.get_running_loop().time())
+            if len(sent_at) == 2:
+                resent.set()
+            return True
+
+        service._send = send
+        task = asyncio.create_task(service._outbox())
+        try:
+            await asyncio.wait_for(resent.wait(), 1)
+            assert len(sent_at) == 2 and sent_at[1] - sent_at[0] >= 0.05
+            assert service.store.acknowledge(event["event_id"]) is True
+            service.event_wake.set()
+            await asyncio.sleep(0.12)
+            assert len(sent_at) == 2
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            service.store.close()
+
+    asyncio.run(scenario())

@@ -57,18 +57,32 @@ def logged_in(client):
 
 
 @pytest.fixture
-def api(logged_in):
+def pump_nodes(app):
+    def pump():
+        for host_id, socket in app.extensions.get("_fake_nodes", {}).items():
+            app.extensions["broker"].pump(host_id, socket, limit=128)
+
+    return pump
+
+
+@pytest.fixture
+def api(logged_in, pump_nodes):
     def request(method, path, **kwargs):
+        flush = kwargs.pop("flush", True)
         token = logged_in.get("/api/auth/me").get_json()["csrf_token"]
         headers = kwargs.pop("headers", {})
         headers["X-CSRF-Token"] = token
-        return logged_in.open(path, method=method, headers=headers, **kwargs)
+        response = logged_in.open(path, method=method, headers=headers, **kwargs)
+        if flush:
+            # A test client has no node owner loop; explicitly run its queue pump.
+            pump_nodes()
+        return response
 
     return request
 
 
 @pytest.fixture
-def paired_host(app, client, api, tmp_path):
+def paired_host(app, client, api, tmp_path, pump_nodes):
     def pair(name="workstation"):
         root = tmp_path / name
         root.mkdir(exist_ok=True)
@@ -87,7 +101,8 @@ def paired_host(app, client, api, tmp_path):
         data = result.get_json()
         host_id = data["host"]["id"]
         socket = FakeNodeSocket()
-        app.extensions["broker"].attach(host_id, socket)
+        app.extensions["broker"].attach(host_id, socket, ready=True)
+        app.extensions.setdefault("_fake_nodes", {})[host_id] = socket
         runtime_id = str(uuid4())
         with app.app_context():
             handle_node_message(
@@ -101,6 +116,7 @@ def paired_host(app, client, api, tmp_path):
                     "platform": "test",
                 },
             )
+        pump_nodes()
         return {
             **data,
             "root": str(root.resolve()),
@@ -112,7 +128,7 @@ def paired_host(app, client, api, tmp_path):
 
 
 @pytest.fixture
-def create_thread(app, api):
+def create_thread(app, api, pump_nodes):
     def create(host, title="Test task"):
         response = api(
             "POST",
@@ -132,13 +148,14 @@ def create_thread(app, api):
                     "result": {"thread": {"id": native_id, "cwd": host["root"]}},
                 },
             )
+        pump_nodes()
         return {**data["thread"], "native_id": native_id}
 
     return create
 
 
 @pytest.fixture
-def completed_item(app):
+def completed_item(app, pump_nodes):
     def add(host, thread, text="Context from another task"):
         native_item = "item-" + uuid4().hex
         event = {
@@ -155,6 +172,7 @@ def completed_item(app):
         }
         with app.app_context():
             handle_node_message(app, host["host"]["id"], event)
+        pump_nodes()
         return native_item
 
     return add

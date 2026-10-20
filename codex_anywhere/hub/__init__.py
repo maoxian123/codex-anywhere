@@ -26,7 +26,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from .broker import Broker
+from .broker import Broker, install_full_writes
 from .models import Asset, Command, Event, Host, Interaction, Item, Pairing, Thread, db, iso, new_id
 from .references import quote_references, resolve_references
 from .transport import emit, handle_node_message
@@ -460,6 +460,7 @@ def create_app(test_config=None):
             if kind == "turn.steer":
                 payload["expected_turn_id"] = thread.active_turn_id
             thread.status = "active"
+            thread.last_error = None
             command = _issue_command(host, thread, kind, payload, key)
             return jsonify(command=command), 202
 
@@ -572,6 +573,7 @@ def create_app(test_config=None):
 
     @sock.route("/ws/client")
     def client_socket(ws):
+        install_full_writes(ws)
         if not origin_valid():
             ws.close()
             return
@@ -602,6 +604,7 @@ def create_app(test_config=None):
 
     @sock.route("/ws/node")
     def node_socket(ws):
+        install_full_writes(ws)
         host = node_host()
         host_id = host.id
         db.session.remove()
@@ -615,9 +618,20 @@ def create_app(test_config=None):
             frame = json.loads(raw) if raw else {}
             if frame.get("type") != "hello":
                 raise ValueError("hello is required")
-            handle_node_message(app, host_id, frame)
-            while ws.connected:
-                raw = ws.receive(timeout=40)
+            handle_node_message(
+                app,
+                host_id,
+                frame,
+                flush_outgoing=lambda: broker.pump(host_id, ws),
+                outgoing_socket=ws,
+            )
+            while ws.connected and broker.is_attached(host_id, ws):
+                # HTTP handlers only enqueue. This connection's owner thread
+                # performs all application writes without waiting for inbound
+                # traffic or a heartbeat to wake a long receive timeout.
+                if not broker.pump(host_id, ws):
+                    break
+                raw = ws.receive(timeout=0.1)
                 if raw is None:
                     if not broker.is_online(host_id):
                         break
@@ -631,9 +645,13 @@ def create_app(test_config=None):
         finally:
             broker.detach(host_id, ws)
             with app.app_context():
-                emit("anywhere/host_offline", {"host_id": host_id}, host_id=host_id)
-                db.session.commit()
-            ws.close()
+                if not broker.is_online(host_id):
+                    emit("anywhere/host_offline", {"host_id": host_id}, host_id=host_id)
+                    db.session.commit()
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     web_dist = Path(os.getenv("WEB_DIST", str(Path.cwd() / "web" / "dist"))).resolve()
 

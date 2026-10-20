@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import time
 
 from .models import Asset, Command, Event, Host, Interaction, Item, Thread, db
@@ -12,6 +13,23 @@ def emit(method, params, thread_id=None, host_id=None):
     event = Event(method=method, params=params, thread_id=thread_id, host_id=host_id)
     db.session.add(event)
     return event
+
+
+def _error_detail(value, fallback):
+    """Keep native human-readable diagnostics available after a page reload."""
+    if isinstance(value, str):
+        return value.strip()[:16000] or fallback
+    if isinstance(value, dict):
+        parts = []
+        for key in ("message", "additionalDetails", "details"):
+            detail = value.get(key)
+            if isinstance(detail, str) and detail.strip() and detail.strip() not in parts:
+                parts.append(detail.strip())
+        if parts:
+            return "\n".join(parts)[:16000]
+        if value:
+            return json.dumps(value, ensure_ascii=False)[:16000]
+    return fallback
 
 
 def _assets(item):
@@ -106,6 +124,7 @@ def _project(thread, method, params, live=True):
     elif method == "turn/started" and live:
         thread.active_turn_id = params.get("turn", {}).get("id")
         thread.status = "active"
+        thread.last_error = None
     elif method == "turn/completed" and live:
         turn = params.get("turn", {})
         for item in turn.get("items", []):
@@ -113,6 +132,12 @@ def _project(thread, method, params, live=True):
         thread.status = {"failed": "error", "interrupted": "interrupted"}.get(
             turn.get("status"), "idle"
         )
+        if turn.get("status") == "failed":
+            thread.last_error = _error_detail(
+                turn.get("error"), thread.last_error or "Codex 执行失败，未返回错误详情"
+            )
+        elif turn.get("status") == "completed":
+            thread.last_error = None
         thread.active_turn_id = None
         for interaction in Interaction.query.filter_by(thread_id=thread.id, status="pending"):
             interaction.status = "expired"
@@ -135,9 +160,31 @@ def _project(thread, method, params, live=True):
             item.data = dict(item.data, _assets=values)
     elif method == "error" and live:
         thread.status = "error"
+        thread.last_error = _error_detail(params.get("error", params), "Codex 执行失败")
 
 
-def handle_node_message(app, host_id, message):
+def handle_node_message(app, host_id, message, flush_outgoing=None, outgoing_socket=None):
+    """Persist first; let the connection owner stream hello replay outside DB locks."""
+    if flush_outgoing is not None and outgoing_socket is None:
+        raise ValueError("Hello replay requires its original outgoing socket")
+    replay = _persist_node_message(app, host_id, message, defer_hello=flush_outgoing is not None)
+    if replay is not None:
+        broker = app.extensions["broker"]
+        for frame in replay:
+            if (
+                not broker.send(host_id, frame, expected_socket=outgoing_socket)
+                or not flush_outgoing()
+            ):
+                return
+        # Keep HTTP producers offline until welcome and older commands have
+        # reached this owner; otherwise a new command can precede hello replay.
+        if broker.mark_ready(host_id, outgoing_socket):
+            with app.app_context():
+                emit("anywhere/host_online", {"host_id": host_id}, host_id=host_id)
+                db.session.commit()
+
+
+def _persist_node_message(app, host_id, message, defer_hello=False):
     """Process one frame, committing before an event ACK. Also used by integration tests."""
     broker = app.extensions["broker"]
     with app.app_context(), broker.command_lock:
@@ -162,6 +209,7 @@ def handle_node_message(app, host_id, message):
                     if thread.status in {"active", "waiting"}:
                         thread.status = "interrupted"
                         thread.active_turn_id = None
+                        thread.last_error = "节点运行进程已更换，执行结果未知；未自动重试"
             pending = Command.query.filter(
                 Command.host_id == host_id, Command.status.in_(["queued", "sent", "running"])
             ).all()
@@ -176,15 +224,22 @@ def handle_node_message(app, host_id, message):
                     if affected and command.kind in {"thread.start", "turn.start"}:
                         affected.status = "interrupted"
                         affected.active_turn_id = None
+                        affected.last_error = command.error
                 else:
                     command.runtime_id = epoch
                     command.status = "sent"
                     replay.append(command.wire())
-            emit("anywhere/host_online", {"host_id": host_id}, host_id=host_id)
+            if not defer_hello:
+                emit("anywhere/host_online", {"host_id": host_id}, host_id=host_id)
             db.session.commit()
+            if defer_hello:
+                return [{"type": "welcome", "host_id": host_id, "protocol": 1}] + [
+                    {"type": "command", "command": wire} for wire in replay
+                ]
             broker.send(host_id, {"type": "welcome", "host_id": host_id, "protocol": 1})
             for wire in replay:
-                broker.send_command({"host_id": host_id, "wire": wire})
+                if not broker.send_command({"host_id": host_id, "wire": wire}):
+                    return
             return
         if kind == "ping":
             db.session.commit()
@@ -204,6 +259,15 @@ def handle_node_message(app, host_id, message):
             ):
                 return
             thread = db.session.get(Thread, command.thread_id) if command.thread_id else None
+            # A completed old command is useful evidence, but cannot overwrite a
+            # newer runtime's live failure. A late thread creation can settle its
+            # own unknown state when no newer state has replaced that diagnostic.
+            project_result = command.runtime_id == host.runtime_id or (
+                thread is not None
+                and command.kind == "thread.start"
+                and thread.native_id is None
+                and thread.last_error == command.error
+            )
             command.updated_at = time.time()
             if kind == "command_started":
                 command.status = "running"
@@ -221,19 +285,24 @@ def handle_node_message(app, host_id, message):
                         native = result.get("thread", {})
                         if not native.get("id"):
                             command.status, command.error = "failed", "Codex 未返回会话 ID"
-                            thread.status = "error"
+                            if project_result:
+                                thread.status = "error"
+                                thread.last_error = command.error
                         else:
                             thread.native_id = str(native["id"])
-                            thread.status = "idle"
-                    elif command.kind in {"turn.start", "turn.steer"}:
+                            if project_result:
+                                thread.status = "idle"
+                                thread.last_error = None
+                    elif command.kind in {"turn.start", "turn.steer"} and project_result:
                         turn = result.get("turn", {})
                         if thread.status in {"active", "waiting"}:
                             thread.active_turn_id = (
                                 turn.get("id") or result.get("turnId") or thread.active_turn_id
                             )
-                elif thread and command.kind in {"thread.start", "turn.start"}:
-                    thread.status = "error"
+                elif thread and command.kind in {"thread.start", "turn.start"} and project_result:
+                    thread.status = "interrupted" if command.status == "unknown" else "error"
                     thread.active_turn_id = None
+                    thread.last_error = command.error or "Codex 指令未成功完成"
                 if command.kind == "interaction.answer":
                     interaction = db.session.get(
                         Interaction, command.payload.get("_interaction_id")
@@ -242,7 +311,7 @@ def handle_node_message(app, host_id, message):
                         interaction.status = (
                             "resolved" if command.status == "completed" else "expired"
                         )
-                        if thread and thread.status == "waiting":
+                        if thread and thread.status == "waiting" and project_result:
                             thread.status = "active" if thread.active_turn_id else "idle"
                 emit(
                     "anywhere/command_completed",
@@ -310,5 +379,9 @@ def handle_node_message(app, host_id, message):
                 if active.status in {"waiting", "active"}:
                     active.status = "interrupted"
                     active.active_turn_id = None
+                    code = params.get("returncode")
+                    active.last_error = "Codex 进程已停止，当前执行已中断" + (
+                        f"（退出码 {code}）" if code is not None else ""
+                    )
         db.session.commit()
         broker.send(host_id, {"type": "event_ack", "event_id": event_id})

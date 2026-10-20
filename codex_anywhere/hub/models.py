@@ -57,6 +57,7 @@ class Thread(db.Model):
     cwd = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(24), default="starting", nullable=False)
     active_turn_id = db.Column(db.String(200), nullable=True)
+    last_error = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.Float, default=time.time, nullable=False)
     updated_at = db.Column(db.Float, default=time.time, nullable=False, index=True)
 
@@ -69,6 +70,7 @@ class Thread(db.Model):
             cwd=self.cwd,
             status=self.status,
             active_turn_id=self.active_turn_id,
+            last_error=self.last_error,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
         )
