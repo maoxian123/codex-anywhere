@@ -1,0 +1,208 @@
+"""Durable control-plane records; the node remains the runtime authority."""
+
+from __future__ import annotations
+
+import time
+import uuid
+from datetime import datetime, timezone
+
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def iso(value: float | None) -> str | None:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat() if value else None
+
+
+class Host(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    name = db.Column(db.String(120), nullable=False)
+    platform = db.Column(db.String(80), nullable=False)
+    roots = db.Column(db.JSON, nullable=False, default=list)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True)
+    version = db.Column(db.String(120), default="")
+    runtime_id = db.Column(db.String(100), nullable=True)
+    last_seen_at = db.Column(db.Float, default=time.time)
+
+    def as_dict(self, online=False):
+        return dict(
+            id=self.id,
+            name=self.name,
+            platform=self.platform,
+            roots=self.roots,
+            version=self.version,
+            online=online,
+            last_seen_at=iso(self.last_seen_at),
+        )
+
+
+class Pairing(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    code_hash = db.Column(db.String(64), nullable=False, unique=True)
+    expires_at = db.Column(db.Float, nullable=False)
+    consumed = db.Column(db.Boolean, default=False, nullable=False)
+
+
+class Thread(db.Model):
+    __table_args__ = (db.UniqueConstraint("host_id", "native_id"),)
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    host_id = db.Column(db.String(32), db.ForeignKey("host.id"), nullable=False, index=True)
+    native_id = db.Column(db.String(200), nullable=True)
+    title = db.Column(db.String(240), nullable=False)
+    cwd = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(24), default="starting", nullable=False)
+    active_turn_id = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+    updated_at = db.Column(db.Float, default=time.time, nullable=False, index=True)
+
+    def as_dict(self):
+        return dict(
+            id=self.id,
+            host_id=self.host_id,
+            native_id=self.native_id,
+            title=self.title,
+            cwd=self.cwd,
+            status=self.status,
+            active_turn_id=self.active_turn_id,
+            created_at=iso(self.created_at),
+            updated_at=iso(self.updated_at),
+        )
+
+
+class Command(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    host_id = db.Column(db.String(32), db.ForeignKey("host.id"), nullable=False, index=True)
+    thread_id = db.Column(db.String(32), db.ForeignKey("thread.id"), nullable=True)
+    kind = db.Column(db.String(60), nullable=False)
+    payload = db.Column(db.JSON, nullable=False)
+    idempotency_key = db.Column(db.String(250), nullable=True, unique=True)
+    status = db.Column(db.String(24), default="queued", nullable=False)
+    result = db.Column(db.JSON, nullable=True)
+    error = db.Column(db.Text, nullable=True)
+    runtime_id = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+    updated_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            id=self.id,
+            host_id=self.host_id,
+            thread_id=self.thread_id,
+            kind=self.kind,
+            status=self.status,
+            result=self.result,
+            error=self.error,
+            created_at=iso(self.created_at),
+            updated_at=iso(self.updated_at),
+        )
+
+    def wire(self):
+        return dict(id=self.id, kind=self.kind, thread_id=self.thread_id, payload=self.payload)
+
+
+class Item(db.Model):
+    __table_args__ = (db.UniqueConstraint("thread_id", "native_id"),)
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    native_id = db.Column(db.String(250), nullable=False)
+    thread_id = db.Column(db.String(32), db.ForeignKey("thread.id"), nullable=False, index=True)
+    turn_id = db.Column(db.String(200), nullable=True)
+    type = db.Column(db.String(100), nullable=False)
+    data = db.Column(db.JSON, nullable=False)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            id=self.id,
+            native_id=self.native_id,
+            thread_id=self.thread_id,
+            turn_id=self.turn_id,
+            type=self.type,
+            data=self.data,
+            created_at=iso(self.created_at),
+        )
+
+
+class Event(db.Model):
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    event_key = db.Column(db.String(200), nullable=True, unique=True)
+    host_id = db.Column(db.String(32), nullable=True, index=True)
+    thread_id = db.Column(db.String(32), nullable=True, index=True)
+    method = db.Column(db.String(200), nullable=False)
+    params = db.Column(db.JSON, nullable=False, default=dict)
+    runtime_id = db.Column(db.String(100), nullable=True)
+    seq = db.Column(db.BigInteger, nullable=True)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            type="event",
+            id=self.id,
+            thread_id=self.thread_id,
+            method=self.method,
+            params=self.params,
+        )
+
+
+class Interaction(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    host_id = db.Column(db.String(32), nullable=False)
+    thread_id = db.Column(db.String(32), db.ForeignKey("thread.id"), nullable=True, index=True)
+    runtime_id = db.Column(db.String(100), nullable=False)
+    rpc_id = db.Column(db.JSON, nullable=False)
+    method = db.Column(db.String(200), nullable=False)
+    params = db.Column(db.JSON, nullable=False)
+    status = db.Column(db.String(24), default="pending", nullable=False)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            id=self.id,
+            thread_id=self.thread_id,
+            method=self.method,
+            params=self.params,
+            status=self.status,
+        )
+
+
+class Asset(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    host_id = db.Column(db.String(32), nullable=True)
+    thread_id = db.Column(db.String(32), nullable=True, index=True)
+    native_item_id = db.Column(db.String(250), nullable=True)
+    name = db.Column(db.String(250), nullable=False)
+    mime = db.Column(db.String(80), nullable=False)
+    size = db.Column(db.Integer, nullable=False)
+    path = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            id=self.id, name=self.name, mime=self.mime, size=self.size, url=f"/api/assets/{self.id}"
+        )
+
+
+class Snapshot(db.Model):
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    kind = db.Column(db.String(20), nullable=False)
+    title = db.Column(db.String(500), nullable=False)
+    url = db.Column(db.Text, nullable=True)
+    thread_id = db.Column(db.String(32), nullable=True)
+    item_id = db.Column(db.String(250), nullable=True)
+    excerpt = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self):
+        return dict(
+            kind=self.kind,
+            title=self.title,
+            url=self.url,
+            thread_id=self.thread_id,
+            item_id=self.item_id,
+            snapshot_id=self.id,
+            excerpt=self.excerpt,
+        )

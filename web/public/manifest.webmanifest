@@ -1,0 +1,19 @@
+{
+  "name": "Codex Anywhere",
+  "short_name": "Anywhere",
+  "description": "随处连接你的 Codex 工作台",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#10171c",
+  "theme_color": "#10171c",
+  "icons": [
+    {
+      "src": "/icons/codex-anywhere.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

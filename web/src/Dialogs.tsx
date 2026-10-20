@@ -1,0 +1,420 @@
+import { useEffect, useState, type FormEvent } from "react";
+import {
+  ArrowRight,
+  CircleCheck,
+  Code2,
+  FolderOpen,
+  KeyRound,
+  Link2,
+  Monitor,
+  Plus,
+  Terminal,
+} from "lucide-react";
+import { api, errorText, post, setSession } from "./api";
+import { CopyButton, ErrorMessage, Modal, Spinner } from "./components";
+import type { Command, Host, Session, Thread } from "./types";
+
+export function Login({ onLogin }: { onLogin: (session: Session) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const session = await post<Session>("/auth/login", {
+        username,
+        password,
+      });
+      setSession(session);
+      onLogin(session);
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <main className="login-page">
+      <div className="login-brand">
+        <img src="/icons/codex-anywhere.svg" alt="" />
+        <span>
+          codex<span className="brand-light">anywhere</span>
+        </span>
+      </div>
+      <div className="login-card">
+        <div className="login-emblem">
+          <Terminal size={30} />
+        </div>
+        <p className="eyebrow">YOUR WORK, WITHIN REACH</p>
+        <h1>工作从这里继续。</h1>
+        <p className="login-description">
+          连接你的设备，在任何地方
+          <br />与 Codex 一起完成工作。
+        </p>
+        <form onSubmit={(event) => void submit(event)} className="form-stack">
+          <label>
+            用户名
+            <input
+              name="username"
+              autoComplete="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder="管理员用户名"
+              required
+              autoFocus
+              disabled={busy}
+            />
+          </label>
+          <label>
+            密码
+            <input
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="输入登录密码"
+              required
+              disabled={busy}
+            />
+          </label>
+          {error && <ErrorMessage>{error}</ErrorMessage>}
+          <button
+            type="submit"
+            className="button button-primary login-submit"
+            disabled={busy}
+          >
+            {busy ? (
+              <Spinner label="正在登录" />
+            ) : (
+              <>
+                进入工作台
+                <ArrowRight size={16} />
+              </>
+            )}
+          </button>
+        </form>
+        <p className="login-note">
+          <KeyRound size={12} />
+          使用管理中心配置的管理员凭据登录
+        </p>
+      </div>
+      <footer className="login-footer">在你的设备执行 · 从任何地方连接</footer>
+    </main>
+  );
+}
+
+export function PairingDialog({ onClose }: { onClose: () => void }) {
+  const [pairing, setPairing] = useState<{
+    code: string;
+    expires_at: string;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [now, setNow] = useState(Date.now());
+  const generate = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setPairing(
+        await post<{ code: string; expires_at: string }>("/pairings", {}),
+      );
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const expired = pairing
+    ? now >= new Date(pairing.expires_at).getTime()
+    : false;
+  const command = pairing
+    ? `codex-anywhere node pair --server ${window.location.origin} --code ${pairing.code} --name "my-computer" --root "PROJECT_PATH"`
+    : "";
+  return (
+    <Modal
+      title="连接一台设备"
+      subtitle="在运行 Codex 的电脑上安装并启动节点服务。"
+      onClose={onClose}
+    >
+      <div className="pairing-steps">
+        <section>
+          <span className="step-number">1</span>
+          <div>
+            <h3>在工作电脑安装节点</h3>
+            <p>
+              先安装 Codex CLI、完成登录，然后在本项目的 Python 环境中运行命令。
+            </p>
+            <div className="code-block">
+              <code>python -m pip install -e .</code>
+              <CopyButton text="python -m pip install -e ." />
+            </div>
+          </div>
+        </section>
+        <section>
+          <span className="step-number">2</span>
+          <div>
+            <h3>生成一次性配对码</h3>
+            <p>配对码用于将这台电脑连接到你的管理中心。</p>
+            {pairing ? (
+              <div className={`pair-code ${expired ? "expired" : ""}`}>
+                <span>{pairing.code}</span>
+                <CopyButton text={pairing.code} />
+                <small>
+                  {expired
+                    ? "配对码已过期"
+                    : `有效至 ${new Date(pairing.expires_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`}
+                </small>
+              </div>
+            ) : null}
+            <button
+              className="button button-small"
+              onClick={() => void generate()}
+              disabled={busy}
+            >
+              {busy ? (
+                <Spinner label="生成中" />
+              ) : (
+                <>
+                  <Link2 size={14} />
+                  {pairing ? "重新生成配对码" : "生成配对码"}
+                </>
+              )}
+            </button>
+          </div>
+        </section>
+        <section>
+          <span className="step-number">3</span>
+          <div>
+            <h3>执行配对并启动</h3>
+            <p>
+              将 PROJECT_PATH 替换为允许 Codex
+              工作的绝对项目路径。远程连接请使用 HTTPS。
+            </p>
+            {pairing && !expired ? (
+              <>
+                <div className="code-block">
+                  <code>{command}</code>
+                  <CopyButton text={command} />
+                </div>
+                <div className="code-block">
+                  <code>codex-anywhere node run</code>
+                  <CopyButton text="codex-anywhere node run" />
+                </div>
+              </>
+            ) : (
+              <div className="code-placeholder">
+                <Terminal size={15} />
+                生成配对码后显示连接命令
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+      {error && <ErrorMessage>{error}</ErrorMessage>}
+      <div className="modal-actions">
+        <span className="field-hint">
+          <CircleCheck size={13} />
+          连接成功后设备会自动显示
+        </span>
+        <button className="button button-primary" onClick={onClose}>
+          完成
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+export function NewTaskDialog({
+  hosts,
+  onClose,
+  onCreated,
+}: {
+  hosts: Host[];
+  onClose: () => void;
+  onCreated: (thread: Thread, command: Command) => void;
+}) {
+  const online = hosts.filter((host) => host.online);
+  const [hostId, setHostId] = useState(online[0]?.id || "");
+  const host = hosts.find((entry) => entry.id === hostId);
+  const [cwd, setCwd] = useState(host?.roots[0] || "");
+  const [title, setTitle] = useState("");
+  const [model, setModel] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const result = await post<{ thread: Thread; command: Command }>(
+        "/threads",
+        {
+          host_id: hostId,
+          cwd: cwd.trim(),
+          title: title.trim() || "新任务",
+          ...(model.trim() ? { model: model.trim() } : {}),
+        },
+      );
+      onCreated(result.thread, result.command);
+      onClose();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      title="创建新任务"
+      subtitle="选择一台在线设备和项目目录，开始新的 Codex 会话。"
+      onClose={onClose}
+    >
+      <form className="form-stack" onSubmit={(event) => void submit(event)}>
+        <label>
+          任务名称
+          <input
+            autoFocus
+            placeholder="例如：实现登录页面"
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            maxLength={200}
+            disabled={busy}
+          />
+        </label>
+        <label>
+          <span className="label-with-icon">
+            <Monitor size={14} />
+            运行设备
+          </span>
+          <select
+            value={hostId}
+            onChange={(event) => {
+              setHostId(event.target.value);
+              setCwd(
+                hosts.find((entry) => entry.id === event.target.value)
+                  ?.roots[0] || "",
+              );
+            }}
+            required
+            disabled={busy}
+          >
+            <option value="" disabled>
+              选择在线设备
+            </option>
+            {hosts.map((entry) => (
+              <option key={entry.id} value={entry.id} disabled={!entry.online}>
+                {entry.name} · {entry.platform}
+                {!entry.online ? " · 离线" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span className="label-with-icon">
+            <FolderOpen size={14} />
+            工作目录
+          </span>
+          <input
+            list="host-roots"
+            value={cwd}
+            onChange={(event) => setCwd(event.target.value)}
+            placeholder="项目的绝对路径"
+            required
+            disabled={busy}
+          />
+          <datalist id="host-roots">
+            {host?.roots.map((root) => (
+              <option key={root} value={root} />
+            ))}
+          </datalist>
+        </label>
+        <p className="field-hint">目录必须位于节点配置的工作根目录中。</p>
+        <details className="advanced-settings">
+          <summary>
+            <Code2 size={14} />
+            高级设置
+          </summary>
+          <label>
+            模型<span className="field-optional">可选</span>
+            <input
+              placeholder="留空使用节点的 Codex 默认模型"
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              disabled={busy}
+            />
+          </label>
+        </details>
+        {!online.length && (
+          <ErrorMessage>当前没有在线设备，请先连接一台工作电脑。</ErrorMessage>
+        )}
+        {error && <ErrorMessage>{error}</ErrorMessage>}
+        <div className="modal-actions">
+          <button
+            type="button"
+            className="button button-quiet"
+            onClick={onClose}
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            className="button button-primary"
+            disabled={busy || !online.length}
+          >
+            {busy ? (
+              <Spinner label="创建中" />
+            ) : (
+              <>
+                <Plus size={15} />
+                创建任务
+              </>
+            )}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+export function useInitialSession() {
+  const [session, updateSession] = useState<Session | null>(null);
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    const expired = () => setRetry((value) => value + 1);
+    window.addEventListener("anywhere:session-expired", expired);
+    return () =>
+      window.removeEventListener("anywhere:session-expired", expired);
+  }, []);
+  useEffect(() => {
+    let disposed = false;
+    setError("");
+    void api<Session>("/auth/me")
+      .then((value) => {
+        if (!disposed) {
+          setSession(value);
+          updateSession(value);
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) setError(errorText(reason));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [retry]);
+  return {
+    session,
+    updateSession,
+    error,
+    retry: () => setRetry((value) => value + 1),
+  };
+}

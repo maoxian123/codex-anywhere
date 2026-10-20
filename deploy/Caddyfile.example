@@ -1,0 +1,9 @@
+# Replace this host and email. Caddy provisions HTTPS automatically.
+{
+    email admin@example.com
+}
+
+codex.example.com {
+    # Run Caddy on the same host as the loopback-published Compose hub.
+    reverse_proxy 127.0.0.1:5000
+}
