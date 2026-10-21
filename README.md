@@ -59,6 +59,13 @@ cd ..
 | `COOKIE_SECURE` | HTTPS 部署时设为 `true` |
 | `PUBLIC_URL` | 浏览器访问的完整外部 Origin，例如 `https://codex.example.com`；用于 WebSocket 来源校验 |
 
+登录后，在左上角“设备与设置”菜单中打开“设置”，即可修改管理员用户名和密码。
+修改时需输入当前密码；新密码留空则只修改用户名。保存立即生效，无需重启；当前浏览器保持登录，其他已登录会话会失效。
+
+管理员配置保存在管理中心数据库中，密码仅保存哈希，不会返回到网页或写入 `.env`。
+`ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 用作初始登录凭据；在设置页面保存过账号后，数据库中的配置优先于这些环境变量，重启后仍然有效。
+部署升级时先运行 `codex-anywhere db-upgrade`，再重启管理中心并构建新版前端；本地 `server` 命令会自动执行数据库迁移。
+
 前端修改后重新运行 `npm run build`。使用 `npm run dev` 热更新开发时，将 `.env` 中的 `PUBLIC_URL` 设为实际 Vite 地址（例如 `http://localhost:5173`），重启 Flask 后从该地址访问。前后端开发、构建和检查脚本以 [web/package.json](web/package.json) 为准。
 
 ## 连接工作电脑

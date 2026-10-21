@@ -92,6 +92,36 @@ JSON errors: `{ "error": "human readable message" }`. GET `/api/auth/me` returns
 
 Authenticated cookies also require a live process-local session nonce. Logout revokes that nonce for copied cookies and existing browser WebSockets; expiration closes the socket with code 1008. A hub restart requires a new browser login. Node credentials are independent of browser sessions.
 
+### Application settings
+
+`GET /api/settings` requires an authenticated browser and returns
+`{administrator:{username}}`. This settings object can gain additional sections;
+it never contains a password or password hash.
+
+`PATCH /api/settings/administrator` accepts
+`{username,current_password,new_password?}` and requires both browser authentication
+and the usual CSRF token. Usernames are trimmed, contain 1–120 characters and
+cannot contain control characters. A supplied new password must contain 8–1024
+characters; omitting it retains the current password. Passwords are not trimmed.
+An incorrect current password returns 403 without expiring the browser session.
+Invalid payloads do not change credentials.
+
+Success returns `{settings:{administrator:{username}},session:Session}`. Saving
+commits the account configuration, revokes all existing browser session nonces,
+and issues a fresh nonce and CSRF token to the current browser. The browser must
+replace its session/CSRF state from this response. Copied cookies, other browser
+sessions and their existing WebSockets lose access; node credentials and running
+tasks are unaffected.
+
+Migration `0006` adds persistent hub settings. The administrator section stores
+only a username and password hash. Startup `ADMIN_USERNAME`/`ADMIN_PASSWORD`
+remain the bootstrap credentials until a saved administrator setting exists;
+saved credentials take precedence across hub restarts. The settings API does not
+rewrite `.env` or return the stored hash. `/settings` serves the browser settings
+page through the same login-gated application shell as conversation routes.
+
+### Workspace endpoints
+
 - GET `/api/hosts` -> `{hosts:[{id,name,platform,online,version,runtime_id,last_seen_at,last_sync_at,sync_error,capabilities}]}`. Sync timestamps are ISO/null; errors are string/null and do not remove cached conversations. Capabilities is the node's advertised feature-name list, separate from the runtime catalog endpoint.
 - POST `/api/pairings` -> `{code,expires_at}`. Node pairing is separate below.
 - GET `/api/threads?q=...&project_id=...&host_id=...&limit=...&offset=...` -> `{threads:[Thread],has_more,next_offset}`. Thread = `{id,host_id,project_id,native_id,title,cwd,status,active_turn_id,last_error,imported,history_loaded,native_updated_at,history_native_updated_at,history_synced_at,history_stale,history_cursor,history_complete,history_generation,execution_settings,effective_settings,settings_revision,effective_settings_revision,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting|importing. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts. Native version fields are Unix seconds/null, `history_synced_at` is ISO/null, and `history_stale` is boolean.

@@ -36,6 +36,7 @@ from .models import (
     Command,
     Event,
     Host,
+    HubSetting,
     Interaction,
     Item,
     Pairing,
@@ -50,6 +51,7 @@ from .models import (
 from .presentation import browser_event, browser_item
 from .projects import ensure_project
 from .references import quote_references, resolve_references
+from .settings import administrator_changes, administrator_credentials, public_settings
 from .transport import emit, handle_node_message
 
 
@@ -306,7 +308,7 @@ def create_app(test_config=None):
     # This single-process hub can revoke a signed cookie and an already-open
     # WebSocket together. Restarting the hub intentionally requires a new login.
     app.extensions["auth_sessions"] = {}
-    app.extensions["auth_lock"] = threading.Lock()
+    app.extensions["auth_lock"] = threading.RLock()
     with app.app_context():
         if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
 
@@ -338,6 +340,30 @@ def create_app(test_config=None):
         if isinstance(nonce, str):
             with app.extensions["auth_lock"]:
                 app.extensions["auth_sessions"].pop(nonce, None)
+
+    def issue_session(username):
+        with app.extensions["auth_lock"]:
+            revoke_current_session()
+            session.clear()
+            session.permanent = True
+            nonce = secrets.token_urlsafe(32)
+            now = time.time()
+            registry = app.extensions["auth_sessions"]
+            for expired in [key for key, until in registry.items() if until <= now]:
+                registry.pop(expired, None)
+            registry[nonce] = now + app.permanent_session_lifetime.total_seconds()
+            session.update(authenticated=True, username=username, auth_nonce=nonce)
+
+    def password_attempt_allowed():
+        now = time.monotonic()
+        address = request.remote_addr
+        with app.extensions["login_lock"]:
+            attempts = app.extensions["login_attempts"]
+            recent = [t for t in attempts.get(address, []) if now - t < 60]
+            if len(recent) >= 10:
+                return False
+            attempts[address] = recent + [now]
+            return True
 
     @app.before_request
     def protect_api():
@@ -405,40 +431,57 @@ def create_app(test_config=None):
     @app.post("/api/auth/login")
     def login():
         data = _json()
-        now = time.monotonic()
-        address = request.remote_addr
-        with app.extensions["login_lock"]:
-            attempts = app.extensions["login_attempts"]
-            recent = [t for t in attempts.get(address, []) if now - t < 60]
-            if len(recent) >= 10:
-                return jsonify(error="登录尝试过于频繁，请稍后重试"), 429
-            attempts[address] = recent + [now]
-        user_ok = hmac.compare_digest(
-            str(data.get("username", "")).encode(), app.config["ADMIN_USERNAME"].encode()
-        )
-        password_ok = check_password_hash(
-            app.config["ADMIN_PASSWORD_HASH"], str(data.get("password", ""))
-        )
-        if not (user_ok and password_ok):
-            return jsonify(error="用户名或密码错误"), 401
-        revoke_current_session()
-        session.clear()
-        session.permanent = True
-        nonce = secrets.token_urlsafe(32)
-        now = time.time()
+        if not password_attempt_allowed():
+            return jsonify(error="登录尝试过于频繁，请稍后重试"), 429
         with app.extensions["auth_lock"]:
-            registry = app.extensions["auth_sessions"]
-            for expired in [key for key, until in registry.items() if until <= now]:
-                registry.pop(expired, None)
-            registry[nonce] = now + app.permanent_session_lifetime.total_seconds()
-        session.update(authenticated=True, username=app.config["ADMIN_USERNAME"], auth_nonce=nonce)
-        return jsonify(auth_state())
+            credentials = administrator_credentials()
+            user_ok = hmac.compare_digest(
+                str(data.get("username", "")).encode(), credentials["username"].encode()
+            )
+            password_ok = check_password_hash(
+                credentials["password_hash"], str(data.get("password", ""))
+            )
+            if not (user_ok and password_ok):
+                return jsonify(error="用户名或密码错误"), 401
+            issue_session(credentials["username"])
+            return jsonify(auth_state())
 
     @app.post("/api/auth/logout")
     def logout():
         revoke_current_session()
         session.clear()
         return jsonify(auth_state())
+
+    @app.get("/api/settings")
+    def settings():
+        return jsonify(public_settings(administrator_credentials()))
+
+    @app.patch("/api/settings/administrator")
+    def update_administrator():
+        username, current_password, new_password = administrator_changes(_json())
+        if not password_attempt_allowed():
+            return jsonify(error="登录尝试过于频繁，请稍后重试"), 429
+        with app.extensions["auth_lock"]:
+            # A second settings request may have passed before_request before
+            # another save revoked its nonce while it waited for this lock.
+            if not authenticated():
+                return jsonify(error="请先登录"), 401
+            credentials = administrator_credentials()
+            if not check_password_hash(credentials["password_hash"], current_password):
+                return jsonify(error="当前密码错误"), 403
+            credentials["username"] = username
+            if new_password is not None:
+                credentials["password_hash"] = generate_password_hash(new_password)
+            record = db.session.get(HubSetting, "administrator")
+            if record is None:
+                record = HubSetting(key="administrator")
+                db.session.add(record)
+            record.value = credentials
+            db.session.commit()
+            # Only a durable save revokes other browsers and their open sockets.
+            app.extensions["auth_sessions"].clear()
+            issue_session(username)
+            return jsonify(settings=public_settings(credentials), session=auth_state())
 
     @app.get("/api/hosts")
     def hosts():
@@ -1222,6 +1265,8 @@ def create_app(test_config=None):
     web_dist = Path(os.getenv("WEB_DIST", str(Path.cwd() / "web" / "dist"))).resolve()
 
     @app.get("/")
+    @app.get("/settings")
+    @app.get("/settings/")
     @app.get("/tasks/<task_id>")
     def index(task_id=None):
         if not (web_dist / "index.html").exists():

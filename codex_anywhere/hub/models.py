@@ -21,6 +21,12 @@ def iso(value: float | None) -> str | None:
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if value else None
 
 
+class HubSetting(db.Model):
+    key = db.Column(db.String(120), primary_key=True)
+    value = db.Column(db.JSON, nullable=False)
+    updated_at = db.Column(db.Float, default=time.time, onupdate=time.time, nullable=False)
+
+
 class Host(db.Model):
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     name = db.Column(db.String(120), nullable=False)

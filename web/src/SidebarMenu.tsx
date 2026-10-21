@@ -1,17 +1,26 @@
 import { useState } from "react";
-import { CircleHelp, Download, LogOut, Monitor, Plus } from "lucide-react";
+import {
+  CircleHelp,
+  Download,
+  LogOut,
+  Monitor,
+  Plus,
+  Settings,
+} from "lucide-react";
 import type { Host } from "./types";
 
 export default function SidebarMenu({
   hosts,
   onPair,
   onHistory,
+  onSettings,
   onAbout,
   onLogout,
 }: {
   hosts: Host[];
   onPair: () => void;
   onHistory: () => void;
+  onSettings: () => void;
   onAbout: () => void;
   onLogout: () => void;
 }) {
@@ -77,6 +86,10 @@ export default function SidebarMenu({
           <button onClick={() => choose(onAbout)}>
             <CircleHelp size={14} />
             使用说明
+          </button>
+          <button onClick={() => choose(onSettings)}>
+            <Settings size={14} />
+            设置
           </button>
           <button onClick={() => choose(onLogout)}>
             <LogOut size={14} />

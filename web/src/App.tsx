@@ -27,6 +27,7 @@ import { ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
 import ProjectNavigation from "./ProjectNavigation";
 import SidebarMenu from "./SidebarMenu";
+import SettingsPage from "./SettingsPage";
 import Timeline from "./Timeline";
 import { commandFailure, eventFailure } from "./runtime-errors";
 import {
@@ -63,6 +64,7 @@ function readRoute() {
   return {
     id: match ? decodeURIComponent(match[1]) : "",
     item: new URLSearchParams(window.location.search).get("item") || undefined,
+    settings: /^\/settings\/?$/.test(window.location.pathname),
   };
 }
 export default function App() {
@@ -166,7 +168,13 @@ function Workspace({
       : "/";
     if (window.location.pathname + window.location.search !== url)
       window.history.pushState({}, "", url);
-    setRoute({ id, item });
+    setRoute({ id, item, settings: false });
+    setSidebarOpen(false);
+  }, []);
+  const navigateSettings = useCallback(() => {
+    if (window.location.pathname !== "/settings")
+      window.history.pushState({}, "", "/settings");
+    setRoute({ id: "", item: undefined, settings: true });
     setSidebarOpen(false);
   }, []);
   useEffect(() => {
@@ -771,6 +779,7 @@ function Workspace({
             hosts={hosts}
             onPair={() => setDialog("pair")}
             onHistory={() => setDialog("import")}
+            onSettings={navigateSettings}
             onAbout={() => setDialog("about")}
             onLogout={() => void logout()}
           />
@@ -802,7 +811,10 @@ function Workspace({
           loading={loading}
           loadingMore={loadingMore}
           hasMore={hasMore}
-          onFilter={setProjectFilter}
+          onFilter={(id) => {
+            setProjectFilter(id);
+            if (route.settings) navigate("");
+          }}
           onNavigate={(id) => navigate(id)}
           onNewProject={() => setDialog("project")}
           onSettings={setSettingsProject}
@@ -823,10 +835,14 @@ function Workspace({
             >
               <Menu size={20} />
             </button>
-            <span className="breadcrumb">会话</span>
+            <span className="breadcrumb">
+              {route.settings ? "工作台" : "会话"}
+            </span>
             <span className="breadcrumb-divider">/</span>
             <h1 className="topbar-title">
-              {detail?.thread.title || (route.id ? "加载会话" : "全部会话")}
+              {route.settings
+                ? "设置"
+                : detail?.thread.title || (route.id ? "加载会话" : "全部会话")}
             </h1>
           </div>
           <div className="topbar-right">
@@ -879,7 +895,9 @@ function Workspace({
             网络已断开，设备上的任务仍会继续运行。恢复连接后将同步最新记录。
           </div>
         )}
-        {route.id ? (
+        {route.settings ? (
+          <SettingsPage onSession={onSession} />
+        ) : route.id ? (
           <>
             {detail && (
               <div className="task-header">

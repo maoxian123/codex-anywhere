@@ -92,6 +92,38 @@ def test_logout_closes_the_existing_browser_websocket(live_system):
     assert denied.value.response.status_code == 401
 
 
+def test_administrator_save_closes_old_socket_and_current_browser_reconnects(live_system):
+    system = live_system
+    client = system["client"]
+    cookie = "; ".join(f"{name}={value}" for name, value in client.cookies.items())
+    url = system["url"].replace("http://", "ws://") + "/ws/client"
+    with connect(
+        url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
+    ) as ws:
+        assert json.loads(ws.recv(timeout=2))["type"] == "ready"
+        csrf = client.get("/api/auth/me").json()["csrf_token"]
+        saved = client.patch(
+            "/api/settings/administrator",
+            headers={"X-CSRF-Token": csrf},
+            json={"username": "new-admin", "current_password": "e2e-password"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["session"]["authenticated"] is True
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=2)
+        assert closed.value.rcvd.code == 1008
+    with pytest.raises(InvalidStatus) as denied:
+        with connect(url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None):
+            pytest.fail("Old administrator cookie unexpectedly opened a WebSocket")
+    assert denied.value.response.status_code == 401
+    renewed = "; ".join(f"{name}={value}" for name, value in client.cookies.items())
+    with connect(
+        url, origin=system["url"], additional_headers={"Cookie": renewed}, proxy=None
+    ) as ws:
+        assert json.loads(ws.recv(timeout=2))["type"] == "ready"
+    assert client.get("/api/hosts").json()["hosts"][0]["online"] is True
+
+
 @pytest.mark.parametrize(
     "frame",
     [

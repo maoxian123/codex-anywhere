@@ -37,7 +37,7 @@ afterEach(() => {
   FakeWebSocket.instances.length = 0;
 });
 
-function setup(threadOverride: Partial<Thread> = {}) {
+function setup(threadOverride: Partial<Thread> = {}, pathname = "/tasks/t1") {
   const thread: Thread = {
     id: "t1",
     host_id: "h1",
@@ -95,6 +95,8 @@ function setup(threadOverride: Partial<Thread> = {}) {
         JSON.stringify({ error: "Authentication required" }),
         { status: 401 },
       );
+    else if (path === "/api/settings")
+      result = { administrator: { username: authentication.username } };
     else if (path === "/api/projects") result = { projects };
     else if (path === "/api/hosts")
       result = {
@@ -131,7 +133,7 @@ function setup(threadOverride: Partial<Thread> = {}) {
       headers: { "Content-Type": "application/json" },
     });
   };
-  window.history.replaceState({}, "", "/tasks/t1");
+  window.history.replaceState({}, "", pathname);
   render(<App />);
   return {
     thread,
@@ -159,6 +161,63 @@ function setup(threadOverride: Partial<Thread> = {}) {
     },
   };
 }
+
+test("application settings open from the sidebar and conversations remain reachable", async () => {
+  setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  fireEvent.click(screen.getByLabelText("设备与设置"));
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+  const username = await screen.findByRole("textbox", { name: "管理员用户名" });
+  assert.equal((username as HTMLInputElement).value, "test");
+  assert.equal(window.location.pathname, "/settings");
+  assert.ok(screen.getByRole("heading", { level: 1, name: "设置" }));
+  assert.ok(!screen.queryByRole("textbox", { name: "发送消息给 Codex" }));
+  fireEvent.click(screen.getByRole("button", { name: /全部会话/ }));
+  await screen.findByText("选择一个会话继续");
+  assert.equal(window.location.pathname, "/");
+  fireEvent.click(screen.getByRole("link", { name: /集成测试任务/ }));
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  assert.equal(window.location.pathname, "/tasks/t1");
+});
+
+test("settings deep links retain the updated session and use the rotated CSRF token", async () => {
+  const server = setup({}, "/settings");
+  const tokens: (string | null)[] = [];
+  server.intercept((path, init) => {
+    if (path !== "/api/settings/administrator") return undefined;
+    assert.equal(init?.method, "PATCH");
+    tokens.push(new Headers(init?.headers).get("X-CSRF-Token"));
+    const data = JSON.parse(String(init?.body)) as { username: string };
+    const session = {
+      authenticated: true,
+      username: data.username,
+      csrf_token: "updated-account-csrf",
+    };
+    Object.assign(server.authentication, session);
+    return new Response(
+      JSON.stringify({
+        settings: { administrator: { username: data.username } },
+        session,
+      }),
+    );
+  });
+  const username = await screen.findByRole("textbox", { name: "管理员用户名" });
+  fireEvent.change(username, { target: { value: "updated-admin" } });
+  fireEvent.change(screen.getByLabelText("当前密码"), {
+    target: { value: "current-password" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+  await screen.findByText("管理员账号已更新");
+  assert.equal(window.location.pathname, "/settings");
+  assert.equal((username as HTMLInputElement).value, "updated-admin");
+  assert.ok(!screen.queryByRole("button", { name: "进入工作台" }));
+  fireEvent.change(screen.getByLabelText("当前密码"), {
+    target: { value: "current-password" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+  await waitFor(() => assert.equal(tokens.length, 2));
+  assert.deepEqual(tokens, ["csrf", "updated-account-csrf"]);
+});
 
 test("native execution errors survive successful background list refreshes", async () => {
   const server = setup();
