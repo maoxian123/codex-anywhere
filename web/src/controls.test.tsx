@@ -25,6 +25,70 @@ const baseThread: Thread = {
 };
 afterEach(cleanup);
 
+test("compact native items fetch full content only on an explicit click and keep bridged images", async () => {
+  const original = globalThis.fetch;
+  let reads = 0;
+  globalThis.fetch = async (input) => {
+    reads += 1;
+    assert.equal(String(input), "/api/threads/t1/items/compact-item");
+    return new Response(
+      JSON.stringify({
+        item: {
+          id: "compact-item",
+          native_id: "native-compact",
+          thread_id: "t1",
+          type: "agentMessage",
+          data: { text: "完整的模型消息，已从原始条目读取。" },
+        },
+      }),
+    );
+  };
+  try {
+    render(
+      <Timeline
+        items={[
+          {
+            id: "compact-item",
+            native_id: "native-compact",
+            thread_id: "t1",
+            type: "agentMessage",
+            data: {
+              text: "简短预览",
+              _truncated: true,
+              _assets: [
+                {
+                  id: "picture",
+                  name: "output.png",
+                  mime: "image/png",
+                  size: 1,
+                  url: "/api/assets/picture",
+                },
+              ],
+            },
+          },
+        ]}
+        streams={{}}
+        busy={false}
+        loading={false}
+        onImage={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+    assert.equal(reads, 0);
+    fireEvent.click(screen.getByRole("button", { name: "查看完整内容" }));
+    await screen.findByText("完整的模型消息，已从原始条目读取。");
+    assert.equal(reads, 1);
+    assert.ok(screen.getByAltText("output.png"));
+    fireEvent.click(screen.getByRole("button", { name: "收起完整内容" }));
+    assert.ok(screen.getByText("简短预览"));
+    fireEvent.click(screen.getByRole("button", { name: "查看完整内容" }));
+    await screen.findByText("完整的模型消息，已从原始条目读取。");
+    assert.equal(reads, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("idle sends start a turn, active sends steer, and interrupt uses its own action", async () => {
   const calls: { payload: MessagePayload; steer: boolean }[] = [];
   let interruptions = 0;

@@ -744,8 +744,6 @@ def test_restart_resumes_owned_thread_once_without_loading_history(peer, tmp_pat
             assert params == {
                 "threadId": "native-1",
                 "cwd": str(tmp_path),
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
                 "excludeTurns": True,
             }
         finally:

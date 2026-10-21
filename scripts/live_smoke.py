@@ -407,6 +407,84 @@ class LiveSystem:
 
         self.record("real_web_search", web_search)
 
+    def run_auto_sync(self, native_id):
+        """Use real local history without inference or a manual import request."""
+
+        def discovery():
+            def discovered():
+                threads = self.client.get("/api/threads").json()["threads"]
+                return threads if any(t["native_id"] == native_id for t in threads) else None
+
+            threads = wait_for(discovered, "automatic recent-50 catalog", self.timeout)
+            assert len(threads) <= 50
+            self.auto_thread = next(t for t in threads if t["native_id"] == native_id)
+            assert not self.auto_thread["history_loaded"]
+            assert self.auto_thread["project_id"]
+            projects = self.client.get("/api/projects").json()["projects"]
+            assert projects
+            with self.app.app_context():
+                from codex_anywhere.hub.models import Command, Item
+
+                assert Item.query.count() == 0 and Command.query.count() == 0
+            host = self.client.get("/api/hosts").json()["hosts"][0]
+            assert host["last_sync_at"] and not host["sync_error"]
+            self.first_auto_sync = host["last_sync_at"]
+            return dict(
+                conversations=len(threads),
+                projects=len(projects),
+                history_items_transferred=0,
+                manual_import_requests=0,
+            )
+
+        self.record("real_automatic_catalog_and_projects", discovery)
+
+        def history():
+            thread_id = self.auto_thread["id"]
+            result = self.post(f"/api/threads/{thread_id}/history", {})
+            self.command(result["command"])
+            detail = wait_for(
+                lambda: (
+                    value
+                    if (value := self.history(thread_id))["thread"]["history_loaded"]
+                    else None
+                ),
+                "lazy original history projection",
+                self.timeout,
+            )
+            assert len(detail["items"]) >= 2 and not detail["thread"]["history_stale"]
+            page = self.client.get(f"/api/threads/{thread_id}?item_limit=2").json()
+            assert len(page["items"]) == 2 and page["has_more_items"]
+            older = self.client.get(
+                f"/api/threads/{thread_id}?item_limit=2&before_position={page['next_before_position']}"
+            ).json()
+            assert older["items"][-1]["position"] < page["items"][0]["position"]
+            current = self.post(f"/api/threads/{thread_id}/history", {})
+            assert current["command"] is None
+            return dict(
+                thread_id=thread_id,
+                item_count=len(detail["items"]),
+                bounded_page_items=len(page["items"]),
+                no_duplicate_history_command=True,
+            )
+
+        self.record("real_automatic_on_open_history_and_pagination", history)
+
+        def periodic():
+            def refreshed():
+                host = self.client.get("/api/hosts").json()["hosts"][0]
+                return host if host["last_sync_at"] != self.first_auto_sync else None
+
+            host = wait_for(refreshed, "next automatic 60-second scan", 90)
+            assert not host["sync_error"]
+            with self.app.app_context():
+                from codex_anywhere.hub.models import Command, Item
+
+                assert Command.query.count() == 1
+                assert len({row[0] for row in db.session.query(Item.thread_id).distinct()}) == 1
+            return dict(period_seconds=60, no_other_history_downloaded=True)
+
+        self.record("real_periodic_sync_without_bulk_history", periodic)
+
     def run_projects(self, native_id, expected_context=""):
         """Import an explicitly selected existing session without creating a model turn."""
 
@@ -543,14 +621,21 @@ def main():
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--projects-only", action="store_true")
+    parser.add_argument(
+        "--sync-only",
+        action="store_true",
+        help="Test automatic catalogs/lazy history without inference",
+    )
     parser.add_argument("--import-native-id", help="Explicit existing test session to import")
     parser.add_argument("--expected-context", default="")
     parser.add_argument(
         "--hold", action="store_true", help="Keep the isolated hub for manual checks"
     )
     args = parser.parse_args()
-    if args.projects_only and not args.import_native_id:
-        parser.error("--projects-only requires --import-native-id")
+    if (args.projects_only or args.sync_only) and not args.import_native_id:
+        parser.error("--projects-only and --sync-only require --import-native-id")
+    if args.projects_only and args.sync_only:
+        parser.error("Select one acceptance mode")
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     directory = Path("instance/live-tests") / (
         time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
@@ -562,7 +647,9 @@ def main():
     interrupted = False
     try:
         system = LiveSystem(directory, args.port, args.codex_bin, args.timeout)
-        if args.projects_only:
+        if args.sync_only:
+            system.run_auto_sync(args.import_native_id)
+        elif args.projects_only:
             system.run_projects(args.import_native_id, args.expected_context)
         else:
             system.run()

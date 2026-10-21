@@ -1,5 +1,22 @@
 # 2026-10-21 项目与历史导入验收
 
+## v4 增量验收：运行设置与自动同步
+
+以下为本日后续 v4 工作区的验证结果；后文保留较早 v2 验收记录。
+
+- Windows 10 / Codex 0.163.0：动态发现 7 个可见模型，模型与推理强度均来自原生接口。
+- 真实模型使用 `gpt-6.1-sol`，指定 `low`、`on-request` 与 `read-only` 后正常回答；保存 `medium` 后，仅下一轮生效，desired/effective 修订号均得到验证。
+- 清空本次测试自己的查询投影后，原生历史首次仅加载 1 项，随后按 cursor 再取 1 项，已有排序位置保持不变，完整历史仍未下载。
+- 重启隔离的测试 Codex 进程后，使用相同原生线程继续对话，能回忆网页未加载的第一轮校验串，模型、强度与只读设置保持有效。上述设置验收共进行三次简短真实推理。
+- 再次运行只读自动同步验收，连接后 0.44 秒发现 50 个会话和 20 个项目，正文传输为 0；打开指定测试会话后 0.52 秒加载正文；60 秒周期扫描通过，未下载其他会话正文。
+- 原生 `thread/start` 的 `sandbox_workspace_write.network_access` 配置分别以 false/true 验证，返回沙箱联网值与请求一致；测试空线程均归档，无推理。
+- 新增真实 HTTP/WebSocket + 假 Codex 验证，覆盖大事件压缩回放、原始事件认证取回、动态模型分页与未知强度、权限和网络映射、下一轮生效、原生历史有限分页及稳定顺序。
+- 最终 Python 完整回归 304 项通过（66.34 秒），前端 69 项测试通过；Ruff、TypeScript/Vite 构建、Prettier 与 `git diff --check` 均通过。
+
+可复测入口：`python -m scripts.live_runtime_smoke --codex-bin codex`，以及 `scripts/live_smoke.py --sync-only --import-native-id <测试会话ID> --port 5011`。本次机器可读报告保存在忽略目录 `instance/live-tests/20261021-111709-runtime-dcdf91/report.json` 和 `instance/live-tests/20261021-112810-2d3b13/report.json`。
+
+本次仍未进行浏览器目视验收，未运行 macOS/Linux、Docker/PostgreSQL 或公网部署。云端 HTTPS 服务与日常配对节点未在这次实现中更新或重启。
+
 本轮在 Windows 10、Python 3.12.3、Node.js 24、Codex CLI/App Server 0.163.0 上验证。真实检查使用独立的回环 Flask 服务、节点状态、SQLite 数据库与测试目录；导入对象为上一轮验收创建的真实 Codex 会话。没有向云端批量上传个人历史。
 
 ## 已实现

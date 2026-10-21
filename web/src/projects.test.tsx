@@ -178,7 +178,7 @@ test("history catalog paginates metadata and imports only sessions selected acro
       return new Response(
         JSON.stringify({
           thread: {
-            id: path.split("/").at(-1),
+            id: path.split("?")[0].split("/").at(-1),
             status: "idle",
             history_loaded: true,
             imported: true,
@@ -263,7 +263,7 @@ test("unknown command outcomes are not polled or submitted again automatically",
 test("import completion waits for hub history projection and returns its latest thread", async () => {
   let reads = 0;
   globalThis.fetch = async (input) => {
-    assert.equal(String(input), "/api/threads/imported-task");
+    assert.equal(String(input), "/api/threads/imported-task?item_limit=1");
     reads += 1;
     return new Response(
       JSON.stringify({

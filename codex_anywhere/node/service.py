@@ -16,6 +16,13 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .assets import AssetBridge, _base64_image
+from .capabilities import (
+    RuntimeCapabilities,
+    effective_settings,
+    requested_settings,
+    thread_overrides,
+    turn_overrides,
+)
 from .config import (
     load_config,
     node_lock,
@@ -25,9 +32,10 @@ from .config import (
     websocket_url,
 )
 from .directories import list_directories, open_project
-from .history import import_thread, list_threads
+from .history import import_thread, list_threads, load_history_page
 from .runtime import CodexRuntime, RpcError, RuntimeGone
 from .store import NodeStore
+from .sync import CatalogSynchronizer, negotiated_settings
 
 log = logging.getLogger(__name__)
 VERSION = "0.1.0"
@@ -101,6 +109,9 @@ class NodeService:
         self.command_tasks: set[asyncio.Task] = set()
         self.stopping = False
         self.last_pong = 0.0
+        self.capabilities = RuntimeCapabilities()
+        self.execution_epoch: str | None = None
+        self.thread_execution: dict[str, dict] = {}
 
     async def _send(self, message: dict) -> bool:
         async with self.send_lock:
@@ -119,11 +130,18 @@ class NodeService:
             method,
             params,
             rpc_id,
-            asset_job=method in {"item/completed", "anywhere/import_item"},
+            asset_job=method in {"item/completed", "anywhere/import_item", "anywhere/history_item"},
         )
         self.event_wake.set()
-        if method in {"item/completed", "anywhere/import_item"}:
+        if method in {"item/completed", "anywhere/import_item", "anywhere/history_item"}:
             self.asset_wake.set()
+        if method in {
+            "config/updated",
+            "config/changed",
+            "account/updated",
+            "account/login/completed",
+        }:
+            self.capabilities.invalidate()
 
     async def _runtime_exit(self, epoch: str, returncode: int | None) -> None:
         self.store.record_event(epoch, "anywhere/runtime_stopped", {"returncode": returncode})
@@ -235,6 +253,12 @@ class NodeService:
                         "runtime_id": self.runtime.runtime_id,
                         "version": VERSION,
                         "platform": platform.system().lower(),
+                        "capabilities": [
+                            "catalogSync",
+                            "lazyHistory",
+                            "runtimeSettings",
+                            "projectInventory",
+                        ],
                     }
                 )
             )
@@ -250,6 +274,20 @@ class NodeService:
                 asyncio.create_task(self._outbox()),
                 asyncio.create_task(self._heartbeat()),
             ]
+            settings = negotiated_settings(welcome)
+            if settings is not None:
+                runtime = self.runtime
+                synchronizer = CatalogSynchronizer(
+                    runtime,
+                    self.store,
+                    self.event_wake.set,
+                    settings,
+                    is_current=lambda: self.ws is ws and self.runtime is runtime,
+                    foreground_busy=lambda: any(not task.done() for task in self.command_tasks),
+                )
+                background.append(
+                    asyncio.create_task(synchronizer.run(), name="codex-catalog-sync")
+                )
             try:
                 # Resend journaled responses after a disconnect. Hub handles these idempotently.
                 for response in self.store.completed():
@@ -413,25 +451,43 @@ class NodeService:
         runtime = self.runtime
         if not runtime or not runtime.process or runtime.process.returncode is not None:
             raise ValueError("Codex is restarting; submit a new command after it reconnects")
+        if self.execution_epoch != runtime.runtime_id:
+            self.execution_epoch = runtime.runtime_id
+            self.thread_execution.clear()
+            self.capabilities.invalidate()
+        if kind == "runtime.capabilities":
+            cwd = payload.get("cwd")
+            if cwd is not None:
+                cwd = str(resolve_path(cwd, directory=True))
+            refresh = payload.get("refresh", False)
+            if type(refresh) is not bool:
+                raise ValueError("refresh must be a boolean")
+            return await self.capabilities.read(runtime, cwd, refresh=refresh)
         if kind == "thread.start":
             cwd = str(resolve_path(payload["cwd"], directory=True))
-            params = {"cwd": cwd, "approvalPolicy": "on-request", "sandbox": "workspace-write"}
-            if payload.get("model"):
-                params["model"] = payload["model"]
+            settings, revision = requested_settings(payload)
+            await self.capabilities.validate(runtime, cwd, settings)
+            params = {"cwd": cwd, **thread_overrides(settings, new=True)}
             result = await runtime.request("thread/start", params)
             native_id = result["thread"]["id"]
             self.store.save_thread(native_id, cwd)
             runtime.loaded_threads.add(native_id)
-            return result
+            fallback = {
+                "approval_policy": params["approvalPolicy"],
+                "sandbox_mode": params["sandbox"],
+                **settings,
+            }
+            return self._execution_result(runtime, command, native_id, result, revision, fallback)
         if kind == "thread.list":
             return await list_threads(runtime, payload)
-        if kind == "thread.import":
+        if kind in {"thread.import", "thread.history"}:
 
             def wake_import() -> None:
                 self.event_wake.set()
                 self.asset_wake.set()
 
-            return await import_thread(runtime, self.store, command, wake_import)
+            handler = import_thread if kind == "thread.import" else load_history_page
+            return await handler(runtime, self.store, command, wake_import)
         if kind == "interaction.answer":
             if payload.get("runtime_id") != runtime.runtime_id:
                 raise ValueError("Interaction belongs to an expired Codex process")
@@ -445,18 +501,6 @@ class NodeService:
         if cwd is None:
             raise ValueError("Thread was not created by this node")
         resolve_path(cwd, directory=True)
-        if kind == "turn.start" and thread_id not in runtime.loaded_threads:
-            await runtime.request(
-                "thread/resume",
-                {
-                    "threadId": thread_id,
-                    "cwd": cwd,
-                    "approvalPolicy": "on-request",
-                    "sandbox": "workspace-write",
-                    "excludeTurns": True,
-                },
-            )
-            runtime.loaded_threads.add(thread_id)
         if kind == "turn.interrupt":
             return await runtime.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": payload["turn_id"]}
@@ -466,7 +510,81 @@ class NodeService:
             if not payload.get("expected_turn_id"):
                 raise ValueError("Steering requires the current turn ID")
             params["expectedTurnId"] = payload["expected_turn_id"]
-        return await runtime.request("turn/start" if kind == "turn.start" else "turn/steer", params)
+            return await runtime.request("turn/steer", params)
+        settings, revision = requested_settings(payload)
+        known = self.thread_execution.get(thread_id, {})
+        if kind == "turn.start" and thread_id not in runtime.loaded_threads:
+            # Resume original native defaults first. Validation then uses the actual
+            # imported model/sandbox rather than the global new-thread defaults.
+            resumed = await runtime.request(
+                "thread/resume",
+                {
+                    "threadId": thread_id,
+                    "cwd": cwd,
+                    "excludeTurns": True,
+                },
+            )
+            runtime.loaded_threads.add(thread_id)
+            # Resume readback is the inherited baseline, not confirmation that
+            # this command's desired settings revision has been applied.
+            self.thread_execution[thread_id] = {
+                "settings": effective_settings(resumed),
+                "sandbox": resumed.get("sandbox"),
+            }
+            known = self.thread_execution[thread_id]
+        baseline = known.get("settings", {})
+        await self.capabilities.validate(runtime, cwd, settings, baseline)
+        overrides = turn_overrides(settings, baseline, known.get("sandbox"))
+        result = await runtime.request("turn/start", {**params, **overrides})
+        # A successful turn RPC accepts overrides for this and subsequent turns.
+        applied = {**baseline, **settings}
+        if "sandboxPolicy" in overrides:
+            result_for_settings = {"sandbox": overrides["sandboxPolicy"], **result}
+        else:
+            result_for_settings = result
+        return self._execution_result(
+            runtime,
+            command,
+            thread_id,
+            result_for_settings,
+            revision,
+            applied,
+            raw_result=result,
+        )
+
+    def _execution_result(
+        self,
+        runtime,
+        command: dict,
+        thread_id: str,
+        result: dict,
+        revision: int,
+        baseline: dict | None = None,
+        *,
+        raw_result: dict | None = None,
+    ) -> dict:
+        settings = effective_settings(result, baseline)
+        old = self.thread_execution.get(thread_id, {})
+        self.thread_execution[thread_id] = {
+            "settings": settings,
+            "sandbox": result.get("sandbox", old.get("sandbox")),
+        }
+        self.store.record_event(
+            runtime.runtime_id,
+            "anywhere/execution_settings",
+            {
+                "threadId": thread_id,
+                "commandId": command["id"],
+                "settings": settings,
+                "settingsRevision": revision,
+            },
+        )
+        self.event_wake.set()
+        return {
+            **(raw_result if raw_result is not None else result),
+            "effective_settings": settings,
+            "settings_revision": revision,
+        }
 
     async def run(self) -> None:
         background = []

@@ -375,3 +375,321 @@ def test_projects_catalog_import_images_and_continue_original_thread(live_system
         next(m for m in audit if m.get("method") == "turn/start")["params"]["threadId"]
         == "native-history"
     )
+
+
+def test_connecting_discovers_local_projects_and_opening_automatically_loads_history(live_system):
+    system = live_system
+    client, post = system["client"], system["post"]
+
+    def discovered():
+        return next(
+            (
+                thread
+                for thread in client.get("/api/threads").json()["threads"]
+                if thread["native_id"] == "native-history"
+            ),
+            None,
+        )
+
+    thread = eventually(discovered, "automatic catalog after node welcome")
+    assert thread["project_id"] and not thread["history_loaded"]
+    history_url = f"/api/threads/{thread['id']}?item_limit=2"
+    assert client.get(history_url).json()["items"] == []
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    assert not any(
+        message.get("method") in {"thread/read", "thread/resume", "turn/start"} for message in audit
+    )
+    started = post(f"/api/threads/{thread['id']}/history", json={"limit": 2})
+    assert started.status_code == 202
+    first_command = started.json()["command"]
+    assert first_command["kind"] == "thread.history"
+
+    def loaded():
+        command = client.get(f"/api/commands/{first_command['id']}").json()["command"]
+        assert command["status"] not in {"failed", "unknown"}, command
+        result = client.get(history_url).json()
+        return result if result["thread"]["history_loaded"] else None
+
+    latest = eventually(loaded, "lazy history projected after opening")
+    assert [item["native_id"] for item in latest["items"]] == ["old-image", "old-search"]
+    assert latest["thread"]["history_complete"] is False
+    assert latest["thread"]["history_cursor"]
+    assert latest["has_more_items"] is False  # Only this bounded native page is cached.
+    tail_positions = [(item["native_id"], item["position"]) for item in latest["items"]]
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    item_pages = [message for message in audit if message.get("method") == "thread/items/list"]
+    assert len(item_pages) == 2
+    assert all(
+        message["params"]["limit"] == 1
+        and message["params"]["sortDirection"] == "desc"
+        and "turnId" not in message["params"]
+        for message in item_pages
+    )
+    assert not any(message.get("method") == "thread/turns/list" for message in audit)
+
+    continuation = post(
+        f"/api/threads/{thread['id']}/history",
+        json={
+            "limit": 2,
+            "cursor": latest["thread"]["history_cursor"],
+        },
+    )
+    assert continuation.status_code == 202
+    older_command = continuation.json()["command"]
+    assert older_command["kind"] == "thread.history"
+
+    def complete():
+        command = client.get(f"/api/commands/{older_command['id']}").json()["command"]
+        assert command["status"] not in {"failed", "unknown"}, command
+        result = client.get(history_url).json()
+        return result if result["thread"]["history_complete"] else None
+
+    latest = eventually(complete, "bounded older native history page")
+    assert [(item["native_id"], item["position"]) for item in latest["items"]] == tail_positions
+    assert latest["has_more_items"] and latest["next_before_position"] == tail_positions[0][1]
+    older = client.get(history_url + f"&before_position={latest['next_before_position']}").json()
+    assert [item["native_id"] for item in older["items"]] == ["old-user-1", "old-answer-1"]
+    assert older["has_more_items"] is False
+    current = post(f"/api/threads/{thread['id']}/history", json={})
+    assert current.status_code == 200 and current.json()["command"] is None
+    assert len(client.get("/api/threads").json()["threads"]) == 1
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    assert not any(message.get("method") in {"thread/resume", "turn/start"} for message in audit)
+    item_pages = [message for message in audit if message.get("method") == "thread/items/list"]
+    assert len(item_pages) == 4
+    assert [message["params"].get("cursor") for message in item_pages] == [None, "1", "2", "3"]
+    reads = [message for message in audit if message.get("method") == "thread/read"]
+    assert len(reads) == 4 and all(message["params"]["includeTurns"] is False for message in reads)
+
+
+def test_runtime_catalog_and_execution_settings_apply_to_create_and_next_turn(live_system):
+    system = live_system
+    client, post = system["client"], system["post"]
+    host_id = system["host"]["id"]
+
+    def completed(response):
+        assert response.status_code == 202, response.text
+        command_id = response.json()["command"]["id"]
+
+        def done():
+            command = client.get(f"/api/commands/{command_id}").json()["command"]
+            assert command["status"] not in {"failed", "unknown"}, command
+            return command if command["status"] == "completed" else None
+
+        return eventually(done, "runtime settings command")
+
+    catalog = completed(
+        post(
+            f"/api/hosts/{host_id}/capabilities",
+            json={
+                "cwd": str(system["root"]),
+                "refresh": True,
+            },
+        )
+    )["result"]
+    assert [model["model"] for model in catalog["models"]] == ["test-default", "test-special"]
+    assert catalog["models"][0]["futureCatalogField"] == {"preserve": True}
+    assert (
+        catalog["models"][1]["supportedReasoningEfforts"][1]["reasoningEffort"] == "future-effort"
+    )
+    assert "PRIVATE-TEST" not in json.dumps(catalog)
+    assert catalog["constraints"]["approval_policies"] == ["on-request", "untrusted"]
+    cached = client.get(
+        f"/api/hosts/{host_id}/capabilities", params={"cwd": str(system["root"])}
+    ).json()
+    assert cached["capabilities"] == catalog
+
+    initial = {
+        "model": "test-special",
+        "effort": "future-effort",
+        "approval_policy": "untrusted",
+        "sandbox_mode": "workspace-write",
+        "approvals_reviewer": "user",
+        "network_access": True,
+    }
+    created = post(
+        "/api/threads",
+        json={
+            "host_id": host_id,
+            "cwd": str(system["root"]),
+            "title": "Settings test",
+            "execution_settings": initial,
+        },
+    )
+    assert created.status_code == 202, created.text
+    thread_id = created.json()["thread"]["id"]
+    start_result = completed(created)["result"]
+    assert start_result["effective_settings"] == initial
+    assert start_result["settings_revision"] == 0
+    started = eventually(
+        lambda: (lambda value: value if value["effective_settings"] == initial else None)(
+            client.get(f"/api/threads/{thread_id}").json()["thread"]
+        ),
+        "created effective settings",
+    )
+    assert started["effective_settings_revision"] == 0
+
+    next_settings = {
+        "model": "test-default",
+        "effort": "medium",
+        "approval_policy": "on-request",
+        "sandbox_mode": "read-only",
+        "approvals_reviewer": "user",
+        "network_access": False,
+    }
+    csrf = client.get("/api/auth/me").json()["csrf_token"]
+    patched = client.patch(
+        f"/api/threads/{thread_id}/settings",
+        json={
+            "execution_settings": next_settings,
+            "settings_revision": 0,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["thread"]["settings_revision"] == 1
+    assert patched.json()["thread"]["effective_settings"] == initial
+    turn = completed(
+        post(
+            f"/api/threads/{thread_id}/messages",
+            json={
+                "text": "Use the next-turn settings",
+                "client_request_id": uuid4().hex,
+            },
+        )
+    )
+    assert turn["result"]["settings_revision"] == 1
+    assert turn["result"]["effective_settings"] == next_settings
+    interaction = eventually(
+        lambda: next(
+            (
+                value
+                for value in client.get(f"/api/threads/{thread_id}").json()["interactions"]
+                if value["status"] == "pending"
+            ),
+            None,
+        ),
+        "approval retained under selected permissions",
+    )
+    completed(
+        post(
+            f"/api/interactions/{interaction['id']}/answer",
+            json={"response": {"decision": "accept"}},
+        )
+    )
+    final = eventually(
+        lambda: (lambda value: value if value["status"] == "idle" else None)(
+            client.get(f"/api/threads/{thread_id}").json()["thread"]
+        ),
+        "settings turn complete",
+    )
+    assert final["execution_settings"] == final["effective_settings"] == next_settings
+    assert final["effective_settings_revision"] == 1
+
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    model_pages = [message for message in audit if message.get("method") == "model/list"]
+    assert [message["params"].get("cursor") for message in model_pages] == [None, "1"]
+    start = next(message["params"] for message in audit if message.get("method") == "thread/start")
+    assert start["model"] == "test-special"
+    assert start["config"] == {
+        "model_reasoning_effort": "future-effort",
+        "sandbox_workspace_write.network_access": True,
+    }
+    assert start["approvalPolicy"] == "untrusted" and start["sandbox"] == "workspace-write"
+    turn_params = next(
+        message["params"] for message in audit if message.get("method") == "turn/start"
+    )
+    assert turn_params["model"] == "test-default" and turn_params["effort"] == "medium"
+    assert (
+        turn_params["approvalPolicy"] == "on-request" and turn_params["approvalsReviewer"] == "user"
+    )
+    assert turn_params["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
+    assert not any(message.get("method") == "thread/resume" for message in audit)
+
+
+def test_browser_websocket_compacts_large_native_events_and_authenticated_raw_is_exact(live_system):
+    system = live_system
+    client, post = system["client"], system["post"]
+    created = post(
+        "/api/threads",
+        json={
+            "host_id": system["host"]["id"],
+            "cwd": str(system["root"]),
+            "title": "Large event test",
+        },
+    )
+    assert created.status_code == 202, created.text
+    thread_id = created.json()["thread"]["id"]
+    command_id = created.json()["command"]["id"]
+
+    def started():
+        command = client.get(f"/api/commands/{command_id}").json()["command"]
+        assert command["status"] not in {"failed", "unknown"}, command
+        return command["result"] if command["status"] == "completed" else None
+
+    native_id = eventually(started, "fake native thread created")["thread"]["id"]
+    native_params = {
+        "threadId": native_id,
+        "turnId": "synthetic-turn",
+        "futureEventField": {"version": 7, "values": [False, None, {"opaque": "preserve"}]},
+        "item": {
+            "id": "synthetic-large-tool",
+            "type": "commandExecution",
+            "status": "completed",
+            "command": "synthetic event; no tool executed",
+            "aggregatedOutput": "x" * 200_000,
+            "futureNativeFields": {
+                "opaque": [1, 2, {"keep": True}],
+                "inlineImage": "data:image/png;base64," + "QUJD" * 50_000,
+            },
+        },
+    }
+    service = system["node"]["service"]
+    asyncio.run_coroutine_threadsafe(
+        service._native_event("item/completed", native_params, None), system["node"]["loop"]
+    ).result(timeout=5)
+    eventually(
+        lambda: any(
+            item["native_id"] == "synthetic-large-tool"
+            for item in client.get(f"/api/threads/{thread_id}?item_limit=10").json()["items"]
+        ),
+        "synthetic event journaled",
+    )
+
+    cookie = "; ".join(f"{name}={value}" for name, value in client.cookies.items())
+    ws_url = system["url"].replace("http://", "ws://") + "/ws/client"
+    with connect(
+        ws_url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
+    ) as browser:
+        assert json.loads(browser.recv(timeout=5)) == {"type": "ready"}
+        browser.send(json.dumps({"type": "subscribe", "thread_id": thread_id, "after": 0}))
+        event = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            frame = browser.recv(timeout=5)
+            received = json.loads(frame)
+            if (
+                received.get("method") == "item/completed"
+                and received["params"].get("item", {}).get("id") == "synthetic-large-tool"
+            ):
+                assert len(frame.encode("utf-8")) < 100_000
+                event = received
+                break
+        assert event is not None, "large native item missing from cursor replay"
+        assert event["params"]["_truncated"] is True
+        assert len(event["params"]["item"]["aggregatedOutput"]) < 200_000
+        assert not event["params"]["item"]["futureNativeFields"]["inlineImage"].startswith(
+            "data:image/"
+        )
+        raw_url = event["params"]["_raw_url"]
+        assert raw_url == f"/api/events/{event['id']}"
+        original = client.get(raw_url)
+        assert original.status_code == 200
+        raw_event = original.json()["event"]
+        assert raw_event["id"] == event["id"]
+        assert raw_event["method"] == "item/completed" and raw_event["thread_id"] == thread_id
+        assert raw_event["params"] == native_params
+        with httpx.Client(base_url=system["url"], trust_env=False) as anonymous:
+            assert anonymous.get(raw_url).status_code == 401
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    assert not any(message.get("method") == "turn/start" for message in audit)

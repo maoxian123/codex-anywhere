@@ -27,6 +27,11 @@ class Host(db.Model):
     version = db.Column(db.String(120), default="")
     runtime_id = db.Column(db.String(100), nullable=True)
     last_seen_at = db.Column(db.Float, default=time.time)
+    last_sync_at = db.Column(db.Float, nullable=True)
+    sync_error = db.Column(db.Text, nullable=True)
+    capabilities = db.Column(db.JSON, default=list, nullable=False)
+    runtime_capabilities = db.Column(db.JSON, nullable=True)
+    capabilities_updated_at = db.Column(db.Float, nullable=True)
 
     def as_dict(self, online=False):
         return dict(
@@ -34,8 +39,12 @@ class Host(db.Model):
             name=self.name,
             platform=self.platform,
             version=self.version,
+            runtime_id=self.runtime_id,
             online=online,
             last_seen_at=iso(self.last_seen_at),
+            last_sync_at=iso(self.last_sync_at),
+            sync_error=self.sync_error,
+            capabilities=self.capabilities or [],
         )
 
 
@@ -53,6 +62,7 @@ class Project(db.Model):
     name = db.Column(db.String(240), nullable=False)
     cwd = db.Column(db.Text, nullable=False)
     cwd_key = db.Column(db.String(64), nullable=False)
+    execution_settings = db.Column(db.JSON, default=dict, nullable=False)
     created_at = db.Column(db.Float, default=time.time, nullable=False)
     updated_at = db.Column(db.Float, default=time.time, nullable=False)
 
@@ -64,6 +74,7 @@ class Project(db.Model):
             host_id=self.host_id,
             name=self.name,
             cwd=self.cwd,
+            execution_settings=self.execution_settings or {},
             thread_count=thread_count,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
@@ -83,6 +94,19 @@ class Thread(db.Model):
     last_error = db.Column(db.Text, nullable=True)
     imported = db.Column(db.Boolean, default=False, nullable=False)
     history_loaded = db.Column(db.Boolean, default=True, nullable=False)
+    native_updated_at = db.Column(db.Float, nullable=True)
+    history_native_updated_at = db.Column(db.Float, nullable=True)
+    history_synced_at = db.Column(db.Float, nullable=True)
+    history_stale = db.Column(db.Boolean, default=False, nullable=False)
+    history_cursor = db.Column(db.Text, nullable=True)
+    history_complete = db.Column(db.Boolean, default=False, nullable=False)
+    history_generation = db.Column(db.String(64), nullable=True)
+    native_fingerprint = db.Column(db.String(64), nullable=True)
+    history_fingerprint = db.Column(db.String(64), nullable=True)
+    execution_settings = db.Column(db.JSON, default=dict, nullable=False)
+    effective_settings = db.Column(db.JSON, default=dict, nullable=False)
+    settings_revision = db.Column(db.Integer, default=0, nullable=False)
+    effective_settings_revision = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.Float, default=time.time, nullable=False)
     updated_at = db.Column(db.Float, default=time.time, nullable=False, index=True)
 
@@ -99,6 +123,17 @@ class Thread(db.Model):
             last_error=self.last_error,
             imported=self.imported,
             history_loaded=self.history_loaded,
+            native_updated_at=self.native_updated_at,
+            history_native_updated_at=self.history_native_updated_at,
+            history_synced_at=iso(self.history_synced_at),
+            history_stale=self.history_stale,
+            history_cursor=self.history_cursor,
+            history_complete=self.history_complete,
+            history_generation=self.history_generation,
+            execution_settings=self.execution_settings or {},
+            effective_settings=self.effective_settings or {},
+            settings_revision=self.settings_revision or 0,
+            effective_settings_revision=self.effective_settings_revision,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
         )
@@ -136,7 +171,10 @@ class Command(db.Model):
 
 
 class Item(db.Model):
-    __table_args__ = (db.UniqueConstraint("thread_id", "native_id"),)
+    __table_args__ = (
+        db.UniqueConstraint("thread_id", "native_id"),
+        db.Index("ix_item_thread_position", "thread_id", "position", "id"),
+    )
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     native_id = db.Column(db.String(250), nullable=False)
     thread_id = db.Column(db.String(32), db.ForeignKey("thread.id"), nullable=False, index=True)

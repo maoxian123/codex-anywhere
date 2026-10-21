@@ -11,6 +11,51 @@ export type Host = {
   online: boolean;
   version?: string;
   last_seen_at?: string;
+  last_sync_at?: string | null;
+  sync_error?: string | null;
+  capabilities?: string[];
+  runtime_id?: string | null;
+};
+export type ExecutionSettings = {
+  model?: string;
+  effort?: string;
+  approval_policy?: string;
+  sandbox_mode?: string;
+  approvals_reviewer?: string;
+  network_access?: boolean;
+};
+export type NativeExecutionSettings = Omit<
+  {
+    [Key in keyof ExecutionSettings]?: ExecutionSettings[Key] | null;
+  },
+  "approval_policy"
+> & { approval_policy?: string | JsonObject | null };
+export type RuntimeModel = {
+  id: string;
+  model: string;
+  displayName: string;
+  description?: string;
+  hidden?: boolean;
+  isDefault?: boolean;
+  defaultReasoningEffort?: string;
+  supportedReasoningEfforts?: {
+    reasoningEffort: string;
+    description?: string;
+  }[];
+  inputModalities?: string[];
+};
+export type RuntimeCapabilities = {
+  models: RuntimeModel[];
+  defaults: NativeExecutionSettings;
+  constraints?: {
+    approval_policies?: string[];
+    sandbox_modes?: string[];
+    approvals_reviewers?: string[];
+  };
+  supported?: Record<string, unknown>;
+  cwd?: string;
+  runtime_id?: string;
+  fetched_at?: string;
 };
 export type Thread = {
   id: string;
@@ -18,6 +63,13 @@ export type Thread = {
   project_id?: string | null;
   imported?: boolean;
   history_loaded?: boolean;
+  history_stale?: boolean;
+  native_updated_at?: number | null;
+  history_native_updated_at?: number | null;
+  history_synced_at?: string | null;
+  history_cursor?: string | null;
+  history_complete?: boolean;
+  history_generation?: string | null;
   native_id?: string;
   title: string;
   cwd: string;
@@ -26,6 +78,10 @@ export type Thread = {
   last_error?: string | null;
   created_at: string;
   updated_at: string;
+  execution_settings?: ExecutionSettings;
+  effective_settings?: NativeExecutionSettings;
+  settings_revision?: number;
+  effective_settings_revision?: number;
 };
 export type Asset = {
   id: string;
@@ -63,6 +119,7 @@ export type Project = {
   thread_count: number;
   created_at: string;
   updated_at: string;
+  execution_settings?: ExecutionSettings;
 };
 export type ThreadPage = {
   threads: Thread[];
@@ -88,6 +145,8 @@ export type ThreadDetail = {
   thread: Thread;
   items: Item[];
   interactions: Interaction[];
+  has_more_items?: boolean;
+  next_before_position?: number | null;
 };
 export type Command = {
   id: string;

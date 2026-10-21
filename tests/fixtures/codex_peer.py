@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import copy
 import json
 import sys
 from pathlib import Path
@@ -25,6 +26,39 @@ def main():
     args = parser.parse_args()
     root = Path(args.root)
     threads = {}
+    execution = {}
+    default_execution = {
+        "model": "test-default",
+        "reasoningEffort": "medium",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": {"type": "workspaceWrite", "networkAccess": False, "writableRoots": []},
+    }
+
+    def apply_settings(params, previous=None):
+        result = copy.deepcopy(previous or default_execution)
+        for key in ("model", "approvalPolicy", "approvalsReviewer"):
+            if key in params:
+                result[key] = params[key]
+        config = params.get("config") or {}
+        if "model_reasoning_effort" in config:
+            result["reasoningEffort"] = config["model_reasoning_effort"]
+        if "effort" in params:
+            result["reasoningEffort"] = params["effort"]
+        if "sandbox" in params:
+            result["sandbox"] = {
+                "type": {
+                    "workspace-write": "workspaceWrite",
+                    "read-only": "readOnly",
+                    "danger-full-access": "dangerFullAccess",
+                }[params["sandbox"]]
+            }
+        if "sandbox_workspace_write.network_access" in config:
+            result["sandbox"]["networkAccess"] = config["sandbox_workspace_write.network_access"]
+        if "sandboxPolicy" in params:
+            result["sandbox"] = copy.deepcopy(params["sandboxPolicy"])
+        return result
+
     history_cwd = root.parent / "previous-project"
     history_cwd.mkdir(exist_ok=True)
     (history_cwd / "history.png").write_bytes((root / "output.png").read_bytes())
@@ -85,14 +119,89 @@ def main():
                 send({"id": rpc_id, "result": {"userAgent": "codex-test-peer/1"}})
             elif method == "initialized":
                 pass
+            elif method == "model/list":
+                models = [
+                    {
+                        "id": "test-default-id",
+                        "model": "test-default",
+                        "displayName": "Test default",
+                        "isDefault": True,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+                        "futureCatalogField": {"preserve": True},
+                    },
+                    {
+                        "id": "test-special-id",
+                        "model": "test-special",
+                        "displayName": "Test special",
+                        "isDefault": False,
+                        "defaultReasoningEffort": "future-effort",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low"},
+                            {"reasoningEffort": "future-effort"},
+                        ],
+                    },
+                ]
+                offset = int(params.get("cursor", "0"))
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "data": models[offset : offset + 1],
+                            "nextCursor": str(offset + 1) if offset + 1 < len(models) else None,
+                        },
+                    }
+                )
+            elif method == "config/read":
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "config": {
+                                "model": "test-default",
+                                "model_reasoning_effort": "medium",
+                                "approval_policy": "on-request",
+                                "sandbox_mode": "workspace-write",
+                                "approvals_reviewer": "user",
+                                "sandbox_workspace_write": {"network_access": False},
+                                "developer_instructions": "PRIVATE-TEST-CONFIG",
+                            },
+                            "origins": {"private": {"token": "PRIVATE-TEST-ORIGIN"}},
+                        },
+                    }
+                )
+            elif method == "configRequirements/read":
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "requirements": {
+                                "allowedApprovalPolicies": ["on-request", "untrusted"],
+                                "allowedSandboxModes": ["workspace-write", "read-only"],
+                            }
+                        },
+                    }
+                )
             elif method == "thread/start":
                 native_id = f"native-thread-{len(threads) + 1}"
                 threads[native_id] = params["cwd"]
-                send({"id": rpc_id, "result": {"thread": {"id": native_id, "cwd": params["cwd"]}}})
+                execution[native_id] = apply_settings(params)
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "thread": {"id": native_id, "cwd": params["cwd"]},
+                            **execution[native_id],
+                        },
+                    }
+                )
             elif method == "thread/list":
                 send({"id": rpc_id, "result": {"data": [historical], "nextCursor": None}})
             elif method == "thread/read":
-                send({"id": rpc_id, "result": {"thread": historical}})
+                thread = {key: value for key, value in historical.items() if key != "turns"}
+                if params.get("includeTurns"):
+                    thread["turns"] = history_turns
+                send({"id": rpc_id, "result": {"thread": thread}})
             elif method == "thread/turns/list":
                 second = bool(params.get("cursor"))
                 turn = history_turns[1 if second else 0]
@@ -108,24 +217,43 @@ def main():
                     }
                 )
             elif method == "thread/items/list":
-                turn = next(turn for turn in history_turns if turn["id"] == params["turnId"])
+                entries = [
+                    {
+                        "turnId": turn["id"],
+                        "item": item,
+                        "startedAtMs": turn["startedAt"] * 1000,
+                        "completedAtMs": None,
+                    }
+                    for turn in history_turns
+                    if params.get("turnId") is None or turn["id"] == params["turnId"]
+                    for item in turn["items"]
+                ]
+                if params.get("sortDirection") == "desc":
+                    entries.reverse()
                 index = int(params.get("cursor", "0"))
+                limit = params.get("limit", 100)
+                page = entries[index : index + limit]
                 send(
                     {
                         "id": rpc_id,
                         "result": {
-                            "data": [{"turnId": turn["id"], "item": turn["items"][index]}],
-                            "nextCursor": str(index + 1)
-                            if index + 1 < len(turn["items"])
+                            "data": page,
+                            "nextCursor": str(index + len(page))
+                            if index + len(page) < len(entries)
                             else None,
                         },
                     }
                 )
             elif method == "thread/resume":
-                send({"id": rpc_id, "result": {"thread": {"id": params["threadId"]}}})
+                native_id = params["threadId"]
+                execution[native_id] = apply_settings(params, execution.get(native_id))
+                send(
+                    {"id": rpc_id, "result": {"thread": {"id": native_id}, **execution[native_id]}}
+                )
             elif method == "turn/start":
                 sequence += 1
                 native_id = params["threadId"]
+                execution[native_id] = apply_settings(params, execution.get(native_id))
                 turn_id = f"native-turn-{sequence}"
                 base = {"threadId": native_id, "turnId": turn_id}
                 send({"id": rpc_id, "result": {"turn": {"id": turn_id}}})

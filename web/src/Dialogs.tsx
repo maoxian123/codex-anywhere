@@ -2,7 +2,6 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   ArrowRight,
   CircleCheck,
-  Code2,
   FolderOpen,
   KeyRound,
   Link2,
@@ -12,7 +11,15 @@ import {
 } from "lucide-react";
 import { api, errorText, post, setSession } from "./api";
 import { CopyButton, ErrorMessage, Modal, Spinner } from "./components";
-import type { Command, Host, Project, Session, Thread } from "./types";
+import { RuntimeSettingsEditor } from "./ExecutionControls";
+import type {
+  Command,
+  ExecutionSettings,
+  Host,
+  Project,
+  Session,
+  Thread,
+} from "./types";
 
 export function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   const [username, setUsername] = useState("");
@@ -260,7 +267,12 @@ export function NewTaskDialog({
   );
   const host = hosts.find((value) => value.id === hostId);
   const [title, setTitle] = useState("");
-  const [model, setModel] = useState("");
+  const [settings, setSettings] = useState<ExecutionSettings>(
+    project?.execution_settings || {},
+  );
+  useEffect(() => {
+    setSettings(project?.execution_settings || {});
+  }, [project?.id]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -285,7 +297,9 @@ export function NewTaskDialog({
           host_id: hostId,
           project_id: projectId,
           title: title.trim() || "新任务",
-          ...(model.trim() ? { model: model.trim() } : {}),
+          ...(Object.keys(settings).length
+            ? { execution_settings: settings }
+            : {}),
         },
       );
       onCreated(result.thread, result.command);
@@ -369,21 +383,16 @@ export function NewTaskDialog({
           <Plus size={14} />
           新建项目 / 选择设备目录
         </button>
-        <details className="advanced-settings">
-          <summary>
-            <Code2 size={14} />
-            高级设置
-          </summary>
-          <label>
-            模型<span className="field-optional">可选</span>
-            <input
-              placeholder="留空使用节点的 Codex 默认模型"
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
-              disabled={busy}
-            />
-          </label>
-        </details>
+        {project && (
+          <RuntimeSettingsEditor
+            key={project.id}
+            host={host}
+            cwd={project.cwd}
+            settings={settings}
+            disabled={busy}
+            onChange={setSettings}
+          />
+        )}
         {!host?.online && (
           <ErrorMessage>当前设备离线，请选择在线设备。</ErrorMessage>
         )}

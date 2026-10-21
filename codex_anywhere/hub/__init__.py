@@ -28,6 +28,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from .broker import Broker, install_full_writes
+from .execution import execution_settings, require_runtime_settings
+from .history import history_command_applied
 from .models import (
     Asset,
     Command,
@@ -42,6 +44,7 @@ from .models import (
     iso,
     new_id,
 )
+from .presentation import browser_event, browser_item
 from .projects import ensure_project
 from .references import quote_references, resolve_references
 from .transport import emit, handle_node_message
@@ -178,6 +181,35 @@ def _issue_command(host, thread, kind, payload, key=None):
         db.session.refresh(command)
         result = command.as_dict()
     return result
+
+
+def _latest_history_import(thread):
+    return (
+        Command.query.filter_by(thread_id=thread.id, kind="thread.import")
+        .order_by(Command.created_at.desc(), Command.id.desc())
+        .first()
+    )
+
+
+def _history_import_pending(thread, command):
+    return command is not None and (
+        command.status in {"queued", "sent", "running"}
+        # The RPC summary can arrive before durable import_complete. Only that
+        # event makes the projected history available to the browser.
+        or (command.status == "completed" and thread.status == "importing")
+    )
+
+
+def _start_history_import(host, thread):
+    thread.imported = True
+    thread.history_loaded = False
+    thread.status = "importing"
+    thread.active_turn_id = None
+    thread.last_error = None
+    if thread.cwd:
+        thread.project_id = ensure_project(host, thread.cwd).id
+    db.session.flush()
+    return _issue_command(host, thread, "thread.import", dict(native_thread_id=thread.native_id))
 
 
 def _save_image(host=None):
@@ -414,6 +446,53 @@ def create_app(test_config=None):
             ]
         )
 
+    @app.get("/api/hosts/<host_id>/capabilities")
+    def runtime_capabilities(host_id):
+        host = db.session.get(Host, _identifier(host_id, "host_id"))
+        if not host:
+            return jsonify(error="节点不存在"), 404
+        cwd = request.args.get("cwd")
+        if cwd is not None and not is_absolute_directory(cwd):
+            raise ValueError("工作目录必须是绝对路径")
+        catalog = host.runtime_capabilities
+        if catalog and (
+            catalog.get("runtime_id") != host.runtime_id
+            or not host.capabilities_updated_at
+            or time.time() - host.capabilities_updated_at >= 60
+            or (cwd is not None and catalog.get("cwd") != cwd)
+        ):
+            catalog = None
+        return jsonify(
+            capabilities=catalog,
+            updated_at=iso(host.capabilities_updated_at) if catalog else None,
+        )
+
+    @app.post("/api/hosts/<host_id>/capabilities")
+    def refresh_runtime_capabilities(host_id):
+        data = _json()
+        with app.extensions["broker"].command_lock:
+            host = _online_host(host_id)
+            require_runtime_settings(host, {"model": "capability-query"})
+            payload = {}
+            if data.get("cwd") is not None:
+                if not is_absolute_directory(data["cwd"]):
+                    raise ValueError("工作目录必须是绝对路径")
+                payload["cwd"] = data["cwd"]
+            refresh = data.get("refresh", False)
+            if not isinstance(refresh, bool):
+                raise ValueError("refresh 必须是布尔值")
+            payload["refresh"] = refresh
+            pending = Command.query.filter(
+                Command.host_id == host.id,
+                Command.kind == "runtime.capabilities",
+                Command.runtime_id == host.runtime_id,
+                Command.status.in_(["queued", "sent", "running"]),
+            ).all()
+            for command in pending:
+                if command.payload == payload:
+                    return jsonify(command=command.as_dict()), 202
+            return jsonify(command=_issue_command(host, None, "runtime.capabilities", payload)), 202
+
     @app.post("/api/pairings")
     def pairing():
         code = secrets.token_hex(6).upper()
@@ -492,6 +571,42 @@ def create_app(test_config=None):
         )
         return jsonify(projects=[project.as_dict(thread_count=count) for project, count in rows])
 
+    @app.patch("/api/projects/<project_id>/settings")
+    def update_project_settings(project_id):
+        data = _json()
+        settings = execution_settings(data.get("execution_settings"))
+        with app.extensions["broker"].command_lock:
+            project = db.session.get(Project, _identifier(project_id, "project_id"))
+            if not project:
+                return jsonify(error="项目不存在"), 404
+            host = db.session.get(Host, project.host_id)
+            require_runtime_settings(host, settings)
+            project.execution_settings = settings
+            emit("anywhere/project_settings", {"project_id": project.id}, host_id=host.id)
+            db.session.commit()
+            return jsonify(project=project.as_dict())
+
+    @app.patch("/api/threads/<thread_id>/settings")
+    def update_thread_settings(thread_id):
+        data = _json()
+        settings = execution_settings(data.get("execution_settings"))
+        with app.extensions["broker"].command_lock:
+            thread = _get_thread(thread_id)
+            host = db.session.get(Host, thread.host_id)
+            require_runtime_settings(host, settings)
+            if "settings_revision" in data:
+                expected = _integer(data["settings_revision"], "settings_revision", 0, 2**31 - 1)
+                if expected != thread.settings_revision:
+                    return jsonify(
+                        error="运行设置已被更新，请刷新后重试", thread=thread.as_dict()
+                    ), 409
+            if settings != thread.execution_settings:
+                thread.execution_settings = settings
+                thread.settings_revision += 1
+                emit("anywhere/thread_settings", {"thread_id": thread.id}, thread.id, host.id)
+                db.session.commit()
+            return jsonify(thread=thread.as_dict())
+
     @app.post("/api/projects")
     def open_project():
         data = _json()
@@ -554,19 +669,11 @@ def create_app(test_config=None):
             raise ValueError("会话标题格式无效")
         with app.extensions["broker"].command_lock:
             thread = Thread.query.filter_by(host_id=host.id, native_id=native_id).first()
-            if thread and thread.status in {"active", "waiting"}:
+            if thread and thread.status in {"active", "waiting", "starting"}:
                 return jsonify(error="正在运行或等待交互的任务不能重新导入"), 409
-            if thread and thread.status == "importing":
-                pending = (
-                    Command.query.filter(
-                        Command.thread_id == thread.id,
-                        Command.kind == "thread.import",
-                        Command.status.in_(["queued", "sent", "running", "completed"]),
-                    )
-                    .order_by(Command.created_at.desc(), Command.id.desc())
-                    .first()
-                )
-                if pending:
+            if thread:
+                pending = _latest_history_import(thread)
+                if _history_import_pending(thread, pending):
                     return jsonify(thread=thread.as_dict(), command=pending.as_dict()), 202
             if thread is None:
                 thread = Thread(
@@ -578,17 +685,95 @@ def create_app(test_config=None):
                     thread.cwd = cwd
                 if title.strip():
                     thread.title = title.strip()
-            thread.imported = True
-            thread.history_loaded = False
-            thread.status = "importing"
-            thread.active_turn_id = None
-            thread.last_error = None
-            if thread.cwd:
-                thread.project_id = ensure_project(host, thread.cwd).id
-            db.session.flush()
-            command = _issue_command(
-                host, thread, "thread.import", dict(native_thread_id=native_id)
-            )
+            command = _start_history_import(host, thread)
+            return jsonify(thread=thread.as_dict(), command=command), 202
+
+    @app.post("/api/threads/<thread_id>/history")
+    def load_history(thread_id):
+        data = _json()
+        cursor = data.get("cursor")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 8192):
+            raise ValueError("历史分页游标无效")
+        limit = _integer(data.get("limit", 50), "limit", 1, 100)
+        retry = data.get("retry", False)
+        if not isinstance(retry, bool):
+            raise ValueError("retry 必须是布尔值")
+        with app.extensions["broker"].command_lock:
+            thread = _get_thread(thread_id)
+            host = _online_host(thread.host_id)
+            if thread.status in {"active", "waiting", "starting"}:
+                return jsonify(thread=thread.as_dict(), command=None)
+            if "lazyHistory" in (host.capabilities or []):
+                if not thread.native_id:
+                    return jsonify(error="任务尚未创建完成"), 409
+                latest = (
+                    Command.query.filter(
+                        Command.thread_id == thread.id,
+                        Command.kind.in_(["thread.history", "thread.import"]),
+                    )
+                    .order_by(Command.created_at.desc(), Command.id.desc())
+                    .first()
+                )
+                if latest and (
+                    latest.status in {"queued", "sent", "running"}
+                    or (
+                        latest.status == "completed"
+                        and (
+                            (
+                                latest.kind == "thread.history"
+                                and not history_command_applied(latest)
+                            )
+                            or (latest.kind == "thread.import" and thread.status == "importing")
+                        )
+                    )
+                ):
+                    return jsonify(thread=thread.as_dict(), command=latest.as_dict()), 202
+                if (
+                    cursor is None
+                    and thread.history_loaded
+                    and not thread.history_stale
+                    and not retry
+                ):
+                    return jsonify(thread=thread.as_dict(), command=None)
+                if cursor is not None and (cursor != thread.history_cursor or thread.history_stale):
+                    return jsonify(
+                        error="历史已更新，请刷新最近消息后继续加载", thread=thread.as_dict()
+                    ), 409
+                if latest and latest.status in {"unknown", "failed"} and not retry:
+                    return jsonify(
+                        error="上次历史读取失败或结果未知，请显式手动重试",
+                        thread=thread.as_dict(),
+                        command=latest.as_dict(),
+                    ), 409
+                payload = dict(
+                    native_thread_id=thread.native_id,
+                    limit=limit,
+                    _native_fingerprint=thread.native_fingerprint,
+                )
+                if cursor:
+                    payload["cursor"] = cursor
+                if not thread.history_loaded:
+                    thread.status = "importing"
+                    thread.last_error = None
+                command = _issue_command(host, thread, "thread.history", payload)
+                return jsonify(thread=thread.as_dict(), command=command), 202
+            if cursor:
+                return jsonify(error="该节点不支持原生历史分页，请更新并重启节点"), 409
+            if thread.history_loaded and not thread.history_stale:
+                return jsonify(thread=thread.as_dict(), command=None)
+            pending = _latest_history_import(thread)
+            if _history_import_pending(thread, pending):
+                return jsonify(thread=thread.as_dict(), command=pending.as_dict()), 202
+            if pending and pending.status in {"unknown", "failed"}:
+                error = (
+                    "上次历史导入的执行结果未知，请显式手动重试"
+                    if pending.status == "unknown"
+                    else "上次历史导入失败，请显式手动重试"
+                )
+                return jsonify(error=error, thread=thread.as_dict(), command=pending.as_dict()), 409
+            if not thread.native_id:
+                return jsonify(error="任务尚未创建完成"), 409
+            command = _start_history_import(host, thread)
             return jsonify(thread=thread.as_dict(), command=command), 202
 
     @app.post("/api/threads")
@@ -610,30 +795,94 @@ def create_app(test_config=None):
                 raise ValueError("工作目录必须是绝对路径")
             project = ensure_project(host, cwd)
         title = str(data.get("title", "新任务")).strip()[:240] or "新任务"
-        thread = Thread(host_id=host.id, project_id=project.id, title=title, cwd=cwd)
+        settings = dict(project.execution_settings or {})
+        if "execution_settings" in data:
+            settings.update(execution_settings(data["execution_settings"]))
+        require_runtime_settings(host, settings)
+        thread = Thread(
+            host_id=host.id,
+            project_id=project.id,
+            title=title,
+            cwd=cwd,
+            execution_settings=settings,
+            history_complete=True,
+        )
         db.session.add(thread)
         db.session.flush()
         payload = dict(cwd=cwd, title=title)
         if data.get("model"):
             payload["model"] = str(data["model"])[:200]
+            if "model" not in settings:
+                settings["model"] = payload["model"]
+                thread.execution_settings = dict(settings)
+        if "runtimeSettings" in (host.capabilities or []):
+            payload.update(
+                execution_settings=settings, settings_revision=thread.settings_revision or 0
+            )
         command = _issue_command(host, thread, "thread.start", payload)
         return jsonify(thread=thread.as_dict(), command=command), 202
 
     @app.get("/api/threads/<thread_id>")
     def thread_detail(thread_id):
         thread = _get_thread(thread_id)
-        items = Item.query.filter_by(thread_id=thread.id).order_by(Item.position, Item.id).all()
+        query = Item.query.filter_by(thread_id=thread.id)
+        paging = "item_limit" in request.args or "before_position" in request.args
+        page_info = {}
+        if paging:
+            limit = _integer(request.args.get("item_limit", 100), "item_limit", 1, 200)
+            if "before_position" in request.args:
+                before = _integer(request.args["before_position"], "before_position", 0, 2**63 - 1)
+                query = query.filter(Item.position < before)
+            rows = (
+                query.with_entities(Item.id, Item.position)
+                .order_by(Item.position.desc(), Item.id.desc())
+                .limit(limit + 1)
+                .all()
+            )
+            has_more = len(rows) > limit
+            items = list(reversed(rows[:limit]))
+            page_info = dict(
+                has_more_items=has_more,
+                next_before_position=items[0].position if has_more else None,
+            )
+        else:
+            items = query.order_by(Item.position, Item.id).all()
+        if paging:
+            displayed_items = []
+            # Materialize at most one raw, potentially image-bearing item at a
+            # time. Selecting a page must not deserialize 100 giant payloads
+            # before their compact presentation can be constructed.
+            for row in items:
+                item = db.session.get(Item, row.id)
+                displayed_items.append(browser_item(item))
+                db.session.expunge(item)
+        else:
+            displayed_items = [item.as_dict() for item in items]
         interactions = (
             Interaction.query.filter_by(thread_id=thread.id).order_by(Interaction.created_at).all()
         )
         return jsonify(
             thread=thread.as_dict(),
-            items=[i.as_dict() for i in items],
+            items=displayed_items,
             interactions=[i.as_dict() for i in interactions],
+            **page_info,
         )
+
+    @app.get("/api/threads/<thread_id>/items/<item_id>")
+    def full_item(thread_id, item_id):
+        thread = _get_thread(thread_id)
+        item = Item.query.filter_by(id=_identifier(item_id, "item_id"), thread_id=thread.id).first()
+        if not item:
+            return jsonify(error="消息不存在"), 404
+        return jsonify(item=item.as_dict())
 
     def send_message(thread_id, kind):
         data = _json()
+        overrides = (
+            execution_settings(data["execution_settings"]) if "execution_settings" in data else None
+        )
+        if overrides is not None and kind == "turn.steer":
+            raise ValueError("补充当前轮次时不能修改运行设置；请设置下一轮参数")
         text = data.get("text", "")
         assets_ids = data.get("asset_ids", [])
         refs = data.get("references", [])
@@ -649,9 +898,12 @@ def create_app(test_config=None):
         client_id = data.get("client_request_id")
         if not isinstance(client_id, str) or not 1 <= len(client_id) <= 100:
             raise ValueError("请提供 client_request_id 以防止重复执行")
+        signed_content = dict(text=text, asset_ids=assets_ids, references=refs)
+        if overrides is not None:
+            signed_content["execution_settings"] = overrides
         signature = token_hash(
             json.dumps(
-                dict(text=text, asset_ids=assets_ids, references=refs),
+                signed_content,
                 sort_keys=True,
                 ensure_ascii=False,
             )
@@ -709,6 +961,24 @@ def create_app(test_config=None):
                 _display_text=text,
                 _assets=assets,
             )
+            if kind == "turn.start":
+                settings = dict(thread.execution_settings or {})
+                if overrides is not None:
+                    settings.update(overrides)
+                # Legacy model-only thread creation remains usable on old nodes.
+                if "runtimeSettings" in (host.capabilities or []):
+                    payload.update(
+                        execution_settings=settings, settings_revision=thread.settings_revision
+                    )
+                elif overrides or set(settings) - {"model"}:
+                    # A downgraded node must not ignore saved sandbox restrictions.
+                    require_runtime_settings(host, settings)
+                for history_command in Command.query.filter_by(
+                    thread_id=thread.id, kind="thread.history"
+                ).filter(Command.status.in_(["queued", "sent", "running", "completed"])):
+                    if not history_command_applied(history_command):
+                        history_command.status = "failed"
+                        history_command.error = "会话已开始新轮次，此历史页未应用；请刷新历史"
             if kind == "turn.steer":
                 payload["expected_turn_id"] = thread.active_turn_id
             thread.status = "active"
@@ -748,6 +1018,13 @@ def create_app(test_config=None):
         if not command:
             return jsonify(error="指令不存在"), 404
         return jsonify(command=command.as_dict())
+
+    @app.get("/api/events/<int:event_id>")
+    def full_event(event_id):
+        event = db.session.get(Event, event_id)
+        if not event:
+            return jsonify(error="事件不存在"), 404
+        return jsonify(event=event.as_dict())
 
     @app.post("/api/interactions/<interaction_id>/answer")
     def answer(interaction_id):
@@ -865,12 +1142,15 @@ def create_app(test_config=None):
             query = Event.query.filter(Event.id > cursor)
             if thread_id:
                 query = query.filter((Event.thread_id == thread_id) | Event.thread_id.is_(None))
-            for event in query.order_by(Event.id).limit(100).all():
+            event_ids = query.with_entities(Event.id).order_by(Event.id).limit(100).all()
+            for (event_id,) in event_ids:
                 if not authenticated():
                     ws.close(reason=1008, message="Session expired")
                     return
-                ws.send(json.dumps(event.as_dict(), ensure_ascii=False))
-                cursor = event.id
+                event = db.session.get(Event, event_id)
+                ws.send(json.dumps(browser_event(event), ensure_ascii=False))
+                cursor = event_id
+                db.session.expunge(event)
 
     @sock.route("/ws/node")
     def node_socket(ws):

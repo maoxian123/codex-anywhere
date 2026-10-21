@@ -1,23 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowRight,
   Bot,
-  CircleHelp,
-  CirclePlus,
-  Code2,
   ExternalLink,
   Folder,
-  Globe2,
-  LogOut,
   Menu,
   Monitor,
   MoreHorizontal,
   Plus,
   RefreshCw,
   Search,
-  Settings2,
   ShieldCheck,
-  Terminal,
   WifiOff,
   X,
 } from "lucide-react";
@@ -34,8 +26,23 @@ import Interactions from "./Interactions";
 import { ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
 import ProjectNavigation from "./ProjectNavigation";
+import SidebarMenu from "./SidebarMenu";
 import Timeline from "./Timeline";
 import { commandFailure, eventFailure } from "./runtime-errors";
+import {
+  latestHistory,
+  olderHistory,
+  withHistory,
+  type HistoryCache,
+} from "./history";
+import { useAutomaticHistory } from "./useAutomaticHistory";
+import { waitForCommand, waitForHistoryPage } from "./commands";
+import { ProjectSettingsDialog } from "./ExecutionControls";
+import {
+  applySettingsUpdate,
+  permissionLabel,
+  preserveNewerSettings,
+} from "./execution-settings";
 import type {
   Command,
   Host,
@@ -47,15 +54,9 @@ import type {
   ThreadDetail,
   Project,
   ThreadPage,
+  ExecutionSettings,
 } from "./types";
-import {
-  busyStatus,
-  fileName,
-  object,
-  relativeDate,
-  statusLabels,
-  string,
-} from "./utils";
+import { busyStatus, object, statusLabels, string } from "./utils";
 
 function readRoute() {
   const match = window.location.pathname.match(/^\/tasks\/([^/]+)\/?$/);
@@ -64,17 +65,6 @@ function readRoute() {
     item: new URLSearchParams(window.location.search).get("item") || undefined,
   };
 }
-function desktopName(platform: string) {
-  const lower = platform.toLowerCase();
-  return lower.includes("win")
-    ? "Windows"
-    : lower.includes("darwin") || lower.includes("mac")
-      ? "macOS"
-      : lower.includes("linux")
-        ? "Linux"
-        : platform || "工作电脑";
-}
-
 export default function App() {
   const initial = useInitialSession();
   if (!initial.session)
@@ -111,6 +101,7 @@ function Workspace({
   const [hosts, setHosts] = useState<Host[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
   const [listPages, setListPages] = useState(1);
   const [hasMore, setHasMore] = useState(false);
@@ -118,6 +109,10 @@ function Workspace({
   const [search, setSearch] = useState("");
   const [route, setRoute] = useState(readRoute);
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
+  const hostsRef = useRef(hosts);
+  hostsRef.current = hosts;
   const [loading, setLoading] = useState(true);
   const [loadingThread, setLoadingThread] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -130,6 +125,9 @@ function Workspace({
   const [error, setError] = useState("");
   const [networkError, setNetworkError] = useState("");
   const [threadError, setThreadError] = useState("");
+  const [historyError, setHistoryError] = useState("");
+  const [olderError, setOlderError] = useState("");
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [connection, setConnection] = useState<
     "connecting" | "connected" | "reconnecting"
   >("connecting");
@@ -143,6 +141,9 @@ function Workspace({
     offsets: [0],
   });
   const threadFetchRef = useRef(0);
+  const historyCache = useRef<HistoryCache | null>(null);
+  const olderRequest = useRef<AbortController | null>(null);
+  const referencePages = useRef({ key: "", count: 0 });
   const listFetchRef = useRef(0);
   const threadRequests = useRef(
     new Map<string, { again: boolean; promise: Promise<void> }>(),
@@ -210,6 +211,7 @@ function Workspace({
       window.removeEventListener("offline", onOnline);
       if (refreshRef.current) clearTimeout(refreshRef.current);
       if (listRefreshRef.current) clearTimeout(listRefreshRef.current);
+      olderRequest.current?.abort();
     };
   }, []);
 
@@ -288,14 +290,24 @@ function Workspace({
         const request = ++threadFetchRef.current;
         try {
           const value = await api<ThreadDetail>(
-            `/threads/${encodeURIComponent(id)}`,
+            `/threads/${encodeURIComponent(id)}?item_limit=100`,
           );
           if (
             liveRef.current &&
             id === selectedRef.current &&
             request === threadFetchRef.current
           ) {
-            setDetail(value);
+            const cache = latestHistory(historyCache.current, value);
+            historyCache.current = cache;
+            setDetail((current) =>
+              withHistory(
+                {
+                  ...value,
+                  thread: preserveNewerSettings(value.thread, current?.thread),
+                },
+                cache,
+              ),
+            );
             setThreadError("");
             setStreams((current) =>
               Object.fromEntries(
@@ -327,6 +339,113 @@ function Workspace({
     });
     return entry.promise;
   }, []);
+  const loadOlder = useCallback(
+    async (retry = false) => {
+      const cache = historyCache.current;
+      const id = selectedRef.current;
+      const thread = detailRef.current?.thread;
+      const nativeMore =
+        thread?.id === id &&
+        thread.history_complete === false &&
+        !!thread.history_cursor;
+      if (
+        !cache ||
+        cache.id !== id ||
+        ((!cache.hasMore || cache.before === null) && !nativeMore) ||
+        olderRequest.current
+      )
+        return;
+      const controller = new AbortController();
+      olderRequest.current = controller;
+      setLoadingOlder(true);
+      setOlderError("");
+      try {
+        const nativePage = !cache.hasMore && nativeMore;
+        if (nativePage && thread?.history_cursor) {
+          if (
+            !hostsRef.current.find((host) => host.id === thread.host_id)?.online
+          )
+            throw new Error("设备离线，连接后可加载更早的本机历史。");
+          if (
+            ["active", "waiting", "starting", "importing"].includes(
+              thread.status,
+            )
+          )
+            throw new Error("当前会话正在执行或同步，请稍后加载更早历史。");
+          const result = await api<{ thread: Thread; command: Command | null }>(
+            `/threads/${encodeURIComponent(id)}/history`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                cursor: thread.history_cursor,
+                limit: 50,
+                ...(retry ? { retry: true } : {}),
+              }),
+              signal: controller.signal,
+            },
+          );
+          if (result.command)
+            await waitForCommand(result.command, controller.signal);
+          const projected = await waitForHistoryPage(
+            id,
+            thread.history_cursor,
+            thread.history_generation,
+            controller.signal,
+          );
+          if (controller.signal.aborted || selectedRef.current !== id) return;
+          if (projected.history_generation !== thread.history_generation) {
+            await refreshThread(id);
+            return;
+          }
+        }
+        const before = nativePage ? cache.items[0]?.position : cache.before;
+        const page = await api<ThreadDetail>(
+          `/threads/${encodeURIComponent(id)}?item_limit=100${typeof before === "number" ? `&before_position=${before}` : ""}`,
+          { signal: controller.signal },
+        );
+        if (
+          controller.signal.aborted ||
+          selectedRef.current !== id ||
+          !liveRef.current
+        )
+          return;
+        const current = historyCache.current;
+        if (!current || current.id !== id || current.version !== cache.version)
+          return;
+        const merged = olderHistory(current, page);
+        if (!merged) {
+          await refreshThread(id);
+          return;
+        }
+        historyCache.current = merged;
+        setDetail((previous) =>
+          previous?.thread.id === id
+            ? withHistory(
+                {
+                  ...previous,
+                  thread: preserveNewerSettings(page.thread, previous.thread),
+                },
+                merged,
+              )
+            : previous,
+        );
+      } catch (reason) {
+        if (
+          !controller.signal.aborted &&
+          selectedRef.current === id &&
+          liveRef.current
+        )
+          setOlderError(errorText(reason));
+      } finally {
+        if (olderRequest.current === controller) {
+          olderRequest.current = null;
+          if (liveRef.current && selectedRef.current === id)
+            setLoadingOlder(false);
+        }
+      }
+    },
+    [refreshThread],
+  );
   const scheduleRefresh = useCallback(
     (listOnly = false) => {
       if (listOnly) {
@@ -356,6 +475,11 @@ function Workspace({
     setStreams({});
     setThreadError("");
     setError("");
+    historyCache.current = null;
+    olderRequest.current?.abort();
+    olderRequest.current = null;
+    setLoadingOlder(false);
+    setOlderError("");
     completedStreams.current.clear();
     if (route.id) {
       setLoadingThread(true);
@@ -366,6 +490,15 @@ function Workspace({
   eventRef.current = (event) => {
     const method = event.method;
     const current = event.thread_id === selectedRef.current;
+    if (
+      method === "anywhere/catalog_sync" &&
+      detail?.thread.native_id &&
+      Array.isArray(event.params.threads) &&
+      event.params.threads.some(
+        (entry) => object(entry).id === detail.thread.native_id,
+      )
+    )
+      scheduleRefresh();
     if (
       current &&
       (method.endsWith("/delta") || method.endsWith("/outputDelta"))
@@ -508,6 +641,43 @@ function Workspace({
     scheduleRefresh();
     scheduleRefresh(true);
   };
+  const saveThreadSettings = async (settings: ExecutionSettings) => {
+    const thread = detail?.thread;
+    if (!thread) return;
+    try {
+      const result = await api<{ thread: Thread }>(
+        `/threads/${encodeURIComponent(thread.id)}/settings`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            execution_settings: settings,
+            ...(thread.settings_revision !== undefined
+              ? { settings_revision: thread.settings_revision }
+              : {}),
+          }),
+        },
+      );
+      if (selectedRef.current === thread.id)
+        setDetail((current) =>
+          current?.thread.id === thread.id
+            ? {
+                ...current,
+                thread: applySettingsUpdate(current.thread, result.thread),
+              }
+            : current,
+        );
+      setThreads((current) =>
+        current.map((entry) =>
+          entry.id === result.thread.id
+            ? applySettingsUpdate(entry, result.thread)
+            : entry,
+        ),
+      );
+    } catch (reason) {
+      await refreshThread(thread.id);
+      throw reason;
+    }
+  };
   const interrupt = async () => {
     const result = await post<{ command: Command }>(
       `/threads/${route.id}/interrupt`,
@@ -528,10 +698,47 @@ function Workspace({
     }
   };
   const selectedHost = hosts.find((host) => host.id === detail?.thread.host_id);
-  const onlineCount = hosts.filter((host) => host.online).length;
-  const activeCount = threads.filter((thread) =>
-    busyStatus(thread.status),
-  ).length;
+  const historyBusy = useAutomaticHistory({
+    selectionId: route.id,
+    thread: detail?.thread,
+    host: selectedHost,
+    refresh: refreshThread,
+    onError: setHistoryError,
+  });
+  useEffect(() => {
+    const key = `${route.id}:${route.item || ""}`;
+    if (referencePages.current.key !== key)
+      referencePages.current = { key, count: 0 };
+    if (
+      !route.item ||
+      !detail ||
+      detail.thread.id !== route.id ||
+      detail.thread.history_loaded === false ||
+      historyBusy ||
+      loadingOlder ||
+      olderError ||
+      !(
+        detail.has_more_items ||
+        (detail.thread.history_complete === false &&
+          detail.thread.history_cursor)
+      ) ||
+      referencePages.current.count >= 20 ||
+      detail.items.some(
+        (item) => item.id === route.item || item.native_id === route.item,
+      )
+    )
+      return;
+    referencePages.current.count += 1;
+    void loadOlder();
+  }, [
+    route.id,
+    route.item,
+    detail,
+    historyBusy,
+    loadingOlder,
+    olderError,
+    loadOlder,
+  ]);
 
   return (
     <div className="app-shell">
@@ -543,43 +750,31 @@ function Workspace({
         />
       )}
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
-        <a
-          href="/"
-          className="brand"
-          onClick={(event) => {
-            event.preventDefault();
-            navigate("");
-          }}
-        >
-          <img src="/icons/codex-anywhere.svg" alt="" />
-          <span>
-            codex<span className="brand-light">anywhere</span>
-          </span>
-          <span className="version-tag">BETA</span>
-        </a>
-        <div className="workspace-selector">
-          <span className="workspace-icon">
-            <Code2 size={17} />
-          </span>
-          <span>
-            <strong>我的工作空间</strong>
-            <small>{session.username}</small>
-          </span>
+        <div className="sidebar-toolbar">
+          <button
+            className="new-conversation-button"
+            onClick={() => setDialog("new")}
+            aria-label="新对话"
+          >
+            <Plus size={17} />
+            新对话
+          </button>
           <button
             className="icon-button"
-            onClick={() => setDialog("about")}
-            aria-label="工作空间信息"
+            onClick={() => setDialog("project")}
+            aria-label="新建项目"
+            title="新建项目"
           >
-            <Settings2 size={15} />
+            <Folder size={16} />
           </button>
+          <SidebarMenu
+            hosts={hosts}
+            onPair={() => setDialog("pair")}
+            onHistory={() => setDialog("import")}
+            onAbout={() => setDialog("about")}
+            onLogout={() => void logout()}
+          />
         </div>
-        <button
-          className="button new-task-button"
-          onClick={() => setDialog("new")}
-        >
-          <Plus size={17} />
-          新建任务<span className="keycap">N</span>
-        </button>
         <div className="search-box">
           <Search size={15} />
           <input
@@ -598,15 +793,6 @@ function Workspace({
             </button>
           )}
         </div>
-        <div className="sidebar-project-actions">
-          <button className="text-button" onClick={() => setDialog("project")}>
-            <Plus size={14} />
-            新建项目
-          </button>
-          <button className="text-button" onClick={() => setDialog("import")}>
-            导入本机会话
-          </button>
-        </div>
         <ProjectNavigation
           hosts={hosts}
           projects={projects}
@@ -619,65 +805,13 @@ function Workspace({
           onFilter={setProjectFilter}
           onNavigate={(id) => navigate(id)}
           onNewProject={() => setDialog("project")}
+          onSettings={setSettingsProject}
           onRefresh={() => void refreshList()}
           onMore={() => {
             setLoadingMore(true);
             setListPages((value) => value + 1);
           }}
         />
-        <div className="sidebar-devices">
-          <div className="sidebar-section-label">
-            <span>工作设备</span>
-            <span className="count-badge">{onlineCount} 在线</span>
-            <button
-              className="icon-button"
-              title="添加设备"
-              aria-label="添加设备"
-              onClick={() => setDialog("pair")}
-            >
-              <Plus size={14} />
-            </button>
-          </div>
-          {hosts.length ? (
-            hosts.map((host) => (
-              <div className="device-row" key={host.id}>
-                <Monitor size={16} />
-                <span>
-                  <strong>{host.name}</strong>
-                  <small>{desktopName(host.platform)}</small>
-                </span>
-                <span
-                  className={`device-status ${host.online ? "online" : ""}`}
-                  title={host.online ? "在线" : "离线"}
-                />
-                <span className="sr-only">{host.online ? "在线" : "离线"}</span>
-              </div>
-            ))
-          ) : (
-            <button
-              className="connect-device"
-              onClick={() => setDialog("pair")}
-            >
-              <CirclePlus size={16} />
-              连接你的第一台设备
-              <ArrowRight size={13} />
-            </button>
-          )}
-        </div>
-        <footer className="sidebar-footer">
-          <button className="text-button" onClick={() => setDialog("about")}>
-            <CircleHelp size={15} />
-            使用说明
-          </button>
-          <button
-            className="icon-button"
-            onClick={() => void logout()}
-            title="退出登录"
-            aria-label="退出登录"
-          >
-            <LogOut size={15} />
-          </button>
-        </footer>
       </aside>
       <main className="main-panel">
         <header className="topbar">
@@ -689,10 +823,10 @@ function Workspace({
             >
               <Menu size={20} />
             </button>
-            <span className="breadcrumb">工作空间</span>
+            <span className="breadcrumb">会话</span>
             <span className="breadcrumb-divider">/</span>
             <span className="topbar-title">
-              {detail?.thread.title || (route.id ? "加载任务" : "概览")}
+              {detail?.thread.title || (route.id ? "加载会话" : "全部会话")}
             </span>
           </div>
           <div className="topbar-right">
@@ -772,7 +906,15 @@ function Workspace({
                   </span>
                   <span className="permission-label">
                     <ShieldCheck size={13} />
-                    按需审批
+                    {detail.thread.effective_settings?.sandbox_mode ||
+                    detail.thread.execution_settings?.sandbox_mode ||
+                    detail.thread.effective_settings?.approval_policy ||
+                    detail.thread.execution_settings?.approval_policy
+                      ? permissionLabel(
+                          detail.thread.effective_settings ||
+                            detail.thread.execution_settings,
+                        )
+                      : "保留原会话设置"}
                   </span>
                 </div>
               </div>
@@ -780,6 +922,11 @@ function Workspace({
             {detail?.thread.last_error && (
               <div className="thread-error">
                 <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
+              </div>
+            )}
+            {historyError && (
+              <div className="thread-error">
+                <ErrorMessage>{historyError}</ErrorMessage>
               </div>
             )}
             {threadError && (
@@ -803,7 +950,16 @@ function Workspace({
               streams={streams}
               busy={busyStatus(detail?.thread.status)}
               loading={loadingThread}
+              hasMore={Boolean(
+                detail?.has_more_items ||
+                (detail?.thread.history_complete === false &&
+                  detail.thread.history_cursor),
+              )}
+              loadingOlder={loadingOlder}
+              olderError={olderError}
+              onLoadOlder={() => void loadOlder(Boolean(olderError))}
               importing={
+                historyBusy ||
                 detail?.thread.status === "importing" ||
                 detail?.thread.history_loaded === false
               }
@@ -822,8 +978,18 @@ function Workspace({
                 />
                 <Composer
                   key={detail.thread.id}
-                  thread={detail.thread}
+                  thread={
+                    historyBusy
+                      ? { ...detail.thread, history_loaded: false }
+                      : detail.thread
+                  }
                   hostOnline={!!selectedHost?.online}
+                  host={selectedHost}
+                  project={projects.find(
+                    (project) => project.id === detail.thread.project_id,
+                  )}
+                  onSettingsChange={saveThreadSettings}
+                  onProjectSettings={setSettingsProject}
                   onSend={sendMessage}
                   onInterrupt={interrupt}
                   onNavigate={navigate}
@@ -832,155 +998,22 @@ function Workspace({
             )}
           </>
         ) : (
-          <div className="overview-scroll">
-            <div className="overview">
-              <div className="overview-topline">
-                <span className="eyebrow">CODEX, CONNECTED.</span>
-                <span className="overview-date">
-                  {new Date().toLocaleDateString("zh-CN", {
-                    month: "long",
-                    day: "numeric",
-                    weekday: "long",
-                  })}
-                </span>
-              </div>
-              <div className="overview-hero">
-                <span className="hero-symbol">
-                  <Terminal size={34} strokeWidth={1.6} />
-                </span>
-                <h1>灵感随行，工作继续。</h1>
-                <p>
-                  把想法交给 Codex。连接工作电脑，
-                  <br className="mobile-break" />
-                  在这里查看进展、回应审批、继续对话。
-                </p>
-                <div className="hero-actions">
-                  <button
-                    className="button button-primary"
-                    onClick={() => setDialog(hosts.length ? "new" : "pair")}
-                  >
-                    <Plus size={16} />
-                    {hosts.length ? "开始新任务" : "连接工作设备"}
-                  </button>
-                  {hosts.length > 0 && (
-                    <button
-                      className="button button-quiet"
-                      onClick={() => setDialog("pair")}
-                    >
-                      <Monitor size={15} />
-                      连接设备
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="overview-stats">
-                <div>
-                  <span className="stat-icon">
-                    <Monitor size={19} />
-                  </span>
-                  <span>
-                    <strong>
-                      {onlineCount}
-                      <small> / {hosts.length}</small>
-                    </strong>
-                    <p>设备在线</p>
-                  </span>
-                  <span className={`stat-dot ${onlineCount ? "online" : ""}`} />
-                </div>
-                <div>
-                  <span className="stat-icon">
-                    <Terminal size={19} />
-                  </span>
-                  <span>
-                    <strong>{activeCount}</strong>
-                    <p>任务运行中</p>
-                  </span>
-                </div>
-                <div>
-                  <span className="stat-icon">
-                    <Globe2 size={19} />
-                  </span>
-                  <span>
-                    <strong>跨设备</strong>
-                    <p>执行在本机，随处可连接</p>
-                  </span>
-                </div>
-              </div>
-              <div className="section-heading">
-                <h2>最近任务</h2>
-                <button
-                  className="text-button"
-                  onClick={() => setDialog("new")}
-                >
-                  <Plus size={14} />
-                  新建任务
-                </button>
-              </div>
-              <div className="recent-tasks">
-                {loading ? (
-                  <div className="overview-empty">
-                    <Spinner label="加载工作空间" />
-                  </div>
-                ) : threads.length ? (
-                  threads.slice(0, 5).map((thread) => (
-                    <a
-                      className="recent-task"
-                      key={thread.id}
-                      href={`/tasks/${thread.id}`}
-                      onClick={(event) => {
-                        event.preventDefault();
-                        navigate(thread.id);
-                      }}
-                    >
-                      <span className="recent-task-icon">
-                        <Bot size={18} />
-                      </span>
-                      <span className="recent-task-main">
-                        <strong>{thread.title || "未命名任务"}</strong>
-                        <small>
-                          <Folder size={12} />
-                          {fileName(thread.cwd)}
-                          <span>·</span>
-                          {hosts.find((host) => host.id === thread.host_id)
-                            ?.name || "工作设备"}
-                        </small>
-                      </span>
-                      <span className={`status-pill status-${thread.status}`}>
-                        <span />
-                        {statusLabels[thread.status] || thread.status}
-                      </span>
-                      <time>{relativeDate(thread.updated_at)}</time>
-                      <ArrowRight size={15} />
-                    </a>
-                  ))
-                ) : (
-                  <div className="overview-empty">
-                    <span className="empty-icon">
-                      <Folder size={25} />
-                    </span>
-                    <h3>还没有任务</h3>
-                    <p>
-                      {hosts.length
-                        ? "创建第一个任务，让 Codex 开始工作。"
-                        : "先连接工作电脑，再开始你的第一个任务。"}
-                    </p>
-                    <button
-                      className="text-button"
-                      onClick={() => setDialog(hosts.length ? "new" : "pair")}
-                    >
-                      {hosts.length ? "创建任务" : "连接设备"}
-                      <ArrowRight size={14} />
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="overview-note">
-                <ShieldCheck size={15} />
-                <span>
-                  项目与 Codex
-                  登录信息保留在你的设备上。任务执行时会按设置请求审批。
-                </span>
-              </div>
+          <div className="conversation-empty-state">
+            <Bot size={30} />
+            <h1>选择一个会话继续</h1>
+            <p>
+              连接设备后，最近的 Codex 会话与项目会自动出现在左侧。
+              <br />
+              打开会话时再加载历史，随时继续工作。
+            </p>
+            <div>
+              <button
+                className="button button-primary"
+                onClick={() => setDialog(hosts.length ? "new" : "pair")}
+              >
+                <Plus size={15} />
+                {hosts.length ? "新对话" : "连接设备"}
+              </button>
             </div>
           </div>
         )}
@@ -991,6 +1024,21 @@ function Workspace({
             setDialog(null);
             void refreshList();
           }}
+        />
+      )}
+      {settingsProject && (
+        <ProjectSettingsDialog
+          key={settingsProject.id}
+          project={settingsProject}
+          host={hosts.find((host) => host.id === settingsProject.host_id)}
+          onClose={() => setSettingsProject(null)}
+          onSaved={(project) =>
+            setProjects((current) =>
+              current.map((entry) =>
+                entry.id === project.id ? project : entry,
+              ),
+            )
+          }
         />
       )}
       {dialog === "new" && (

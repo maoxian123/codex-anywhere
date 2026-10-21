@@ -16,8 +16,12 @@ import {
 import { api, errorText } from "./api";
 import { ErrorMessage, Modal, References, Spinner } from "./components";
 import { messageText } from "./Timeline";
+import { ThreadExecutionControls } from "./ExecutionControls";
 import type {
   Asset,
+  Host,
+  Project,
+  ExecutionSettings,
   MessagePayload,
   Reference,
   Thread,
@@ -77,7 +81,11 @@ function TaskPicker({
   const openThread = async (id: string) => {
     setOpening(true);
     try {
-      setDetail(await api<ThreadDetail>(`/threads/${id}`));
+      setDetail(
+        await api<ThreadDetail>(
+          `/threads/${encodeURIComponent(id)}?item_limit=100`,
+        ),
+      );
       setError("");
     } catch (reason) {
       setError(errorText(reason));
@@ -288,18 +296,27 @@ export default function Composer({
   onSend,
   onInterrupt,
   onNavigate,
+  host,
+  project,
+  onSettingsChange,
+  onProjectSettings,
 }: {
   thread: Thread;
   hostOnline: boolean;
   onSend: (payload: MessagePayload, steer: boolean) => Promise<void>;
   onInterrupt: () => Promise<void>;
   onNavigate: (id: string, item?: string) => void;
+  host?: Host;
+  project?: Project;
+  onSettingsChange?: (settings: ExecutionSettings) => Promise<void>;
+  onProjectSettings?: (project: Project) => void;
 }) {
   const [text, setText] = useState("");
   const [assets, setAssets] = useState<Asset[]>([]);
   const [references, setReferences] = useState<Reference[]>([]);
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -309,7 +326,9 @@ export default function Composer({
   const textRef = useRef<HTMLTextAreaElement>(null);
   const busy = ["active", "waiting"].includes(thread.status);
   const historyReady =
-    thread.history_loaded !== false && thread.status !== "importing";
+    thread.history_loaded !== false &&
+    thread.status !== "importing" &&
+    !(thread.status === "idle" && thread.history_stale);
   const ready = hostOnline && thread.status !== "starting" && historyReady;
   useEffect(() => {
     const input = textRef.current;
@@ -350,6 +369,7 @@ export default function Composer({
       (!text.trim() && !assets.length && !references.length) ||
       sending ||
       uploading ||
+      settingsSaving ||
       !ready
     )
       return;
@@ -566,9 +586,7 @@ export default function Composer({
             >
               <Globe size={18} />
             </button>
-            <span className="composer-mode">
-              {busy ? "补充当前任务" : "工作区写入 · 按需审批"}
-            </span>
+            {busy && <span className="composer-mode">补充当前任务</span>}
           </div>
           <div className="composer-actions">
             {busy && (
@@ -599,6 +617,7 @@ export default function Composer({
               disabled={
                 sending ||
                 uploading ||
+                settingsSaving ||
                 !ready ||
                 (!text.trim() && !assets.length && !references.length)
               }
@@ -612,6 +631,14 @@ export default function Composer({
             </button>
           </div>
         </div>
+        <ThreadExecutionControls
+          thread={thread}
+          host={host}
+          project={project}
+          onSave={onSettingsChange}
+          onProjectSettings={onProjectSettings}
+          onBusyChange={setSettingsSaving}
+        />
       </div>
       <div className="composer-footnote">
         <span>

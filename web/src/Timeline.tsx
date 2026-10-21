@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowDown,
   Bot,
@@ -22,6 +22,7 @@ import {
 import type { Asset, Item, Reference, StreamItem } from "./types";
 import { json, list, object, safeLink, string, timeLabel } from "./utils";
 import { galleryAssets } from "./markdown-assets";
+import { api, errorText } from "./api";
 
 export type TimelineProps = {
   items: Item[];
@@ -30,6 +31,10 @@ export type TimelineProps = {
   targetItem?: string;
   loading: boolean;
   importing?: boolean;
+  hasMore?: boolean;
+  loadingOlder?: boolean;
+  olderError?: string;
+  onLoadOlder?: () => void;
   onImage: (src: string, alt: string) => void;
   onNavigate: (id: string, item?: string) => void;
 };
@@ -74,17 +79,20 @@ function boundedJson(value: unknown) {
     : text;
 }
 
-function TimelineItem({
+function NativeTimelineItem({
   item,
   stream,
   onImage,
   onNavigate,
+  full = false,
 }: {
   item: Item;
   stream?: StreamItem;
   onImage: TimelineProps["onImage"];
   onNavigate: TimelineProps["onNavigate"];
+  full?: boolean;
 }) {
+  const formattedJson = full ? json : boundedJson;
   const data = item.data;
   const type = item.type || string(data.type);
   const assets = list(data._assets) as Asset[];
@@ -284,7 +292,7 @@ function TimelineItem({
           )}
           <details className="raw-details">
             <summary>操作详情</summary>
-            <pre>{boundedJson(data)}</pre>
+            <pre>{formattedJson(data)}</pre>
           </details>
         </Disclosure>
       );
@@ -333,15 +341,15 @@ function TimelineItem({
           error={Boolean(data.error)}
         >
           <p className="eyebrow">输入</p>
-          <pre>{boundedJson(data.arguments)}</pre>
+          <pre>{formattedJson(data.arguments)}</pre>
           {data.result != null && (
             <>
               <p className="eyebrow">结果</p>
-              <pre>{boundedJson(data.result)}</pre>
+              <pre>{formattedJson(data.result)}</pre>
             </>
           )}
           {data.error != null && (
-            <pre className="text-error">{boundedJson(data.error)}</pre>
+            <pre className="text-error">{formattedJson(data.error)}</pre>
           )}
         </Disclosure>
       );
@@ -353,7 +361,7 @@ function TimelineItem({
         running={running}
       >
         <pre>
-          {boundedJson(
+          {formattedJson(
             Object.fromEntries(
               Object.entries(data).filter(([key]) => !key.startsWith("_")),
             ),
@@ -374,12 +382,100 @@ function TimelineItem({
   );
 }
 
+function TimelineItem(props: {
+  item: Item;
+  stream?: StreamItem;
+  onImage: TimelineProps["onImage"];
+  onNavigate: TimelineProps["onNavigate"];
+}) {
+  const { item } = props;
+  const [raw, setRaw] = useState<Item | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), [item.id]);
+  const expand = async () => {
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    if (raw) {
+      setExpanded(true);
+      return;
+    }
+    if (loading) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api<{ item: Item }>(
+        `/threads/${encodeURIComponent(item.thread_id)}/items/${encodeURIComponent(item.id)}`,
+        { signal: controller.signal },
+      );
+      if (!controller.signal.aborted) {
+        setRaw(result.item);
+        setExpanded(true);
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted) setError(errorText(reason));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  };
+  const shown =
+    expanded && raw
+      ? {
+          ...raw,
+          data: {
+            ...raw.data,
+            ...(item.data._assets ? { _assets: item.data._assets } : {}),
+            ...(item.data._references
+              ? { _references: item.data._references }
+              : {}),
+          },
+        }
+      : item;
+  return (
+    <div className="timeline-item-wrapper">
+      <NativeTimelineItem {...props} item={shown} full={expanded} />
+      {item.data._truncated === true && (
+        <div className="item-expansion">
+          <button
+            className="text-button"
+            disabled={loading}
+            onClick={() => void expand()}
+          >
+            {loading ? (
+              <Spinner label="读取完整内容" />
+            ) : expanded ? (
+              "收起完整内容"
+            ) : (
+              "查看完整内容"
+            )}
+          </button>
+          {error && (
+            <p className="text-error" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Timeline({
   items,
   streams,
   busy,
   loading,
   importing = false,
+  hasMore = false,
+  loadingOlder = false,
+  olderError = "",
+  onLoadOlder,
   targetItem,
   onImage,
   onNavigate,
@@ -389,6 +485,17 @@ export default function Timeline({
   const [nearBottom, setNearBottom] = useState(true);
   const previousLastItem = useRef("");
   const revealedTarget = useRef("");
+  const prependPosition = useRef<{ height: number; top: number } | null>(null);
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!loadingOlder && prependPosition.current && element) {
+      element.scrollTop =
+        prependPosition.current.top +
+        element.scrollHeight -
+        prependPosition.current.height;
+      prependPosition.current = null;
+    }
+  }, [items, loadingOlder]);
   const scrollKey = Object.values(streams).reduce(
     (total, stream) => total + stream.text.length,
     0,
@@ -442,6 +549,51 @@ export default function Timeline({
       }}
     >
       <div className="timeline-inner">
+        {(hasMore || olderError) && (
+          <div className="history-pagination">
+            {hasMore && (
+              <button
+                className="text-button"
+                disabled={loadingOlder}
+                onClick={() => {
+                  const element = scrollRef.current;
+                  if (element)
+                    prependPosition.current = {
+                      height: element.scrollHeight,
+                      top: element.scrollTop,
+                    };
+                  setNearBottom(false);
+                  onLoadOlder?.();
+                }}
+              >
+                {loadingOlder ? (
+                  <Spinner label="加载更早消息" />
+                ) : (
+                  "加载更早消息"
+                )}
+              </button>
+            )}
+            {olderError && (
+              <p className="text-error" role="alert">
+                {olderError}
+              </p>
+            )}
+          </div>
+        )}
+        {targetItem &&
+          !items.some(
+            (item) => item.id === targetItem || item.native_id === targetItem,
+          ) &&
+          !loading &&
+          !importing && (
+            <p className="reference-search-note">
+              {loadingOlder
+                ? "正在定位引用消息…"
+                : hasMore
+                  ? "引用位于更早的历史中，可继续加载消息。"
+                  : "未找到这条引用消息。"}
+            </p>
+          )}
         {!items.length && !pending.length && (
           <div className="thread-empty">
             <span className="empty-orbit">

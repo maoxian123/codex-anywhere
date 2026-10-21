@@ -81,6 +81,7 @@ function setup(threadOverride: Partial<Thread> = {}) {
   const loginHeaders: Headers[] = [];
   globalThis.fetch = async (input, init) => {
     const path = String(input);
+    const pathname = path.split("?")[0];
     const overridden = intercept?.(path, init);
     if (overridden) return overridden;
     let result: unknown;
@@ -116,11 +117,11 @@ function setup(threadOverride: Partial<Thread> = {}) {
         has_more: offset + limit < threads.length,
         next_offset: offset + limit < threads.length ? offset + limit : null,
       };
-    } else if (path === "/api/threads/t1")
+    } else if (pathname === "/api/threads/t1")
       result = { thread, items: [], interactions: [] };
     else if (path.startsWith("/api/threads/")) {
       const found = threads.find(
-        (entry) => path === `/api/threads/${entry.id}`,
+        (entry) => pathname === `/api/threads/${entry.id}`,
       );
       if (!found) throw new Error(`Unexpected test request: ${path}`);
       result = { thread: found, items: [], interactions: [] };
@@ -248,7 +249,7 @@ test("continuous streaming still paints snapshots when requests take longer than
   let inFlight = 0;
   let peak = 0;
   server.intercept((path) => {
-    if (path !== "/api/threads/t1") return undefined;
+    if (path.split("?")[0] !== "/api/threads/t1") return undefined;
     inFlight += 1;
     peak = Math.max(peak, inFlight);
     return new Promise<Response>((resolve) =>
@@ -400,7 +401,7 @@ test("switching tasks does not wait for or display an older pending snapshot", a
   const old = deferred<Response>();
   let started = false;
   server.intercept((path) => {
-    if (path === "/api/threads/t1") {
+    if (path.split("?")[0] === "/api/threads/t1") {
       started = true;
       return old.promise;
     }
@@ -488,4 +489,189 @@ test("load more follows the server next_offset rather than assuming a full first
   await screen.findByText("后续页元数据");
   assert.ok(offsets.includes(17));
   assert.equal(offsets.includes(50), false);
+});
+
+test("bounded latest-page refreshes preserve loaded old messages until the history snapshot changes", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  let version = "snapshot-1",
+    latestText = "最新消息",
+    olderReads = 0;
+  server.intercept((path) => {
+    if (path.split("?")[0] !== "/api/threads/t1") return undefined;
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("item_limit"), "100");
+    const older = query.has("before_position");
+    if (older) olderReads += 1;
+    return response({
+      thread: {
+        ...server.thread,
+        history_loaded: true,
+        history_synced_at: version,
+      },
+      interactions: [],
+      items: [
+        {
+          id: older ? "old-item" : "new-item",
+          native_id: older ? "old-item" : "new-item",
+          thread_id: "t1",
+          type: "agentMessage",
+          position: older ? 1 : 101,
+          data: { text: older ? "更早的消息" : latestText },
+        },
+      ],
+      has_more_items: !older,
+      next_before_position: older ? null : 101,
+    });
+  });
+  server.event("item/completed", {});
+  await screen.findByText("最新消息");
+  fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
+  await screen.findByText("更早的消息");
+  latestText = "实时更新后的消息";
+  server.event("item/agentMessage/delta", {
+    itemId: "new-item",
+    delta: "chunk",
+  });
+  await screen.findByText("实时更新后的消息");
+  assert.ok(screen.getByText("更早的消息"));
+  assert.equal(olderReads, 1);
+  version = "snapshot-2";
+  latestText = "新快照中的消息";
+  server.event("item/completed", {});
+  await screen.findByText("新快照中的消息");
+  assert.equal(screen.queryByText("更早的消息") === null, true);
+});
+
+test("a reference to an older item searches history by bounded pages", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  let olderReads = 0;
+  server.intercept((path) => {
+    if (path.split("?")[0] !== "/api/threads/t1") return undefined;
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("item_limit"), "100");
+    const older = query.has("before_position");
+    if (older) olderReads += 1;
+    return response({
+      thread: { ...server.thread, history_loaded: true },
+      interactions: [],
+      items: [
+        {
+          id: older ? "source-old" : "recent",
+          native_id: older ? "source-old" : "recent",
+          thread_id: "t1",
+          type: "agentMessage",
+          position: older ? 1 : 101,
+          data: { text: older ? "引用定位到的原始消息" : "最新页" },
+        },
+      ],
+      has_more_items: !older,
+      next_before_position: older ? null : 101,
+    });
+  });
+  act(() => {
+    window.history.pushState({}, "", "/tasks/t1?item=source-old");
+    window.dispatchEvent(new Event("popstate"));
+  });
+  server.event("item/completed", {});
+  await screen.findByText("引用定位到的原始消息");
+  assert.equal(olderReads, 1);
+});
+
+test("compact sidebar prioritizes sessions and keeps manual history inside the device menu", async () => {
+  setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  assert.ok(screen.getByRole("button", { name: "新对话" }));
+  assert.equal(screen.queryByText("我的工作空间") === null, true);
+  assert.equal(
+    screen.queryByRole("button", { name: "更多本机历史" }) === null,
+    true,
+  );
+  fireEvent.click(screen.getByLabelText("设备与设置"));
+  await screen.findByRole("button", { name: "更多本机历史" });
+});
+
+test("older native history waits for cursor projection and preserves the loaded tail", async () => {
+  const server = setup({
+    history_loaded: true,
+    history_complete: false,
+    history_cursor: "cursor-1",
+    history_generation: "generation-1",
+    history_synced_at: "first-sync",
+  });
+  let requests = 0,
+    projected = false,
+    metadataReads = 0;
+  server.intercept((path, init) => {
+    if (path === "/api/threads/t1/history") {
+      requests += 1;
+      assert.equal(init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(init.body)), {
+        cursor: "cursor-1",
+        limit: 50,
+      });
+      return response({
+        thread: server.thread,
+        command: {
+          id: "older-command",
+          kind: "thread.import",
+          status: "completed",
+          result: { itemCount: 1 },
+        },
+      });
+    }
+    if (path.split("?")[0] !== "/api/threads/t1") return undefined;
+    const query = new URLSearchParams(path.split("?")[1]);
+    const limit = query.get("item_limit");
+    assert.ok(limit === "100" || limit === "1");
+    if (limit === "1") {
+      metadataReads += 1;
+      if (metadataReads >= 2) projected = true;
+    }
+    const thread = {
+      ...server.thread,
+      ...(projected
+        ? {
+            history_cursor: null,
+            history_complete: true,
+            history_synced_at: "older-sync",
+          }
+        : {}),
+    };
+    return response({
+      thread,
+      interactions: [],
+      items:
+        limit === "1"
+          ? []
+          : [
+              {
+                id: query.has("before_position") ? "native-old" : "tail",
+                native_id: query.has("before_position") ? "native-old" : "tail",
+                thread_id: "t1",
+                type: "agentMessage",
+                position: query.has("before_position") ? 50 : 100,
+                data: {
+                  text: query.has("before_position")
+                    ? "原生较早页"
+                    : "保留的尾页",
+                },
+              },
+            ],
+      has_more_items: false,
+      next_before_position: null,
+    });
+  });
+  await screen.findByText("保留的尾页");
+  assert.equal(requests, 0);
+  fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
+  await screen.findByText("原生较早页");
+  assert.ok(screen.getByText("保留的尾页"));
+  assert.equal(requests, 1);
+  assert.equal(metadataReads, 2);
+  assert.equal(
+    screen.queryByRole("button", { name: "加载更早消息" }) === null,
+    true,
+  );
 });
