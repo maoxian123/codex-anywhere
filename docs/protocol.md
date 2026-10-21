@@ -1,5 +1,44 @@
 # Codex Anywhere protocol v5
 
+## Local node settings service
+
+`codex-anywhere node web [--state-dir DIR] [--port 5780] [--codex-bin codex]
+[--no-open]` starts a separate loopback-only settings server on `127.0.0.1`.
+The Windows/Linux launchers bootstrap the Python environment and run that command.
+It serves its own packaged HTML/CSS/JavaScript, without depending on the hub's
+frontend build. The node remains the same `NodeService` and Codex app-server
+implementation used by `node run`; the settings UI does not replace its protocol.
+
+The settings controller creates the node on its background worker's asyncio loop,
+and owns its lifetime independently of Flask requests and browser tabs. A paired
+node auto-starts with the settings service. Browser close does not stop it; explicit
+Stop and local service shutdown gracefully cancel the owned node and Codex runtime.
+Native process/runtime epochs, journals, approvals and uncertain outcomes retain
+the existing node semantics.
+
+The local service exposes `GET /api/status` -> `{status,csrf_token}` and JSON-only
+`POST /api/pair`, `/api/start`, `/api/stop` -> 202 `{status}`. Status includes only
+public connection/configuration fields and sanitized errors; tokens, pairing codes
+and raw node configuration are never returned. Pair accepts
+`{server,name,code,codex_bin?,allow_insecure?:false,replace_pairing?:false}`; Start
+accepts `{codex_bin?,allow_insecure?}`, and Stop accepts `{}`. Every mutation needs
+the browser's `X-CSRF-Token` and signed HttpOnly SameSite=Strict session cookie.
+Exact loopback Host/port, request Origin and cross-site fetch metadata checks
+prevent remote pages and DNS rebinding from configuring or stopping the node.
+No wildcard bind, CORS access or external assets are provided.
+
+Pair/start/stop requests schedule bounded background operations and report progress
+through status polling. Pairing codes are used once, never saved, and failed or
+uncertain pairing is not retried automatically. Re-pair requires explicit
+`replace_pairing:true` while stopped. Each new pairing uses a fresh
+`profiles/<uuid>/` state directory. Atomic `launcher.json` selects the active
+relative profile and stores public launcher preferences. Existing root `node.json`
+state remains compatible; old profiles and journals are retained rather than
+being delivered under a new hub identity. Profile paths cannot escape the
+selected base state directory. A separate launcher lock prevents two local
+controllers from managing the same base directory; native per-profile node locks
+also prevent simultaneous `node run` ownership.
+
 ## Thread writer ownership and browser leases (v5)
 
 Nodes advertise the independent `threadOwnership` capability. Upgrade the hub,

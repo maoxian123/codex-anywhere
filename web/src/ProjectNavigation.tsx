@@ -9,11 +9,7 @@ import {
   Settings2,
 } from "lucide-react";
 import { Spinner } from "./components";
-import {
-  groupThreadsByDate,
-  sortProjectsByActivity,
-  threadActivityLabel,
-} from "./sidebar-activity";
+import { groupThreadsByDate, threadActivityLabel } from "./sidebar-activity";
 import type { Host, Project, Thread } from "./types";
 
 export default function ProjectNavigation({
@@ -31,6 +27,8 @@ export default function ProjectNavigation({
   onRefresh,
   onMore,
   onSettings,
+  hostPages,
+  onHostMore,
 }: {
   hosts: Host[];
   projects: Project[];
@@ -46,21 +44,29 @@ export default function ProjectNavigation({
   onRefresh: () => void;
   onMore: () => void;
   onSettings?: (project: Project) => void;
+  hostPages?: Record<string, { hasMore: boolean; loading: boolean }>;
+  onHostMore?: (hostId: string) => void;
 }) {
   const [treeOpen, setTreeOpen] = useState(Boolean(selectedProjectId));
   useEffect(() => {
     if (selectedProjectId) setTreeOpen(true);
   }, [selectedProjectId]);
   const threadList = (
+    groupThreads: Thread[],
+    page: { hasMore: boolean; loading: boolean },
+    hostName: string,
+    onLoadMore: () => void,
+    hostPagination: boolean,
+  ) => (
     <>
       <div className="project-thread-list">
-        {loading ? (
+        {(loading || page.loading) && !groupThreads.length ? (
           <div className="sidebar-empty">
             <Spinner label="加载会话" />
           </div>
-        ) : threads.length ? (
-          groupThreadsByDate(threads).map((group) => (
-            <section className="thread-date-group" key={group.label}>
+        ) : groupThreads.length ? (
+          groupThreadsByDate(groupThreads, undefined, true).map((group) => (
+            <section className="thread-date-group" key={group.threads[0].id}>
               <h3 className="thread-date-label">{group.label}</h3>
               {group.threads.map((thread) => (
                 <a
@@ -94,23 +100,39 @@ export default function ProjectNavigation({
           </div>
         )}
       </div>
-      {hasMore && (
+      {page.hasMore && (
         <button
           className="sidebar-load-more"
-          disabled={loadingMore}
-          onClick={onMore}
+          aria-label={
+            hostPagination ? `加载 ${hostName} 的更多会话` : undefined
+          }
+          disabled={page.loading}
+          onClick={onLoadMore}
         >
-          {loadingMore ? <Spinner label="加载中" /> : "加载更多会话"}
+          {page.loading ? <Spinner label="加载中" /> : "加载更多会话"}
         </button>
       )}
     </>
   );
-  const sortedProjects = sortProjectsByActivity(projects, threads);
-  const hostIds = [
-    ...new Set(sortedProjects.map((project) => project.host_id)),
-  ];
+  const hostIds = [...new Set(projects.map((project) => project.host_id))];
+  const selectedProject = projects.find(
+    (project) => project.id === selectedProjectId,
+  );
+  const threadHostIds = selectedProjectId
+    ? [selectedProject?.host_id || threads[0]?.host_id].filter(
+        (id): id is string => Boolean(id),
+      )
+    : [
+        ...new Set([
+          ...hosts.map((host) => host.id),
+          ...threads.map((thread) => thread.host_id),
+        ]),
+      ];
   return (
-    <nav className="project-navigation" aria-label="项目与会话">
+    <nav
+      className="project-navigation grouped-navigation"
+      aria-label="项目与会话"
+    >
       <div className="navigation-scope">
         <button
           className={`all-threads-button ${selectedProjectId === null ? "selected" : ""}`}
@@ -152,7 +174,7 @@ export default function ProjectNavigation({
         </div>
         {hostIds.map((hostId) => {
           const host = hosts.find((value) => value.id === hostId);
-          const group = sortedProjects.filter(
+          const group = projects.filter(
             (project) => project.host_id === hostId,
           );
           if (!group.length) return null;
@@ -195,7 +217,6 @@ export default function ProjectNavigation({
                       </button>
                     )}
                   </div>
-                  {selectedProjectId === project.id && threadList}
                 </div>
               ))}
             </section>
@@ -208,7 +229,78 @@ export default function ProjectNavigation({
           </button>
         )}
       </details>
-      {selectedProjectId === null && <>{threadList}</>}
+      <div
+        className={`host-thread-groups ${threadHostIds.length === 1 ? "single-host" : ""}`}
+      >
+        {threadHostIds.map((hostId) => {
+          const host = hosts.find((value) => value.id === hostId);
+          const hostName = host?.name || hostId;
+          const groupThreads = threads.filter(
+            (thread) => thread.host_id === hostId,
+          );
+          const perHost = selectedProjectId === null && !!hostPages;
+          const page = perHost
+            ? hostPages[hostId] || { hasMore: false, loading: false }
+            : { hasMore, loading: loadingMore };
+          const compact =
+            !loading &&
+            !page.loading &&
+            !page.hasMore &&
+            groupThreads.length <= 3;
+          return (
+            <section
+              className={`host-thread-group ${compact ? "compact-thread-host" : ""} ${!groupThreads.length ? "empty-host" : ""}`}
+              key={hostId}
+              aria-label={`${hostName} 会话`}
+              aria-busy={loading || page.loading}
+            >
+              <header className="host-thread-heading">
+                <h3>
+                  <Monitor size={12} />
+                  <span title={hostName}>{hostName}</span>
+                </h3>
+                <i
+                  className={`mini-status ${host?.online ? "online" : ""}`}
+                  role="img"
+                  aria-label={host?.online ? "在线" : "离线"}
+                />
+                <span
+                  className="host-thread-count"
+                  title={`当前已加载 ${groupThreads.length} 个会话`}
+                >
+                  {groupThreads.length}
+                </span>
+              </header>
+              <div
+                className="host-thread-scroll"
+                role="region"
+                aria-label={`${hostName} 会话列表`}
+                tabIndex={0}
+              >
+                {threadList(
+                  groupThreads,
+                  page,
+                  hostName,
+                  perHost && onHostMore ? () => onHostMore(hostId) : onMore,
+                  perHost,
+                )}
+              </div>
+            </section>
+          );
+        })}
+        {!threadHostIds.length && (
+          <div className="sidebar-empty">
+            {loading ? (
+              <Spinner label="加载会话" />
+            ) : (
+              <>
+                <Folder size={22} />
+                <p>这里还没有会话</p>
+              </>
+            )}
+          </div>
+        )}
+      </div>
     </nav>
   );
 }

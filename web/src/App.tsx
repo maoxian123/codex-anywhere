@@ -61,6 +61,11 @@ import type {
   ThreadOwnership,
 } from "./types";
 import { busyStatus, object, statusLabels, string } from "./utils";
+import {
+  mergeSidebarProjects,
+  mergeSidebarThreads,
+  promoteSidebarThread,
+} from "./sidebar-activity";
 
 function readRoute() {
   const match = window.location.pathname.match(/^\/tasks\/([^/]+)\/?$/);
@@ -109,6 +114,12 @@ function Workspace({
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
   const [listPages, setListPages] = useState(1);
+  const [hostPageCounts, setHostPageCounts] = useState<Record<string, number>>(
+    {},
+  );
+  const [hostPages, setHostPages] = useState<
+    Record<string, { hasMore: boolean; loading: boolean }>
+  >({});
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [search, setSearch] = useState("");
@@ -140,11 +151,16 @@ function Workspace({
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
-  const listScopeRef = useRef({ projectFilter, listPages });
-  const listOffsetsRef = useRef<{ key: string; offsets: number[] }>({
+  const listScopeRef = useRef({ projectFilter, listPages, hostPageCounts });
+  const listOffsetsRef = useRef<{
+    key: string;
+    offsets: Record<string, number[]>;
+  }>({
     key: "",
-    offsets: [0],
+    offsets: {},
   });
+  const appliedListScope = useRef<string | null>(null);
+  const localThreadActivity = useRef(new Map<string, Thread>());
   const threadFetchRef = useRef(0);
   const historyCache = useRef<HistoryCache | null>(null);
   const olderRequest = useRef<AbortController | null>(null);
@@ -163,7 +179,7 @@ function Workspace({
   const lastCursor = useRef(Number(sessionStorage.getItem(cursorKey) || 0));
   selectedRef.current = route.id;
   searchRef.current = search;
-  listScopeRef.current = { projectFilter, listPages };
+  listScopeRef.current = { projectFilter, listPages, hostPageCounts };
   const selectedHost = hosts.find((host) => host.id === detail?.thread.host_id);
   const ownershipEnabled = Boolean(
     detail?.thread.id === route.id &&
@@ -240,47 +256,126 @@ function Workspace({
       const query = searchRef.current;
       const scope = listScopeRef.current;
       const scopeKey = JSON.stringify([query, scope.projectFilter]);
-      const offsets = Array.from({ length: scope.listPages }, (_, index) =>
-        listOffsetsRef.current.key === scopeKey
-          ? (listOffsetsRef.current.offsets[index] ?? index * 50)
-          : index * 50,
-      );
-      const [hostData, projectData, ...threadPages] = await Promise.all([
+      const [hostData, projectData] = await Promise.all([
         api<{ hosts: Host[] }>("/hosts"),
         api<{ projects: Project[] }>("/projects"),
-        ...Array.from({ length: scope.listPages }, (_, index) =>
-          api<ThreadPage>(
-            `/threads?q=${encodeURIComponent(query)}&limit=50&offset=${offsets[index]}${scope.projectFilter ? `&project_id=${encodeURIComponent(scope.projectFilter)}` : ""}`,
-          ),
-        ),
       ]);
+      if (!liveRef.current || request !== listFetchRef.current) return;
+      // Each device has its own page budget. A busy device must never crowd
+      // another device's conversations out of the first page.
+      const targets = scope.projectFilter
+        ? [
+            {
+              key: `project:${scope.projectFilter}`,
+              hostId: "",
+              pages: scope.listPages,
+            },
+          ]
+        : hostData.hosts.map((host) => ({
+            key: host.id,
+            hostId: host.id,
+            pages: scope.hostPageCounts[host.id] || 1,
+          }));
+      const pages = await Promise.all(
+        targets.map(async (target) => {
+          const offsets = Array.from({ length: target.pages }, (_, index) =>
+            listOffsetsRef.current.key === scopeKey
+              ? (listOffsetsRef.current.offsets[target.key]?.[index] ??
+                index * 50)
+              : index * 50,
+          );
+          const results = await Promise.all(
+            offsets.map((offset) =>
+              api<ThreadPage>(
+                `/threads?q=${encodeURIComponent(query)}&limit=50&offset=${offset}${scope.projectFilter ? `&project_id=${encodeURIComponent(scope.projectFilter)}` : `&host_id=${encodeURIComponent(target.hostId)}`}`,
+              ),
+            ),
+          );
+          return { ...target, offsets, results };
+        }),
+      );
       if (
         liveRef.current &&
         request === listFetchRef.current &&
         query === searchRef.current &&
         scope.projectFilter === listScopeRef.current.projectFilter &&
-        scope.listPages === listScopeRef.current.listPages
+        scope.listPages === listScopeRef.current.listPages &&
+        scope.hostPageCounts === listScopeRef.current.hostPageCounts
       ) {
-        setHosts(hostData.hosts);
-        setProjects(projectData.projects);
-        setThreads([
-          ...new Map(
-            threadPages
-              .flatMap((page) => page.threads)
-              .map((thread) => [thread.id, thread]),
-          ).values(),
-        ]);
-        setHasMore(Boolean(threadPages.at(-1)?.has_more));
+        setHosts((current) => {
+          const remaining = new Map(
+            hostData.hosts.map((host) => [host.id, host]),
+          );
+          const known = current.flatMap((host) => {
+            const value = remaining.get(host.id);
+            remaining.delete(host.id);
+            return value ? [value] : [];
+          });
+          return [...known, ...remaining.values()];
+        });
+        setProjects((current) =>
+          mergeSidebarProjects(current, projectData.projects),
+        );
+        const incoming = new Map(
+          pages.flatMap((page) =>
+            page.results
+              .flatMap((result) => result.threads)
+              .map((thread) => [thread.id, thread] as const),
+          ),
+        );
+        for (const [id, local] of localThreadActivity.current) {
+          if (
+            (scope.projectFilter && local.project_id !== scope.projectFilter) ||
+            (query &&
+              !local.title
+                .toLocaleLowerCase()
+                .includes(query.toLocaleLowerCase()))
+          )
+            continue;
+          const value = incoming.get(id);
+          incoming.set(
+            id,
+            value
+              ? { ...value, last_activity_at: local.last_activity_at }
+              : local,
+          );
+        }
+        const reset = appliedListScope.current !== scopeKey;
+        appliedListScope.current = scopeKey;
+        setThreads((current) =>
+          mergeSidebarThreads(current, [...incoming.values()], reset),
+        );
+        setHasMore(
+          pages.some((page) => Boolean(page.results.at(-1)?.has_more)),
+        );
+        setHostPages(
+          Object.fromEntries(
+            pages
+              .filter((page) => page.hostId)
+              .map((page) => [
+                page.hostId,
+                {
+                  hasMore: Boolean(page.results.at(-1)?.has_more),
+                  loading: false,
+                },
+              ]),
+          ),
+        );
         listOffsetsRef.current = {
           key: scopeKey,
-          offsets: [
-            0,
-            ...threadPages.map((page, index) =>
-              typeof page.next_offset === "number"
-                ? page.next_offset
-                : offsets[index] + page.threads.length,
-            ),
-          ],
+          offsets: Object.fromEntries(
+            pages.map((page) => [
+              page.key,
+              [
+                0,
+                ...page.results.map((result, index) =>
+                  typeof result.next_offset === "number"
+                    ? result.next_offset
+                    : page.offsets[index] + result.threads.length,
+                ),
+              ],
+            ]),
+          ),
         };
         setNetworkError("");
       }
@@ -291,6 +386,14 @@ function Workspace({
       if (liveRef.current && request === listFetchRef.current) {
         setLoading(false);
         setLoadingMore(false);
+        setHostPages((current) =>
+          Object.fromEntries(
+            Object.entries(current).map(([id, page]) => [
+              id,
+              { ...page, loading: false },
+            ]),
+          ),
+        );
       }
     }
   }, []);
@@ -326,6 +429,11 @@ function Workspace({
                 },
                 cache,
               ),
+            );
+            setThreads((current) =>
+              current.some((thread) => thread.id === value.thread.id)
+                ? mergeSidebarThreads(current, [value.thread])
+                : current,
             );
             setThreadError("");
             setStreams((current) =>
@@ -484,10 +592,14 @@ function Workspace({
   useEffect(() => {
     const timer = setTimeout(() => void refreshList(), search ? 220 : 0);
     return () => clearTimeout(timer);
-  }, [search, projectFilter, listPages, refreshList]);
+  }, [search, projectFilter, listPages, hostPageCounts, refreshList]);
   useEffect(() => {
     setListPages(1);
     setHasMore(false);
+    setHostPageCounts((current) =>
+      Object.keys(current).length ? {} : current,
+    );
+    setHostPages({});
   }, [search, projectFilter]);
   useEffect(() => {
     setDetail(null);
@@ -677,14 +789,43 @@ function Workspace({
     [scheduleRefresh, ownership.check],
   );
 
+  const markConversationActivity = (thread: Thread) => {
+    const touched = { ...thread, last_activity_at: new Date().toISOString() };
+    localThreadActivity.current.set(thread.id, touched);
+    const filter = listScopeRef.current.projectFilter;
+    const query = searchRef.current.toLocaleLowerCase();
+    if (
+      (!filter || thread.project_id === filter) &&
+      (!query || thread.title.toLocaleLowerCase().includes(query))
+    ) {
+      setThreads((current) =>
+        promoteSidebarThread(
+          current,
+          touched,
+          new Date(touched.last_activity_at),
+        ),
+      );
+    }
+    if (thread.project_id)
+      setProjects((current) => {
+        const project = current.find((value) => value.id === thread.project_id);
+        return project
+          ? [project, ...current.filter((value) => value.id !== project.id)]
+          : current;
+      });
+  };
   const sendMessage = async (payload: MessagePayload, steer: boolean) => {
     const id = route.id;
+    const thread = detailRef.current?.thread;
     try {
       if (ownershipEnabled) await ownership.ensurePresence();
       const result = await post<{ command: Command }>(
         `/threads/${id}/${steer ? "steer" : "messages"}`,
         payload,
       );
+      // The accepted user action moves the row now; command polling and
+      // catalog snapshots can update its contents without changing its rank.
+      if (thread?.id === id) markConversationActivity(thread);
       if (ownershipEnabled) {
         // A failed resume must leave the draft intact. Waiting ends when the
         // start RPC is accepted, independently of the model's running turn.
@@ -693,7 +834,6 @@ function Workspace({
       } else watchCommand(result.command, id);
       if (id === selectedRef.current) setError("");
       scheduleRefresh();
-      scheduleRefresh(true);
     } catch (reason) {
       if (id === selectedRef.current && writerConflict(errorText(reason)))
         void ownership.check();
@@ -863,6 +1003,20 @@ function Workspace({
           loading={loading}
           loadingMore={loadingMore}
           hasMore={hasMore}
+          hostPages={hostPages}
+          onHostMore={(hostId) => {
+            setHostPages((current) => ({
+              ...current,
+              [hostId]: {
+                hasMore: current[hostId]?.hasMore ?? false,
+                loading: true,
+              },
+            }));
+            setHostPageCounts((current) => ({
+              ...current,
+              [hostId]: (current[hostId] || 1) + 1,
+            }));
+          }}
           onFilter={(id) => {
             setProjectFilter(id);
             if (route.settings) navigate("");
@@ -1133,10 +1287,7 @@ function Workspace({
           onNewProject={() => setDialog("project")}
           onClose={() => setDialog(null)}
           onCreated={(thread, command) => {
-            setThreads((current) => [
-              thread,
-              ...current.filter((entry) => entry.id !== thread.id),
-            ]);
+            markConversationActivity(thread);
             setProjectFilter(thread.project_id || null);
             navigate(thread.id);
             watchCommand(command, thread.id);
@@ -1171,7 +1322,7 @@ function Workspace({
                 ? current
                 : projectFilter && thread.project_id !== projectFilter
                   ? current
-                  : [thread, ...current],
+                  : mergeSidebarThreads(current, [thread]),
             );
             void refreshList();
           }}

@@ -4011,6 +4011,104 @@ svg {
 .thread-error .inline-error > span {
   white-space: pre-wrap;
 }
+
+/* Each node keeps its own scroll position and share of the session sidebar. */
+.project-navigation.grouped-navigation {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.grouped-navigation > .navigation-scope {
+  flex-shrink: 0;
+}
+.grouped-navigation > .project-filter-tree {
+  flex: 0 0 auto;
+  max-height: 38%;
+  overflow-y: auto;
+}
+.host-thread-groups {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 5px;
+}
+.host-thread-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 150px;
+  min-height: 150px;
+  overflow: hidden;
+}
+.host-thread-group + .host-thread-group {
+  border-top: 1px solid #293e444f;
+  padding-top: 7px;
+}
+.host-thread-group.compact-thread-host {
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 240px;
+}
+.host-thread-heading {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 7px;
+  min-height: 30px;
+  padding: 5px 9px;
+}
+.host-thread-heading > h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: #8ca7b1;
+  font-size: 10px;
+  font-weight: 500;
+}
+.host-thread-heading > h3 > svg {
+  flex-shrink: 0;
+  color: #63838f;
+}
+.host-thread-heading > h3 > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.host-thread-count {
+  min-width: 16px;
+  text-align: right;
+  color: #63858e;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.host-thread-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.compact-thread-host > .host-thread-scroll {
+  flex: 0 1 auto;
+}
+.empty-host .sidebar-empty {
+  min-height: 40px;
+  padding: 7px 9px 9px;
+  align-items: flex-start;
+}
+.empty-host .sidebar-empty > svg {
+  display: none;
+}
+.host-thread-scroll:focus-visible {
+  outline: 1px solid #53786d;
+  outline-offset: -1px;
+  border-radius: 6px;
+}
 .runtime-settings-editor {
   position: relative;
   padding-right: 25px;

@@ -1,3 +1,4 @@
+import { preserveNewerSettings } from "./execution-settings";
 import type { Project, Thread } from "./types";
 
 function dateTime(value: string) {
@@ -44,6 +45,90 @@ export function sortProjectsByActivity(projects: Project[], threads: Thread[]) {
   );
 }
 
+/** Rank a new scope once; subsequent snapshots only refresh row metadata. */
+export function mergeSidebarThreads(
+  current: Thread[],
+  incoming: Thread[],
+  reset = false,
+): Thread[] {
+  if (reset || current.length === 0) {
+    const seen = new Set<string>();
+    return [...incoming]
+      .sort(
+        (left, right) => threadActivityTime(right) - threadActivityTime(left),
+      )
+      .filter((thread) => {
+        if (seen.has(thread.id)) return false;
+        seen.add(thread.id);
+        return true;
+      });
+  }
+  const updates = new Map(incoming.map((thread) => [thread.id, thread]));
+  const seen = new Set<string>();
+  const result: Thread[] = [];
+  for (const thread of current) {
+    if (seen.has(thread.id)) continue;
+    seen.add(thread.id);
+    const update = updates.get(thread.id);
+    result.push(
+      update
+        ? preserveNewerSettings(
+            {
+              ...thread,
+              ...update,
+              last_activity_at: new Date(
+                threadActivityTime(thread),
+              ).toISOString(),
+            },
+            thread,
+          )
+        : thread,
+    );
+  }
+  for (const thread of incoming) {
+    if (seen.has(thread.id)) continue;
+    seen.add(thread.id);
+    result.push(updates.get(thread.id)!);
+  }
+  return result;
+}
+
+/** Explicit local activity is the only action that promotes an existing row. */
+export function promoteSidebarThread(
+  current: Thread[],
+  thread: Thread,
+  now = new Date(),
+): Thread[] {
+  const previous = current.find((value) => value.id === thread.id);
+  const promoted = preserveNewerSettings(
+    { ...previous, ...thread, last_activity_at: now.toISOString() },
+    previous,
+  );
+  return [promoted, ...current.filter((value) => value.id !== thread.id)];
+}
+
+/** Project snapshots are complete: retain rank, refresh rows, remove deleted IDs. */
+export function mergeSidebarProjects(
+  current: Project[],
+  incoming: Project[],
+): Project[] {
+  const updates = new Map(incoming.map((project) => [project.id, project]));
+  const seen = new Set<string>();
+  const result: Project[] = [];
+  for (const project of current) {
+    const update = updates.get(project.id);
+    if (!update || seen.has(project.id)) continue;
+    seen.add(project.id);
+    result.push({ ...project, ...update });
+  }
+  for (const project of incoming) {
+    if (seen.has(project.id)) continue;
+    seen.add(project.id);
+    result.push(updates.get(project.id)!);
+  }
+  return result;
+}
+
 function calendarDay(time: number) {
   const date = new Date(time);
   return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
@@ -66,19 +151,33 @@ export function threadActivityLabel(thread: Thread, now = new Date()) {
   });
 }
 
-export function groupThreadsByDate(threads: Thread[], now = new Date()) {
+export function groupThreadsByDate(
+  threads: Thread[],
+  now = new Date(),
+  preserveOrder = false,
+) {
   const groups = [
     { label: "今天", threads: [] as Thread[] },
     { label: "昨天", threads: [] as Thread[] },
     { label: "过去7天", threads: [] as Thread[] },
     { label: "更早", threads: [] as Thread[] },
   ];
-  for (const thread of [...threads].sort(
-    (left, right) => threadActivityTime(right) - threadActivityTime(left),
-  )) {
+  const ordered = preserveOrder
+    ? threads
+    : [...threads].sort(
+        (left, right) => threadActivityTime(right) - threadActivityTime(left),
+      );
+  const sections: { label: string; threads: Thread[] }[] = [];
+  for (const thread of ordered) {
     const days = threadAgeDays(thread, now);
     const index = days <= 0 ? 0 : days === 1 ? 1 : days <= 7 ? 2 : 3;
-    groups[index].threads.push(thread);
+    if (preserveOrder) {
+      const label = groups[index].label;
+      const last = sections[sections.length - 1];
+      if (last?.label === label) last.threads.push(thread);
+      else sections.push({ label, threads: [thread] });
+    } else groups[index].threads.push(thread);
   }
+  if (preserveOrder) return sections;
   return groups.filter((group) => group.threads.length > 0);
 }

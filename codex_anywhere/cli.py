@@ -122,6 +122,22 @@ def run(state_dir, codex_bin, allow_insecure):
         raise click.ClickException(str(exc)) from exc
 
 
+@node.command("web")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state)
+@click.option("--port", type=click.IntRange(0, 65535), default=5780, show_default=True)
+@click.option("--codex-bin", default="codex", show_default=True)
+@click.option("--open/--no-open", "open_browser", default=True, help="Open the local settings page.")
+def node_web(state_dir, port, codex_bin, open_browser):
+    """Run the loopback-only node settings page and managed background node."""
+    from .node.local import serve_local_node
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        serve_local_node(state_dir, port, codex_bin, open_browser)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 if __name__ == "__main__":
     load_dotenv()
     main()

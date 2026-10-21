@@ -24,6 +24,9 @@ codex-anywhere = "codex_anywhere.cli:main"
 [tool.setuptools.packages.find]
 include = ["codex_anywhere*"]
 
+[tool.setuptools.package-data]
+"codex_anywhere.node" = ["local_ui/*.html", "local_ui/*.js", "local_ui/*.css"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

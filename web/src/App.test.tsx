@@ -10,7 +10,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import App from "./App";
-import type { HubEvent, Thread, ThreadOwnership } from "./types";
+import type { Host, HubEvent, Project, Thread, ThreadOwnership } from "./types";
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -41,6 +41,7 @@ function setup(
   threadOverride: Partial<Thread> = {},
   pathname = "/tasks/t1",
   capabilities: string[] = [],
+  catalog?: { threads?: Thread[]; projects?: Project[]; hosts?: Host[] },
 ) {
   const thread: Thread = {
     id: "t1",
@@ -59,8 +60,17 @@ function setup(
   });
   let refreshes = 0;
   let sequence = 0;
-  const threads = [thread];
-  const projects = [
+  const threads = catalog?.threads || [thread];
+  const hosts = catalog?.hosts || [
+    {
+      id: "h1",
+      name: "测试设备",
+      platform: "windows",
+      online: true,
+      capabilities,
+    },
+  ];
+  const projects: Project[] = catalog?.projects || [
     {
       id: "p1",
       host_id: "h1",
@@ -102,27 +112,23 @@ function setup(
     else if (path === "/api/settings")
       result = { administrator: { username: authentication.username } };
     else if (path === "/api/projects") result = { projects };
-    else if (path === "/api/hosts")
-      result = {
-        hosts: [
-          {
-            id: "h1",
-            name: "测试设备",
-            platform: "windows",
-            online: true,
-            capabilities,
-          },
-        ],
-      };
+    else if (path === "/api/hosts") result = { hosts };
     else if (path.startsWith("/api/threads?")) {
       refreshes += 1;
       const query = new URLSearchParams(path.split("?")[1]);
       const offset = Number(query.get("offset") || 0);
       const limit = Number(query.get("limit") || 50);
+      const hostId = query.get("host_id");
+      const projectId = query.get("project_id");
+      const filtered = threads.filter(
+        (entry) =>
+          (!hostId || entry.host_id === hostId) &&
+          (!projectId || entry.project_id === projectId),
+      );
       result = {
-        threads: threads.slice(offset, offset + limit),
-        has_more: offset + limit < threads.length,
-        next_offset: offset + limit < threads.length ? offset + limit : null,
+        threads: filtered.slice(offset, offset + limit),
+        has_more: offset + limit < filtered.length,
+        next_offset: offset + limit < filtered.length ? offset + limit : null,
       };
     } else if (pathname === "/api/threads/t1")
       result = { thread, items: [], interactions: [] };
@@ -145,6 +151,7 @@ function setup(
     authentication,
     loginHeaders,
     threads,
+    hosts,
     projects,
     intercept: (handler: typeof intercept) => {
       intercept = handler;
@@ -620,6 +627,353 @@ function response(value: unknown, status = 200) {
   });
 }
 
+function catalogThread(
+  id: string,
+  title: string,
+  projectId: string,
+  activity: string,
+  hostId = "h1",
+): Thread {
+  return {
+    id,
+    title,
+    host_id: hostId,
+    project_id: projectId,
+    cwd: `C:\\${projectId}`,
+    status: "idle",
+    created_at: activity,
+    updated_at: activity,
+    last_activity_at: activity,
+  };
+}
+
+function catalogProject(
+  id: string,
+  name: string,
+  activity: string,
+  hostId = "h1",
+): Project {
+  return {
+    id,
+    name,
+    host_id: hostId,
+    cwd: `C:\\${id}`,
+    thread_count: 1,
+    created_at: activity,
+    updated_at: activity,
+    last_activity_at: activity,
+  };
+}
+
+function conversationIds(root: ParentNode = document): string[] {
+  return Array.from(
+    root.querySelectorAll<HTMLAnchorElement>('a[href^="/tasks/"]'),
+  ).map((link) => link.getAttribute("href")!.split("/").at(-1)!);
+}
+
+function projectNames(names: string[]): string[] {
+  return screen
+    .getAllByRole("button")
+    .map((button) => names.find((name) => button.textContent?.includes(name)))
+    .filter((name): name is string => name !== undefined);
+}
+
+function recentCatalog() {
+  const recent = "2026-10-21T10:00:00Z",
+    old = "2026-10-01T10:00:00Z";
+  const older = catalogThread("t1", "较早会话", "p1", old);
+  const latest = catalogThread("t2", "近期会话", "p2", recent);
+  const projects = [
+    catalogProject("p2", "近期项目", recent),
+    catalogProject("p1", "较早项目", old),
+  ];
+  return { older, latest, projects, threads: [latest, older] };
+}
+
+test("initial navigation follows recent activity without promoting the selected older conversation", async () => {
+  const catalog = recentCatalog();
+  setup(catalog.older, "/tasks/t1", [], catalog);
+  await screen.findByRole("link", { name: /近期会话/ });
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  assert.deepEqual(conversationIds(), ["t2", "t1"]);
+  assert.deepEqual(projectNames(["近期项目", "较早项目"]), [
+    "近期项目",
+    "较早项目",
+  ]);
+});
+
+test("background metadata updates titles and status while inverted activity preserves conversation and project order", async () => {
+  const catalog = recentCatalog();
+  const server = setup(catalog.older, "/tasks/t1", [], catalog);
+  await screen.findByRole("link", { name: /近期会话/ });
+  server.threads.splice(
+    0,
+    2,
+    {
+      ...catalog.older,
+      title: "较早会话更新",
+      last_activity_at: "2030-01-01T00:00:00Z",
+      updated_at: "2030-01-01T00:00:00Z",
+    },
+    {
+      ...catalog.latest,
+      title: "近期会话更新",
+      status: "active",
+      last_activity_at: "2000-01-01T00:00:00Z",
+    },
+  );
+  server.projects.splice(
+    0,
+    2,
+    {
+      ...catalog.projects[1],
+      name: "较早项目更新",
+      last_activity_at: "2030-01-01T00:00:00Z",
+    },
+    {
+      ...catalog.projects[0],
+      name: "近期项目更新",
+      last_activity_at: "2000-01-01T00:00:00Z",
+    },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  const updated = await screen.findByRole("link", { name: /近期会话更新/ });
+  assert.ok(updated.querySelector(".thread-dot.status-active"));
+  assert.ok(screen.getByRole("link", { name: /较早会话更新/ }));
+  assert.deepEqual(conversationIds(), ["t2", "t1"]);
+  assert.deepEqual(projectNames(["近期项目更新", "较早项目更新"]), [
+    "近期项目更新",
+    "较早项目更新",
+  ]);
+});
+
+test("an accepted message immediately promotes its conversation and project while command polling and an older list are pending", async () => {
+  const catalog = recentCatalog();
+  const server = setup(catalog.older, "/tasks/t1", [], catalog);
+  const input = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  await screen.findByRole("link", { name: /近期会话/ });
+  const staleThreads = deferred<Response>();
+  const completion = deferred<Response>();
+  let listStarted = false,
+    polled = false,
+    holdLists = true;
+  server.intercept((path) => {
+    if (path.startsWith("/api/threads?") && holdLists) {
+      listStarted = true;
+      return staleThreads.promise;
+    }
+    if (path === "/api/projects")
+      return response({ projects: catalog.projects });
+    if (path === "/api/threads/t1/messages")
+      return response(
+        {
+          command: {
+            id: "promote-command",
+            kind: "turn.start",
+            status: "queued",
+          },
+        },
+        202,
+      );
+    if (path === "/api/commands/promote-command") {
+      polled = true;
+      return completion.promise;
+    }
+    return undefined;
+  });
+  try {
+    fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+    await waitFor(() => assert.equal(listStarted, true));
+    fireEvent.change(input, { target: { value: "继续较早会话" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    await waitFor(() => assert.equal(polled, true));
+    assert.deepEqual(conversationIds(), ["t1", "t2"]);
+    assert.deepEqual(projectNames(["近期项目", "较早项目"]), [
+      "较早项目",
+      "近期项目",
+    ]);
+    holdLists = false;
+    await act(async () => {
+      staleThreads.resolve(
+        response({
+          threads: [catalog.latest, catalog.older],
+          has_more: false,
+          next_offset: null,
+        }),
+      );
+      await staleThreads.promise;
+    });
+    assert.deepEqual(conversationIds(), ["t1", "t2"]);
+    assert.deepEqual(projectNames(["近期项目", "较早项目"]), [
+      "较早项目",
+      "近期项目",
+    ]);
+  } finally {
+    holdLists = false;
+    await act(async () => {
+      staleThreads.resolve(
+        response({
+          threads: catalog.threads,
+          has_more: false,
+          next_offset: null,
+        }),
+      );
+      completion.resolve(
+        response({
+          command: {
+            id: "promote-command",
+            kind: "turn.start",
+            status: "completed",
+            result: {},
+          },
+        }),
+      );
+      await Promise.all([staleThreads.promise, completion.promise]);
+    });
+  }
+});
+
+test("each node loads its own first page and advances only its own native offset", async () => {
+  const first = catalogThread(
+    "t1",
+    "Windows 最近会话",
+    "p1",
+    "2026-10-21T10:00:00Z",
+  );
+  const second = catalogThread(
+    "t2",
+    "Linux 最近会话",
+    "p2",
+    "2026-10-21T09:00:00Z",
+    "h2",
+  );
+  const server = setup(first, "/tasks/t1", [], {
+    threads: [first, second],
+    hosts: [
+      { id: "h1", name: "Windows 节点", platform: "windows", online: true },
+      { id: "h2", name: "Linux 节点", platform: "linux", online: true },
+    ],
+    projects: [
+      catalogProject("p1", "Windows 项目", first.created_at),
+      catalogProject("p2", "Linux 项目", second.created_at, "h2"),
+    ],
+  });
+  const queries: URLSearchParams[] = [];
+  server.intercept((path) => {
+    if (!path.startsWith("/api/threads?")) return undefined;
+    const query = new URLSearchParams(path.split("?")[1]);
+    queries.push(query);
+    const host = query.get("host_id"),
+      offset = Number(query.get("offset"));
+    assert.ok(
+      host === "h1" || host === "h2",
+      "unfiltered global pages must not starve another node",
+    );
+    assert.equal(query.get("project_id"), null);
+    const initial = host === "h1" ? first : second;
+    return response({
+      threads: [
+        offset === 0
+          ? initial
+          : { ...initial, id: `${host}-older`, title: `${host} 较早会话` },
+      ],
+      has_more: offset === 0,
+      next_offset: offset === 0 ? (host === "h1" ? 17 : 31) : null,
+    });
+  });
+  await screen.findByRole("link", { name: /Windows 最近会话/ });
+  await screen.findByRole("link", { name: /Linux 最近会话/ });
+  const windows = screen.getByRole("region", { name: "Windows 节点 会话" });
+  const linux = screen.getByRole("region", { name: "Linux 节点 会话" });
+  assert.deepEqual(conversationIds(windows), ["t1"]);
+  assert.deepEqual(conversationIds(linux), ["t2"]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "加载 Windows 节点 的更多会话" }),
+  );
+  await screen.findByRole("link", { name: /h1 较早会话/ });
+  assert.deepEqual(conversationIds(windows), ["t1", "h1-older"]);
+  assert.deepEqual(conversationIds(linux), ["t2"]);
+  assert.ok(
+    queries.some(
+      (query) => query.get("host_id") === "h1" && query.get("offset") === "0",
+    ),
+  );
+  assert.ok(
+    queries.some(
+      (query) => query.get("host_id") === "h2" && query.get("offset") === "0",
+    ),
+  );
+  assert.deepEqual(
+    queries
+      .filter(
+        (query) => query.get("host_id") === "h1" && query.get("offset") !== "0",
+      )
+      .map((query) => Number(query.get("offset"))),
+    [17],
+  );
+  assert.deepEqual(
+    queries.filter(
+      (query) => query.get("host_id") === "h2" && query.get("offset") !== "0",
+    ),
+    [],
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "加载 Linux 节点 的更多会话" }),
+  );
+  await screen.findByRole("link", { name: /h2 较早会话/ });
+  assert.deepEqual(conversationIds(linux), ["t2", "h2-older"]);
+  assert.deepEqual(conversationIds(windows), ["t1", "h1-older"]);
+  assert.deepEqual(
+    queries
+      .filter(
+        (query) => query.get("host_id") === "h2" && query.get("offset") !== "0",
+      )
+      .map((query) => Number(query.get("offset"))),
+    [31],
+  );
+});
+
+test("a late first-page snapshot cannot discard conversations already loaded from an older page", async () => {
+  const server = setup();
+  let pendingRefresh = false,
+    refreshStarted = false;
+  const stale = deferred<Response>();
+  server.intercept((path) => {
+    if (!path.startsWith("/api/threads?")) return undefined;
+    const offset = Number(
+      new URLSearchParams(path.split("?")[1]).get("offset"),
+    );
+    if (offset === 0 && pendingRefresh) {
+      refreshStarted = true;
+      return stale.promise;
+    }
+    return response({
+      threads: [
+        offset === 0
+          ? server.thread
+          : { ...server.thread, id: "older-loaded", title: "已加载的旧会话" },
+      ],
+      has_more: offset === 0,
+      next_offset: offset === 0 ? 17 : null,
+    });
+  });
+  await screen.findByRole("button", { name: /加载.*更多会话/ });
+  fireEvent.click(screen.getByRole("button", { name: /加载.*更多会话/ }));
+  await screen.findByRole("link", { name: /已加载的旧会话/ });
+  pendingRefresh = true;
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await waitFor(() => assert.equal(refreshStarted, true));
+  await act(async () => {
+    stale.resolve(
+      response({ threads: [server.thread], has_more: true, next_offset: 17 }),
+    );
+    await stale.promise;
+  });
+  assert.deepEqual(conversationIds(), ["t1", "older-loaded"]);
+});
+
 test("continuous streaming still paints snapshots when requests take longer than the refresh interval", async () => {
   const server = setup();
   await screen.findByRole("textbox", { name: "发送消息给 Codex" });
@@ -825,11 +1179,11 @@ test("all sessions remain reachable when the catalog contains more than 200 task
   fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
   await screen.findByText("分页会话 50");
   for (const boundary of [100, 150, 200, 250, 251]) {
-    fireEvent.click(screen.getByRole("button", { name: "加载更多会话" }));
+    fireEvent.click(screen.getByRole("button", { name: /加载.*更多会话/ }));
     await screen.findByText(`分页会话 ${boundary}`, {}, { timeout: 3000 });
   }
   assert.equal(
-    screen.queryByRole("button", { name: "加载更多会话" }) === null,
+    screen.queryByRole("button", { name: /加载.*更多会话/ }) === null,
     true,
   );
 });
@@ -862,7 +1216,7 @@ test("load more follows the server next_offset rather than assuming a full first
   });
   fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
   await screen.findByText("第一页元数据");
-  fireEvent.click(screen.getByRole("button", { name: "加载更多会话" }));
+  fireEvent.click(screen.getByRole("button", { name: /加载.*更多会话/ }));
   await screen.findByText("后续页元数据");
   assert.ok(offsets.includes(17));
   assert.equal(offsets.includes(50), false);

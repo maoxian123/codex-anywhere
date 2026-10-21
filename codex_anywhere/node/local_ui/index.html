@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f3f6f7" />
+    <title>本机节点 · Codex Anywhere</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="page-header">
+        <a class="brand" href="/" aria-label="Codex Anywhere 本机节点">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="25" height="25" viewBox="0 0 24 24" fill="none">
+              <rect
+                x="3"
+                y="4"
+                width="18"
+                height="13"
+                rx="3"
+                stroke="currentColor"
+                stroke-width="1.6"
+              />
+              <path
+                d="m8 8 3 2.5L8 13m6 0h3M9 21h6m-3-4v4"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </span>
+          <span>Codex Anywhere<small>本机节点</small></span>
+        </a>
+        <span class="local-label"
+          ><span aria-hidden="true"></span>仅本机访问</span
+        >
+      </header>
+
+      <main>
+        <div class="page-heading">
+          <h1>连接这台设备</h1>
+          <p>将本机 Codex 连接到管理中心，随后即可在网页中继续会话。</p>
+        </div>
+
+        <section class="card status-card" aria-labelledby="status-heading">
+          <div class="card-heading status-heading">
+            <div>
+              <span class="eyebrow">运行状态</span>
+              <h2 id="status-heading">本机节点</h2>
+            </div>
+            <span id="status-badge" class="status-badge" role="status"
+              ><span aria-hidden="true"></span
+              ><span id="status-label">正在读取</span></span
+            >
+          </div>
+          <p id="status-description" class="status-description">
+            正在读取本地节点状态…
+          </p>
+
+          <dl id="connection-summary" class="connection-summary" hidden>
+            <div>
+              <dt>管理中心</dt>
+              <dd id="summary-server">—</dd>
+            </div>
+            <div>
+              <dt>设备名称</dt>
+              <dd id="summary-name">—</dd>
+            </div>
+            <div>
+              <dt>运行平台</dt>
+              <dd id="summary-platform">—</dd>
+            </div>
+          </dl>
+
+          <div
+            id="error-message"
+            class="message message-error"
+            role="alert"
+            hidden
+          ></div>
+          <div
+            id="feedback-message"
+            class="message message-info"
+            role="status"
+            hidden
+          ></div>
+          <button id="refresh-status" type="button" class="text-button" hidden>
+            重新读取状态
+          </button>
+
+          <div id="node-actions" class="node-actions" hidden>
+            <button id="start-node" type="button" class="button button-primary">
+              启动节点
+            </button>
+            <button
+              id="request-stop"
+              type="button"
+              class="button button-secondary"
+            >
+              停止节点
+            </button>
+            <button id="edit-pairing" type="button" class="text-button">
+              修改配对
+            </button>
+            <a
+              id="open-hub"
+              class="text-button open-hub"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              hidden
+              >打开管理中心 <span aria-hidden="true">↗</span></a
+            >
+          </div>
+
+          <div
+            id="stop-confirmation"
+            class="confirmation"
+            role="group"
+            aria-labelledby="stop-heading"
+            hidden
+          >
+            <h3 id="stop-heading">确认停止本机节点？</h3>
+            <p>
+              停止会中断本节点正在执行的任务。配对信息和已有会话资料会保留。
+            </p>
+            <div class="button-row">
+              <button
+                id="confirm-stop"
+                type="button"
+                class="button button-danger"
+              >
+                确认停止
+              </button>
+              <button
+                id="cancel-stop"
+                type="button"
+                class="button button-secondary"
+              >
+                继续运行
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section
+          id="configuration-card"
+          class="card"
+          aria-labelledby="configuration-heading"
+          hidden
+        >
+          <div id="configuration-intro" class="card-heading">
+            <div>
+              <h2 id="configuration-heading">连接管理中心</h2>
+              <p id="configuration-description">
+                在管理中心创建配对码，将这台设备添加为节点。
+              </p>
+            </div>
+          </div>
+          <form id="pair-form" autocomplete="off">
+            <fieldset id="pair-fields" class="pair-fields">
+              <label class="field-label" for="server"
+                >管理中心地址 <span aria-hidden="true">*</span></label
+              >
+              <input
+                id="server"
+                name="server"
+                type="url"
+                placeholder="https://codex.example.com"
+                required
+                spellcheck="false"
+                autocomplete="url"
+              />
+              <p class="field-hint">
+                填写管理中心的完整地址，包含 https:// 或 http://。
+              </p>
+
+              <div class="field-grid">
+                <div>
+                  <label class="field-label" for="pair-code"
+                    >配对码 <span aria-hidden="true">*</span></label
+                  >
+                  <input
+                    id="pair-code"
+                    name="code"
+                    type="text"
+                    placeholder="输入管理中心生成的配对码"
+                    maxlength="100"
+                    required
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="characters"
+                  />
+                </div>
+                <div>
+                  <label class="field-label" for="device-name"
+                    >设备名称 <span aria-hidden="true">*</span></label
+                  >
+                  <input
+                    id="device-name"
+                    name="name"
+                    type="text"
+                    placeholder="例如：工作电脑"
+                    maxlength="120"
+                    required
+                    autocomplete="off"
+                  />
+                </div>
+              </div>
+            </fieldset>
+
+            <details id="advanced-settings" class="advanced-settings">
+              <summary>
+                高级设置 <span>Codex 路径与 HTTP 连接</span
+                ><span class="chevron" aria-hidden="true"></span>
+              </summary>
+              <div class="advanced-content">
+                <label class="field-label" for="codex-bin"
+                  >Codex 可执行文件</label
+                >
+                <input
+                  id="codex-bin"
+                  name="codex_bin"
+                  type="text"
+                  value="codex"
+                  placeholder="codex 或可执行文件的完整路径"
+                  spellcheck="false"
+                  autocomplete="off"
+                />
+                <p class="field-hint">
+                  默认使用 PATH 中的 codex。修改后于下次启动节点时应用。
+                </p>
+                <label class="checkbox-label" for="allow-insecure"
+                  ><input
+                    id="allow-insecure"
+                    name="allow_insecure"
+                    type="checkbox"
+                  /><span
+                    >允许使用 HTTP 连接<small
+                      >管理中心使用 HTTP
+                      时需明确开启，配对与节点通信将不加密。</small
+                    ></span
+                  ></label
+                >
+              </div>
+            </details>
+
+            <label
+              id="replace-confirmation"
+              class="checkbox-label replacement-label"
+              for="replace-pairing"
+              hidden
+              ><input id="replace-pairing" type="checkbox" /><span
+                >确认替换本机配对，保留已有会话资料<small
+                  >旧配对将不再连接；本机 Codex
+                  会话及节点状态资料会保留。</small
+                ></span
+              ></label
+            >
+            <div id="pair-actions" class="form-actions">
+              <button
+                id="pair-submit"
+                type="submit"
+                class="button button-primary"
+              >
+                配对并启动 <span aria-hidden="true">→</span>
+              </button>
+              <button
+                id="cancel-pairing"
+                type="button"
+                class="button button-secondary"
+                hidden
+              >
+                取消修改
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <noscript
+          ><p class="message message-error">
+            请启用 JavaScript，以配置和查看本机节点。
+          </p></noscript
+        >
+      </main>
+
+      <footer class="page-footer">
+        <p>关闭此页面不会停止节点。请保持本地节点服务运行。</p>
+        <span>本地设置地址 <code id="local-address">127.0.0.1:5780</code></span>
+      </footer>
+    </div>
+  </body>
+</html>

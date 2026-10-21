@@ -162,7 +162,7 @@ test("sidebar preserves server project ranking across partial pages and promotes
   );
 });
 
-test("sidebar renders recent device and project groups and keeps dated conversations navigable", () => {
+test("sidebar preserves supplied device and project order and keeps dated conversations navigable", () => {
   const now = new Date();
   const earlier = new Date(
     now.getFullYear(),
@@ -217,14 +217,14 @@ test("sidebar renders recent device and project groups and keeps dated conversat
     Array.from(container.querySelectorAll(".thread-date-label")).map(
       (value) => value.textContent,
     ),
-    ["今天", "更早"],
+    ["更早", "今天"],
   );
   const links = screen.getAllByRole("link");
   assert.deepEqual(
     links.map((link) => link.getAttribute("href")),
-    ["/tasks/新会话", "/tasks/旧会话"],
+    ["/tasks/旧会话", "/tasks/新会话"],
   );
-  fireEvent.click(links[1]);
+  fireEvent.click(links[0]);
   assert.deepEqual(navigated, ["旧会话"]);
 });
 
