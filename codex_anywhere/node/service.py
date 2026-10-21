@@ -9,6 +9,7 @@ import json
 import logging
 import platform
 import random
+import time
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,7 @@ log = logging.getLogger(__name__)
 VERSION = "0.1.0"
 OUTBOX_RETRY_SECONDS = 5.0
 OUTBOX_WINDOW = 100
+STABLE_CONNECTION_SECONDS = 30.0
 
 
 def pair_node(
@@ -306,6 +308,7 @@ class NodeService:
                             self.event_wake.set()
                     elif message.get("type") == "pong":
                         self.last_pong = asyncio.get_running_loop().time()
+                log.warning("Hub closed the node connection (code=%s); reconnecting", ws.close_code)
             finally:
                 if self.ws is ws:
                     self.ws = None
@@ -321,14 +324,16 @@ class NodeService:
     async def _network(self) -> None:
         attempt = 0
         while True:
+            started = time.monotonic()
             try:
                 await self._connect_once()
-                attempt = 0
             except asyncio.CancelledError:
                 raise
             except (OSError, WebSocketException, TimeoutError, ValueError) as exc:
                 # Exception strings from HTTP clients may contain URLs, never include tokens.
                 log.warning("Hub connection unavailable (%s); reconnecting", type(exc).__name__)
+            if time.monotonic() - started >= STABLE_CONNECTION_SECONDS:
+                attempt = 0
             attempt = min(attempt + 1, 6)
             await asyncio.sleep(min(30, 2**attempt) + random.random())
 

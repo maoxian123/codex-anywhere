@@ -37,6 +37,13 @@ def _error_detail(value, fallback):
     return fallback
 
 
+def _append_text(previous, delta):
+    """Nullable native snapshots have no text yet; do not stringify nulls."""
+    return (previous if isinstance(previous, str) else "") + (
+        delta if isinstance(delta, str) else ""
+    )
+
+
 def _assets(item):
     previous = {a.get("id"): a for a in item.data.get("_assets", []) if isinstance(a, dict)}
     result = []
@@ -289,7 +296,7 @@ def _project(thread, method, params, live=True):
             )
             db.session.add(item)
         data = dict(item.data)
-        data["text"] = data.get("text", "") + str(params.get("delta", ""))
+        data["text"] = _append_text(data.get("text"), params.get("delta"))
         item.data = data
     elif method == "item/commandExecution/outputDelta":
         item = Item.query.filter_by(
@@ -298,8 +305,7 @@ def _project(thread, method, params, live=True):
         if item:
             item.data = dict(
                 item.data,
-                aggregatedOutput=item.data.get("aggregatedOutput", "")
-                + str(params.get("delta", "")),
+                aggregatedOutput=_append_text(item.data.get("aggregatedOutput"), params.get("delta")),
             )
     elif method == "turn/started" and live:
         thread.active_turn_id = params.get("turn", {}).get("id")
