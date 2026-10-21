@@ -12,7 +12,14 @@ import {
 import { ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
 import { NewTaskDialog } from "./Dialogs";
+import ProjectNavigation from "./ProjectNavigation";
 import { waitForCommand, waitForImportedThread } from "./commands";
+import {
+  groupThreadsByDate,
+  sortProjectsByActivity,
+  threadActivityLabel,
+  threadActivityTime,
+} from "./sidebar-activity";
 import type { Host, Project, Thread } from "./types";
 
 const originalFetch = globalThis.fetch;
@@ -51,6 +58,175 @@ const command = (result: unknown, id = "c1") =>
     }),
     { status: 202 },
   );
+
+const sidebarThread = (
+  id: string,
+  updatedAt: Date,
+  extra: Partial<Thread> = {},
+): Thread => ({
+  id,
+  host_id: "h1",
+  project_id: "p1",
+  title: id,
+  cwd: "C:\\work",
+  status: "idle",
+  created_at: updatedAt.toISOString(),
+  updated_at: updatedAt.toISOString(),
+  ...extra,
+});
+
+test("sidebar groups conversations by local calendar date and native activity, without mutating input", () => {
+  const now = new Date(2026, 9, 21, 0, 15);
+  const yesterday = new Date(2026, 9, 20, 23, 58);
+  const week = new Date(2026, 9, 14, 23, 0);
+  const old = new Date(2026, 9, 13, 23, 0);
+  const threads = [
+    sidebarThread("imported-old", now, {
+      imported: true,
+      native_updated_at: old.getTime() / 1000,
+    }),
+    sidebarThread("yesterday", yesterday),
+    sidebarThread("week", week),
+    sidebarThread("today-first", new Date(2026, 9, 21, 0, 1)),
+    sidebarThread("today-latest", now),
+  ];
+  const originalIds = threads.map((thread) => thread.id);
+  assert.deepEqual(
+    groupThreadsByDate(threads, now).map((group) => ({
+      label: group.label,
+      ids: group.threads.map((thread) => thread.id),
+    })),
+    [
+      { label: "今天", ids: ["today-latest", "today-first"] },
+      { label: "昨天", ids: ["yesterday"] },
+      { label: "过去7天", ids: ["week"] },
+      { label: "更早", ids: ["imported-old"] },
+    ],
+  );
+  assert.equal(threadActivityLabel(threads[1], now), "昨天");
+  assert.deepEqual(
+    threads.map((thread) => thread.id),
+    originalIds,
+  );
+});
+
+test("sidebar prefers projected live activity and falls back safely when native metadata is missing", () => {
+  const today = new Date(2026, 9, 21, 12);
+  const native = new Date(2026, 9, 12, 12);
+  const imported = sidebarThread("imported", today, {
+    imported: true,
+    native_updated_at: native.getTime() / 1000,
+  });
+  assert.equal(threadActivityTime(imported), native.getTime());
+  assert.equal(
+    threadActivityTime({ ...imported, last_activity_at: today.toISOString() }),
+    today.getTime(),
+  );
+  assert.equal(
+    threadActivityTime({ ...imported, native_updated_at: null }),
+    today.getTime(),
+  );
+  assert.equal(
+    threadActivityTime({ ...imported, native_updated_at: Number.NaN }),
+    today.getTime(),
+  );
+});
+
+test("sidebar preserves server project ranking across partial pages and promotes new loaded activity", () => {
+  const projects: Project[] = [
+    {
+      ...project,
+      id: "server-first",
+      updated_at: "2026-10-01T00:00:00Z",
+    },
+    {
+      ...project,
+      id: "server-second",
+      updated_at: "2026-10-05T00:00:00Z",
+    },
+  ];
+  assert.deepEqual(
+    sortProjectsByActivity(projects, []).map((value) => value.id),
+    ["server-first", "server-second"],
+  );
+  const active = sidebarThread("active", new Date("2026-10-21T00:00:00Z"), {
+    project_id: "server-second",
+  });
+  assert.deepEqual(
+    sortProjectsByActivity(projects, [active]).map((value) => value.id),
+    ["server-second", "server-first"],
+  );
+  assert.deepEqual(
+    projects.map((value) => value.id),
+    ["server-first", "server-second"],
+  );
+});
+
+test("sidebar renders recent device and project groups and keeps dated conversations navigable", () => {
+  const now = new Date();
+  const earlier = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() - 10,
+  );
+  const projects: Project[] = [
+    { ...project, id: "latest", host_id: "h2", name: "最近项目" },
+    { ...project, id: "older", host_id: "h1", name: "较早项目" },
+    { ...project, id: "oldest", host_id: "h2", name: "更早项目" },
+  ];
+  const navigated: string[] = [];
+  const { container } = render(
+    <ProjectNavigation
+      hosts={hosts}
+      projects={projects}
+      threads={[
+        sidebarThread("旧会话", now, {
+          imported: true,
+          native_updated_at: earlier.getTime() / 1000,
+        }),
+        sidebarThread("新会话", now),
+      ]}
+      selectedProjectId={null}
+      currentThreadId="新会话"
+      loading={false}
+      loadingMore={false}
+      hasMore={false}
+      onFilter={() => {}}
+      onNavigate={(id) => navigated.push(id)}
+      onNewProject={() => {}}
+      onRefresh={() => {}}
+      onMore={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByText("项目", { selector: "summary" }));
+  assert.deepEqual(
+    Array.from(container.querySelectorAll(".project-host-group > h3 span")).map(
+      (value) => value.textContent,
+    ),
+    ["Linux 工作电脑", "Windows 工作电脑"],
+  );
+  assert.deepEqual(
+    Array.from(container.querySelectorAll(".project-host-group")).map((group) =>
+      Array.from(group.querySelectorAll(".project-row strong")).map(
+        (value) => value.textContent,
+      ),
+    ),
+    [["最近项目", "更早项目"], ["较早项目"]],
+  );
+  assert.deepEqual(
+    Array.from(container.querySelectorAll(".thread-date-label")).map(
+      (value) => value.textContent,
+    ),
+    ["今天", "更早"],
+  );
+  const links = screen.getAllByRole("link");
+  assert.deepEqual(
+    links.map((link) => link.getAttribute("href")),
+    ["/tasks/新会话", "/tasks/旧会话"],
+  );
+  fireEvent.click(links[1]);
+  assert.deepEqual(navigated, ["旧会话"]);
+});
 
 test("remote directory picker browses the selected node and creates a folder project only on request", async () => {
   const requests: { path: string; data: Record<string, unknown> }[] = [];

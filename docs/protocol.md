@@ -42,6 +42,16 @@ Migration `0005` adds runtime capabilities, project/thread desired and effective
 
 ## Automatic discovery baseline (v3; v4 paging supersedes full loads)
 
+Thread and Project browser objects include `last_activity_at` (ISO timestamp).
+`GET /api/threads` orders by descending activity before applying pagination,
+with descending ID as a stable tie-breaker. Activity uses the latest native
+thread/history version and locally journaled `turn.start`/`turn.steer` input;
+threads without native versions fall back to `updated_at`, then `created_at`.
+`GET /api/projects` orders by the latest activity across all of each project's
+cached conversations, with creation time for an empty project and descending ID
+for ties. Discovery, inventory and read-only history synchronization do not make
+old native activity recent. These fields are derived without a schema migration.
+
 Nodes advertise `capabilities:["catalogSync"]` in hello. Compatible hubs add `capabilities:{catalogSync:{recentLimit:50,intervalSeconds:60}}` to welcome. The node starts automatic discovery only after receiving that explicit welcome capability; a new node connected to an old hub must not emit automatic catalog events. Old nodes without the hello capability retain their existing behavior. On each negotiated connection the node immediately discovers the most recent 50 non-archived Codex threads and repeats every 60 seconds, independently of browsers. Do not run inference or load full histories for discovery.
 
 The node sends durable `anywhere/catalog_sync` events with `{threads:[nativeMetadataWithoutTurns],scanned_count,limit,syncedAt}`. The first scan sends the full bounded catalog; later scans send only metadata whose identity/version/title/cwd changed, including empty updates to record successful scans. Start a fresh comparison on reconnect. `anywhere/catalog_sync_error` `{error}` reports a failed scan without removing existing data. These are host-level events without `threadId`.

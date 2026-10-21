@@ -78,6 +78,7 @@ export type Thread = {
   last_error?: string | null;
   created_at: string;
   updated_at: string;
+  last_activity_at?: string;
   execution_settings?: ExecutionSettings;
   effective_settings?: NativeExecutionSettings;
   settings_revision?: number;
@@ -119,6 +120,7 @@ export type Project = {
   thread_count: number;
   created_at: string;
   updated_at: string;
+  last_activity_at?: string;
   execution_settings?: ExecutionSettings;
 };
 export type ThreadPage = {

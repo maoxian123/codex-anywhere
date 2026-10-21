@@ -23,6 +23,7 @@ from PIL import Image, UnidentifiedImageError
 from sqlalchemy import event as sa_event
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import with_expression
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
@@ -42,7 +43,9 @@ from .models import (
     Thread,
     db,
     iso,
+    latest_thread_inputs,
     new_id,
+    thread_activity_at,
 )
 from .presentation import browser_event, browser_item
 from .projects import ensure_project
@@ -535,7 +538,11 @@ def create_app(test_config=None):
 
     @app.get("/api/threads")
     def threads():
-        query = Thread.query
+        inputs = latest_thread_inputs()
+        activity = thread_activity_at(inputs.c.created_at)
+        query = Thread.query.outerjoin(inputs, inputs.c.thread_id == Thread.id).options(
+            with_expression(Thread.last_activity_at, activity)
+        )
         search = request.args.get("q", "").strip()[:200]
         if search:
             query = query.filter(Thread.title.ilike(f"%{search}%"))
@@ -547,7 +554,7 @@ def create_app(test_config=None):
         limit = _integer(request.args.get("limit", 200), "limit", 1, 200)
         offset = _integer(request.args.get("offset", 0), "offset", 0, 2**31 - 1)
         rows = (
-            query.order_by(Thread.updated_at.desc(), Thread.id.desc())
+            query.order_by(activity.desc(), Thread.id.desc())
             .offset(offset)
             .limit(limit + 1)
             .all()
@@ -561,15 +568,24 @@ def create_app(test_config=None):
 
     @app.get("/api/projects")
     def projects():
-        query = db.session.query(Project, func.count(Thread.id)).outerjoin(
-            Thread, Thread.project_id == Project.id
+        inputs = latest_thread_inputs()
+        last_activity_at = func.coalesce(
+            func.max(thread_activity_at(inputs.c.created_at)), Project.created_at
         )
+        query = db.session.query(Project, func.count(Thread.id), last_activity_at).outerjoin(
+            Thread, Thread.project_id == Project.id
+        ).outerjoin(inputs, inputs.c.thread_id == Thread.id)
         if "host_id" in request.args:
             query = query.filter(Project.host_id == _identifier(request.args["host_id"], "host_id"))
         rows = (
-            query.group_by(Project.id).order_by(Project.updated_at.desc(), Project.id.desc()).all()
+            query.group_by(Project.id).order_by(last_activity_at.desc(), Project.id.desc()).all()
         )
-        return jsonify(projects=[project.as_dict(thread_count=count) for project, count in rows])
+        return jsonify(
+            projects=[
+                project.as_dict(thread_count=count, last_activity_at=activity)
+                for project, count, activity in rows
+            ]
+        )
 
     @app.patch("/api/projects/<project_id>/settings")
     def update_project_settings(project_id):

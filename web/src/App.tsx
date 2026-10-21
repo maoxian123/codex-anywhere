@@ -825,9 +825,9 @@ function Workspace({
             </button>
             <span className="breadcrumb">会话</span>
             <span className="breadcrumb-divider">/</span>
-            <span className="topbar-title">
+            <h1 className="topbar-title">
               {detail?.thread.title || (route.id ? "加载会话" : "全部会话")}
-            </span>
+            </h1>
           </div>
           <div className="topbar-right">
             <span
@@ -884,7 +884,6 @@ function Workspace({
             {detail && (
               <div className="task-header">
                 <div className="task-heading">
-                  <h1>{detail.thread.title || "未命名任务"}</h1>
                   <span
                     className={`status-pill status-${detail.thread.status}`}
                   >

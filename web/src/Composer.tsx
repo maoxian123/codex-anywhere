@@ -10,6 +10,7 @@ import {
   LoaderCircle,
   Plus,
   Search,
+  Settings2,
   Square,
   X,
 } from "lucide-react";
@@ -17,6 +18,7 @@ import { api, errorText } from "./api";
 import { ErrorMessage, Modal, References, Spinner } from "./components";
 import { messageText } from "./Timeline";
 import { ThreadExecutionControls } from "./ExecutionControls";
+import { settingsLabel } from "./execution-settings";
 import type {
   Asset,
   Host,
@@ -334,7 +336,7 @@ export default function Composer({
     const input = textRef.current;
     if (input) {
       input.style.height = "auto";
-      input.style.height = `${Math.min(input.scrollHeight, 210)}px`;
+      input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
     }
   }, [text]);
   const edited = () => setRetryRequestId(null);
@@ -514,7 +516,8 @@ export default function Composer({
                 : "描述你想完成的工作…"
           }
           aria-label={busy ? "补充任务要求" : "发送消息给 Codex"}
-          rows={2}
+          rows={1}
+          title="Enter 发送 · Shift+Enter 换行"
           disabled={sending}
           onKeyDown={(event) => {
             if (
@@ -588,6 +591,37 @@ export default function Composer({
             </button>
             {busy && <span className="composer-mode">补充当前任务</span>}
           </div>
+          <details className="composer-settings">
+            <summary
+              aria-label="运行设置"
+              title={settingsLabel({
+                ...thread.effective_settings,
+                ...thread.execution_settings,
+              })}
+            >
+              <Settings2 size={14} />
+              <span>
+                {thread.execution_settings?.model ||
+                  thread.effective_settings?.model ||
+                  "运行设置"}
+              </span>
+              {(settingsSaving ||
+                (thread.settings_revision ?? 0) >
+                  (thread.effective_settings_revision ?? 0)) && (
+                <i title={settingsSaving ? "保存设置中" : "下次执行生效"} />
+              )}
+            </summary>
+            <div className="composer-settings-panel">
+              <ThreadExecutionControls
+                thread={thread}
+                host={host}
+                project={project}
+                onSave={onSettingsChange}
+                onProjectSettings={onProjectSettings}
+                onBusyChange={setSettingsSaving}
+              />
+            </div>
+          </details>
           <div className="composer-actions">
             {busy && (
               <button
@@ -631,29 +665,18 @@ export default function Composer({
             </button>
           </div>
         </div>
-        <ThreadExecutionControls
-          thread={thread}
-          host={host}
-          project={project}
-          onSave={onSettingsChange}
-          onProjectSettings={onProjectSettings}
-          onBusyChange={setSettingsSaving}
-        />
       </div>
-      <div className="composer-footnote">
-        <span>
-          {!hostOnline
-            ? "设备离线，重新连接后可发送消息"
-            : !historyReady
-              ? "正在导入本机会话历史，完成后可继续原会话。"
-              : thread.status === "starting"
-                ? "正在启动 Codex 会话…"
-                : busy
-                  ? "任务在远程设备持续运行，关闭页面不影响执行。"
-                  : "Codex 在远程设备执行，请留意审批与结果。"}
-        </span>
-        <span className="keyboard-hint">Enter 发送 · Shift+Enter 换行</span>
-      </div>
+      {!ready && (
+        <div className="composer-footnote">
+          <span>
+            {!hostOnline
+              ? "设备离线，重新连接后可发送消息"
+              : !historyReady
+                ? "正在导入本机会话历史，完成后可继续原会话。"
+                : "正在启动 Codex 会话…"}
+          </span>
+        </div>
+      )}
       {picker === "task" && (
         <TaskPicker
           currentId={thread.id}

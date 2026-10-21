@@ -7,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import column_property
 
 db = SQLAlchemy()
 
@@ -66,9 +68,18 @@ class Project(db.Model):
     created_at = db.Column(db.Float, default=time.time, nullable=False)
     updated_at = db.Column(db.Float, default=time.time, nullable=False)
 
-    def as_dict(self, thread_count=None):
+    def as_dict(self, thread_count=None, last_activity_at=None):
         if thread_count is None:
             thread_count = Thread.query.filter_by(project_id=self.id).count()
+        if last_activity_at is None:
+            inputs = latest_thread_inputs()
+            last_activity_at = (
+                db.session.query(func.max(thread_activity_at(inputs.c.created_at)))
+                .select_from(Thread)
+                .outerjoin(inputs, inputs.c.thread_id == Thread.id)
+                .filter(Thread.project_id == self.id)
+                .scalar()
+            ) or self.created_at
         return dict(
             id=self.id,
             host_id=self.host_id,
@@ -78,6 +89,7 @@ class Project(db.Model):
             thread_count=thread_count,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
+            last_activity_at=iso(last_activity_at),
         )
 
 
@@ -136,6 +148,7 @@ class Thread(db.Model):
             effective_settings_revision=self.effective_settings_revision,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
+            last_activity_at=iso(self.last_activity_at),
         )
 
 
@@ -168,6 +181,43 @@ class Command(db.Model):
 
     def wire(self):
         return dict(id=self.id, kind=self.kind, thread_id=self.thread_id, payload=self.payload)
+
+
+# Native versions describe conversation activity; updated_at also changes while
+# loading history. A locally queued input must become recent before native
+# metadata catches up. Keep this derived so existing databases need no migration.
+def thread_activity_at(latest_input_at):
+    native = case(
+        (Thread.native_updated_at > Thread.history_native_updated_at, Thread.native_updated_at),
+        else_=func.coalesce(
+            Thread.history_native_updated_at,
+            Thread.native_updated_at,
+            Thread.updated_at,
+            Thread.created_at,
+        ),
+    )
+    return case((latest_input_at > native, latest_input_at), else_=native)
+
+
+def latest_thread_inputs():
+    """Scan the command journal once for a list, rather than once per thread."""
+    return (
+        select(Command.thread_id, func.max(Command.created_at).label("created_at"))
+        .where(Command.kind.in_(["turn.start", "turn.steer"]))
+        .group_by(Command.thread_id)
+        .subquery()
+    )
+
+
+_latest_input_at = (
+    select(func.max(Command.created_at))
+    .where(Command.thread_id == Thread.id, Command.kind.in_(["turn.start", "turn.steer"]))
+    .correlate_except(Command)
+    .scalar_subquery()
+)
+Thread.last_activity_at = column_property(
+    thread_activity_at(_latest_input_at), deferred=True
+)
 
 
 class Item(db.Model):

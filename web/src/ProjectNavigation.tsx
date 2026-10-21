@@ -9,8 +9,12 @@ import {
   Settings2,
 } from "lucide-react";
 import { Spinner } from "./components";
+import {
+  groupThreadsByDate,
+  sortProjectsByActivity,
+  threadActivityLabel,
+} from "./sidebar-activity";
 import type { Host, Project, Thread } from "./types";
-import { relativeDate } from "./utils";
 
 export default function ProjectNavigation({
   hosts,
@@ -55,28 +59,33 @@ export default function ProjectNavigation({
             <Spinner label="加载会话" />
           </div>
         ) : threads.length ? (
-          threads.map((thread) => (
-            <a
-              key={thread.id}
-              href={`/tasks/${thread.id}`}
-              className={`thread-row ${thread.id === currentThreadId ? "selected" : ""}`}
-              onClick={(event) => {
-                event.preventDefault();
-                onNavigate(thread.id);
-              }}
-            >
-              <span className={`thread-dot status-${thread.status}`} />
-              <span className="thread-text">
-                <strong>{thread.title || "未命名会话"}</strong>
-                <small>
-                  {thread.imported ? "本机会话" : "Codex"}
-                  <span>{relativeDate(thread.updated_at)}</span>
-                </small>
-              </span>
-              {thread.status === "waiting" && (
-                <span className="attention-dot" title="等待处理" />
-              )}
-            </a>
+          groupThreadsByDate(threads).map((group) => (
+            <section className="thread-date-group" key={group.label}>
+              <h3 className="thread-date-label">{group.label}</h3>
+              {group.threads.map((thread) => (
+                <a
+                  key={thread.id}
+                  href={`/tasks/${thread.id}`}
+                  className={`thread-row ${thread.id === currentThreadId ? "selected" : ""}`}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    onNavigate(thread.id);
+                  }}
+                >
+                  <span className={`thread-dot status-${thread.status}`} />
+                  <span className="thread-text">
+                    <strong>{thread.title || "未命名会话"}</strong>
+                    <small>
+                      {thread.imported ? "本机会话" : "Codex"}
+                      <span>{threadActivityLabel(thread)}</span>
+                    </small>
+                  </span>
+                  {thread.status === "waiting" && (
+                    <span className="attention-dot" title="等待处理" />
+                  )}
+                </a>
+              ))}
+            </section>
           ))
         ) : (
           <div className="sidebar-empty">
@@ -96,11 +105,9 @@ export default function ProjectNavigation({
       )}
     </>
   );
+  const sortedProjects = sortProjectsByActivity(projects, threads);
   const hostIds = [
-    ...new Set([
-      ...hosts.map((host) => host.id),
-      ...projects.map((project) => project.host_id),
-    ]),
+    ...new Set(sortedProjects.map((project) => project.host_id)),
   ];
   return (
     <nav className="project-navigation" aria-label="项目与会话">
@@ -145,7 +152,7 @@ export default function ProjectNavigation({
         </div>
         {hostIds.map((hostId) => {
           const host = hosts.find((value) => value.id === hostId);
-          const group = projects.filter(
+          const group = sortedProjects.filter(
             (project) => project.host_id === hostId,
           );
           if (!group.length) return null;

@@ -636,6 +636,7 @@ svg {
 }
 .topbar-title {
   font-size: 12px;
+  font-weight: 400;
   color: #a4b8c4;
   white-space: nowrap;
   overflow: hidden;
@@ -999,7 +1000,10 @@ svg {
   }
 }
 .task-header {
-  padding: 25px 38px 22px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 38px;
   flex-shrink: 0;
   border-bottom: 1px solid #28363d88;
 }
@@ -1008,20 +1012,11 @@ svg {
   align-items: center;
   gap: 13px;
 }
-.task-heading h1 {
-  font-size: 20px;
-  letter-spacing: 0.2px;
-  line-height: 1.5;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
 .task-metadata {
   display: flex;
+  flex: 1;
   align-items: center;
   gap: 18px;
-  margin-top: 9px;
   font-size: 10px;
   color: #758d9a;
   min-width: 0;
@@ -1680,9 +1675,9 @@ svg {
 }
 .composer-area {
   width: 100%;
-  max-width: 890px;
+  max-width: 760px;
   margin: 0 auto;
-  padding: 12px 38px 18px;
+  padding: 8px 24px 14px;
   flex-shrink: 0;
 }
 .composer {
@@ -1703,10 +1698,10 @@ svg {
 }
 .composer textarea {
   resize: none;
-  min-height: 77px;
-  max-height: 210px;
+  min-height: 42px;
+  max-height: 160px;
   background: none;
-  padding: 15px 17px 4px;
+  padding: 12px 14px 4px;
   border: 0;
   border-radius: 12px;
   box-shadow: none;
@@ -1718,11 +1713,67 @@ svg {
   color: #6f8a96;
 }
 .composer-toolbar {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 10px 10px;
-  gap: 10px;
+  padding: 3px 9px 8px;
+  gap: 8px;
+}
+.composer-settings {
+  flex: 1;
+  min-width: 0;
+}
+.composer-settings > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 30px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  list-style: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: #91a8b3;
+}
+.composer-settings > summary::-webkit-details-marker {
+  display: none;
+}
+.composer-settings > summary:hover,
+.composer-settings[open] > summary {
+  background: #2b3d40;
+  color: #c4d4c4;
+}
+.composer-settings > summary > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-settings > summary > svg,
+.composer-settings > summary > i {
+  flex-shrink: 0;
+}
+.composer-settings > summary > i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #dfba73;
+}
+.composer-settings-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  padding: 4px;
+  border: 1px solid #455b48;
+  border-radius: 10px;
+  background: #1d2b22;
+  box-shadow: 0 10px 30px #0005;
+}
+.composer-settings-panel .thread-execution-controls {
+  border-top: 0;
 }
 .composer-tools,
 .composer-actions {
@@ -2657,10 +2708,7 @@ svg {
     display: none;
   }
   .task-header {
-    padding: 22px;
-  }
-  .task-heading h1 {
-    font-size: 18px;
+    padding: 9px 22px;
   }
   .task-metadata {
     gap: 11px;
@@ -2852,20 +2900,17 @@ svg {
     margin-top: 3px;
   }
   .task-header {
-    padding: 17px 19px 15px;
+    gap: 9px;
+    padding: 8px 18px;
   }
   .task-heading {
     gap: 9px;
-  }
-  .task-heading h1 {
-    font-size: 17px;
   }
   .task-heading .status-pill {
     font-size: 8px;
   }
   .task-metadata {
     gap: 11px;
-    margin-top: 8px;
     font-size: 8px;
   }
   .task-metadata > span:nth-child(2) {
@@ -2947,12 +2992,12 @@ svg {
     border-radius: 11px;
   }
   .composer textarea {
-    padding: 13px 14px 3px;
+    padding: 11px 12px 3px;
     font-size: 12px;
-    min-height: 72px;
+    min-height: 40px;
   }
   .composer-toolbar {
-    padding: 4px 9px 9px;
+    padding: 3px 8px 7px;
   }
   .composer-footnote {
     font-size: 7px;
@@ -3195,7 +3240,7 @@ svg {
 .project-navigation .sidebar-section-label .icon-button + .icon-button {
   margin-left: 0;
 }
-.project-host-group h3 {
+.project-host-group > h3 {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3204,13 +3249,13 @@ svg {
   color: #688692;
   padding: 8px 8px 5px;
 }
-.project-host-group h3 > span {
+.project-host-group > h3 > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.project-host-group h3 > i {
+.project-host-group > h3 > i {
   margin-left: auto;
 }
 .project-row {
@@ -3742,7 +3787,7 @@ svg {
   padding-bottom: 4px;
   font-size: 8px;
 }
-.project-filter-tree .project-host-group h3 {
+.project-filter-tree .project-host-group > h3 {
   font-size: 8px;
   padding-top: 6px;
 }
@@ -3757,6 +3802,15 @@ svg {
 .project-navigation .thread-text small {
   font-size: 8px;
   margin-top: 3px;
+}
+.thread-date-label {
+  padding: 13px 9px 5px;
+  font-size: 10px;
+  font-weight: 400;
+  color: #718e99;
+}
+.thread-date-group:first-child .thread-date-label {
+  padding-top: 7px;
 }
 .sidebar-menu {
   position: relative;

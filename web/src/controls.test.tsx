@@ -25,6 +25,29 @@ const baseThread: Thread = {
 };
 afterEach(cleanup);
 
+test("compact composer keeps runtime settings available behind its toolbar disclosure", () => {
+  render(
+    <Composer
+      thread={baseThread}
+      hostOnline={true}
+      onSend={async () => {}}
+      onInterrupt={async () => {}}
+      onNavigate={() => {}}
+    />,
+  );
+  const toggle = screen.getByLabelText("运行设置");
+  const disclosure = toggle.closest("details")!;
+  assert.ok(!disclosure.open);
+  fireEvent.click(toggle);
+  assert.ok(disclosure.open);
+  assert.ok(screen.getByRole("combobox", { name: "模型" }));
+  assert.ok(screen.getByRole("combobox", { name: "推理强度" }));
+  assert.ok(screen.getByRole("combobox", { name: "权限" }));
+  fireEvent.click(toggle);
+  assert.ok(!disclosure.open);
+  assert.ok(screen.getByRole("textbox", { name: "发送消息给 Codex" }));
+});
+
 test("compact native items fetch full content only on an explicit click and keep bridged images", async () => {
   const original = globalThis.fetch;
   let reads = 0;
