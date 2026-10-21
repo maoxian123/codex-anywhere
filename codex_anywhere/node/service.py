@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import json
 import logging
+import math
 import platform
 import random
 import time
@@ -34,6 +35,7 @@ from .config import (
 )
 from .directories import list_directories, open_project
 from .history import import_thread, list_threads, load_history_page
+from .ownership import WriterOwnership
 from .runtime import CodexRuntime, RpcError, RuntimeGone
 from .store import NodeStore
 from .sync import CatalogSynchronizer, negotiated_settings
@@ -43,6 +45,9 @@ VERSION = "0.1.0"
 OUTBOX_RETRY_SECONDS = 5.0
 OUTBOX_WINDOW = 100
 STABLE_CONNECTION_SECONDS = 30.0
+PRESENCE_TTL_SECONDS = 90.0
+LEGACY_IDLE_SECONDS = 300.0
+THREAD_RELEASE_TIMEOUT = 8.0
 
 
 def pair_node(
@@ -114,6 +119,19 @@ class NodeService:
         self.capabilities = RuntimeCapabilities()
         self.execution_epoch: str | None = None
         self.thread_execution: dict[str, dict] = {}
+        self.ownership = WriterOwnership()
+        self.thread_leases: dict[str, dict[str, float]] = {}
+        self.lease_versions: dict[tuple[str, str], tuple[float, bool]] = {}
+        self.presence_seen: set[str] = set()
+        self.last_activity: dict[str, float] = {}
+        self.active_turns: dict[str, str] = {}
+        self.completed_turns: dict[str, set[str]] = {}
+        self.pending_thread_commands: dict[str, int] = {}
+        self.release_requested: set[str] = set()
+        self.release_errors: dict[str, str] = {}
+        self.thread_closed: dict[str, asyncio.Event] = {}
+        self.unstarted_threads: set[str] = set()
+        self.hub_clock: tuple[float, float] | None = None
 
     async def _send(self, message: dict) -> bool:
         async with self.send_lock:
@@ -127,6 +145,37 @@ class NodeService:
 
     async def _native_event(self, method: str, params: dict, rpc_id) -> None:
         assert self.runtime
+        thread_id = params.get("threadId")
+        thread = params.get("thread")
+        if not thread_id and isinstance(thread, dict):
+            thread_id = thread.get("id")
+        if isinstance(thread_id, str):
+            turn = params.get("turn", {})
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if method == "turn/started" and isinstance(turn_id, str):
+                self.active_turns[thread_id] = turn_id
+                self.last_activity[thread_id] = time.time()
+                self.unstarted_threads.discard(thread_id)
+            elif method == "turn/completed" and isinstance(turn_id, str):
+                completed = self.completed_turns.setdefault(thread_id, set())
+                if len(completed) >= 100:
+                    completed.clear()
+                completed.add(turn_id)
+                if self.active_turns.get(thread_id) == turn_id:
+                    self.active_turns.pop(thread_id, None)
+                self.last_activity[thread_id] = time.time()
+            status = params.get("status", {})
+            not_loaded = status == "notLoaded" or (
+                isinstance(status, dict) and status.get("type") == "notLoaded"
+            )
+            if method == "thread/closed" or (method == "thread/status/changed" and not_loaded):
+                self.runtime.loaded_threads.discard(thread_id)
+                self.thread_execution.pop(thread_id, None)
+                self.active_turns.pop(thread_id, None)
+                self.release_errors.pop(thread_id, None)
+                self.release_requested.discard(thread_id)
+                self.unstarted_threads.discard(thread_id)
+                self.thread_closed.setdefault(thread_id, asyncio.Event()).set()
         self.store.record_event(
             self.runtime.runtime_id,
             method,
@@ -145,14 +194,189 @@ class NodeService:
         }:
             self.capabilities.invalidate()
 
+    def _leases(self, thread_id: str, now: float | None = None) -> dict[str, float]:
+        now = time.time() if now is None else now
+        leases = self.thread_leases.setdefault(thread_id, {})
+        for client_id, expires_at in list(leases.items()):
+            if expires_at <= now:
+                leases.pop(client_id, None)
+        return leases
+
+    def _sync_hub_clock(self, welcome: dict) -> None:
+        server_time = welcome.get("server_time")
+        self.hub_clock = (
+            (float(server_time), time.monotonic())
+            if type(server_time) in {int, float} and math.isfinite(server_time)
+            else None
+        )
+
+    def _hub_now(self) -> float:
+        if self.hub_clock is None:
+            return time.time()
+        server_time, received_at = self.hub_clock
+        return server_time + time.monotonic() - received_at
+
+    def _presence(
+        self, thread_id: str, payload: dict, *, release: bool = False, takeover: bool = False
+    ) -> bool:
+        client_id, issued_at = payload.get("client_id"), payload.get("issued_at")
+        if not isinstance(client_id, str) or not client_id or len(client_id) > 200:
+            raise ValueError("A bounded client_id is required")
+        if type(issued_at) not in {int, float} or not math.isfinite(issued_at):
+            raise ValueError("A finite issued_at is required")
+        expires_at = payload.get("expires_at", 0)
+        if type(expires_at) not in {int, float} or not math.isfinite(expires_at):
+            raise ValueError("A finite expires_at is required")
+        release = release or expires_at <= 0
+        now = time.time()
+        remaining = expires_at - self._hub_now()
+        if takeover and (release or remaining <= 0):
+            raise ValueError("Takeover presence has expired; reopen the conversation and try again")
+        key = (thread_id, client_id)
+        version = (issued_at, release)
+        previous = self.lease_versions.get(key, (-math.inf, False))
+        if version <= previous:
+            # A presence and takeover may share the browser's millisecond clock
+            # value. Reuse only that still-live lease; the same-time release has
+            # a higher version and always wins. Never revive an expired lease.
+            if takeover and version == previous and self._leases(thread_id, now).get(client_id, 0) > now:
+                return True
+            return False
+        self.lease_versions[key] = version
+        self.presence_seen.add(thread_id)
+        leases = self._leases(thread_id)
+        if release or remaining <= 0:
+            leases.pop(client_id, None)
+        else:
+            leases[client_id] = now + min(remaining, PRESENCE_TTL_SECONDS)
+            self.release_requested.discard(thread_id)
+        return True
+
+    def _require_takeover_presence(self, thread_id: str, payload: dict) -> None:
+        # Legacy direct callers have no browser client. The hub always supplies
+        # its bounded lease, which must remain valid before each acquisition or
+        # external-process action, rather than being applied after side effects.
+        if "client_id" in payload and not self._presence(thread_id, payload, takeover=True):
+            raise ValueError("Takeover presence is stale; reopen the conversation and try again")
+
+    def _thread_busy(self, thread_id: str) -> bool:
+        if thread_id in self.active_turns or self.pending_thread_commands.get(thread_id, 0):
+            return True
+        runtime = self.runtime
+        return bool(
+            runtime
+            and any(
+                message.get("params", {}).get("threadId") == thread_id
+                for message in runtime.server_requests.values()
+            )
+        )
+
+    def _release_due(self, thread_id: str, now: float) -> bool:
+        if self._leases(thread_id, now):
+            return False
+        return (
+            thread_id in self.release_requested
+            or thread_id in self.presence_seen
+            or now - self.last_activity.setdefault(thread_id, now) >= LEGACY_IDLE_SECONDS
+        )
+
+    async def _publish_ownership(self, thread_id: str, **extra) -> dict:
+        runtime = self.runtime
+        managed = bool(runtime and thread_id in runtime.loaded_threads)
+        ownership = await asyncio.to_thread(self.ownership.inspect, thread_id, managed=managed)
+        ownership.update(extra)
+        if runtime:
+            self.store.record_event(
+                runtime.runtime_id,
+                "anywhere/ownership",
+                {"threadId": thread_id, "ownership": ownership},
+            )
+            self.event_wake.set()
+        return ownership
+
+    async def _release_thread(self, thread_id: str, *, explicit: bool = False) -> dict:
+        runtime = self.runtime
+        if self._leases(thread_id):
+            return {
+                "released": False,
+                "retained": True,
+                "deferred": True,
+                "reason": "Another browser tab still holds this conversation",
+            }
+        if not runtime or thread_id not in runtime.loaded_threads:
+            self.release_requested.discard(thread_id)
+            return {"released": True}
+        self.release_requested.add(thread_id)
+        if thread_id in self.unstarted_threads:
+            return {
+                "released": False,
+                "deferred": True,
+                "reason": "Codex has not persisted this empty conversation; release follows its first turn",
+            }
+        if self._thread_busy(thread_id):
+            return {"released": False, "deferred": True}
+        if thread_id in self.release_errors and not explicit:
+            return {"released": False, "error": self.release_errors[thread_id]}
+        closed = self.thread_closed.setdefault(thread_id, asyncio.Event())
+        closed.clear()
+        try:
+            async with asyncio.timeout(THREAD_RELEASE_TIMEOUT):
+                await runtime.request("thread/unsubscribe", {"threadId": thread_id})
+                await closed.wait()
+        except (RpcError, RuntimeGone, TimeoutError) as exc:
+            error = (
+                "Codex did not confirm thread release; upgrade Codex if thread/unsubscribe "
+                "or thread/closed is unsupported"
+                if isinstance(exc, (TimeoutError, RuntimeGone))
+                else str(exc)
+            )
+            self.release_errors[thread_id] = error
+            await self._publish_ownership(thread_id, release_error=error)
+            return {"released": False, "error": error}
+        self.release_errors.pop(thread_id, None)
+        self.release_requested.discard(thread_id)
+        await self._publish_ownership(thread_id)
+        return {"released": True}
+
+    async def _sweep_threads_once(self) -> None:
+        runtime = self.runtime
+        if not runtime:
+            return
+        for thread_id in list(runtime.loaded_threads):
+            lock = self.command_locks.setdefault(thread_id, asyncio.Lock())
+            if lock.locked():
+                continue
+            async with lock:
+                if self.runtime is runtime and self._release_due(thread_id, time.time()):
+                    await self._release_thread(thread_id)
+
+    async def _sweep_threads(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await self._sweep_threads_once()
+            except Exception:
+                log.exception("Unable to release an idle Codex thread")
+
     async def _runtime_exit(self, epoch: str, returncode: int | None) -> None:
         self.store.record_event(epoch, "anywhere/runtime_stopped", {"returncode": returncode})
         self.store.recover_uncertain()
         self.event_wake.set()
+        self.active_turns.clear()
+        self.thread_execution.clear()
+        self.release_errors.clear()
+        self.unstarted_threads.clear()
 
     async def _start_runtime(self) -> None:
         runtime = CodexRuntime(
-            [self.codex_bin, "app-server", "--listen", "stdio://"],
+            [
+                self.codex_bin,
+                "-c",
+                "thread_unload_delay_secs=0",
+                "app-server",
+                "--listen",
+                "stdio://",
+            ],
             self._native_event,
             self._runtime_exit,
         )
@@ -260,6 +484,7 @@ class NodeService:
                             "lazyHistory",
                             "runtimeSettings",
                             "projectInventory",
+                            "threadOwnership",
                         ],
                     }
                 )
@@ -269,6 +494,7 @@ class NodeService:
                 raise ValueError("Hub did not accept the node protocol")
             if welcome.get("host_id") != self.config["host_id"]:
                 raise ValueError("Hub returned a different host identity")
+            self._sync_hub_clock(welcome)
             self.ws = ws
             self.last_pong = asyncio.get_running_loop().time()
             log.info("Connected to hub as %s", self.config.get("name", "node"))
@@ -387,6 +613,32 @@ class NodeService:
 
     async def handle_command(self, command: dict) -> dict | None:
         payload = command.get("payload", {})
+        thread_id = payload.get("native_thread_id")
+        kind = command.get("kind")
+        if kind == "interaction.answer" and self.runtime:
+            request = self.runtime.server_requests.get(json.dumps(payload.get("rpc_id")), {})
+            thread_id = request.get("params", {}).get("threadId")
+        guarded = bool(
+            isinstance(thread_id, str)
+            and kind in {"turn.start", "turn.steer", "turn.interrupt", "interaction.answer"}
+        )
+        if guarded:
+            self.pending_thread_commands[thread_id] = (
+                self.pending_thread_commands.get(thread_id, 0) + 1
+            )
+            self.last_activity[thread_id] = time.time()
+        try:
+            return await self._handle_command(command)
+        finally:
+            if guarded:
+                count = self.pending_thread_commands.get(thread_id, 1) - 1
+                if count:
+                    self.pending_thread_commands[thread_id] = count
+                else:
+                    self.pending_thread_commands.pop(thread_id, None)
+
+    async def _handle_command(self, command: dict) -> dict | None:
+        payload = command.get("payload", {})
         key = payload.get("native_thread_id") or command.get("thread_id") or command["id"]
         if command.get("kind") == "interaction.answer":
             key = "interaction:" + str(payload.get("rpc_id"))
@@ -468,6 +720,45 @@ class NodeService:
             if type(refresh) is not bool:
                 raise ValueError("refresh must be a boolean")
             return await self.capabilities.read(runtime, cwd, refresh=refresh)
+        if kind in {"thread.ownership", "thread.takeover", "thread.presence", "thread.release"}:
+            thread_id = payload.get("native_thread_id")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise ValueError("native_thread_id is required")
+            if kind == "thread.ownership":
+                return await asyncio.to_thread(
+                    self.ownership.inspect, thread_id, managed=thread_id in runtime.loaded_threads
+                )
+            if kind in {"thread.presence", "thread.release"}:
+                changed = self._presence(thread_id, payload, release=kind == "thread.release")
+                if kind == "thread.presence":
+                    return {"accepted": changed, "clients": len(self._leases(thread_id))}
+                if not changed:
+                    return {"released": False, "stale": True}
+                return await self._release_thread(thread_id, explicit=True)
+            self._require_takeover_presence(thread_id, payload)
+            ownership = await asyncio.to_thread(
+                self.ownership.inspect, thread_id, managed=thread_id in runtime.loaded_threads
+            )
+            state = ownership.get("state")
+            if state == "external":
+                if payload.get("confirmed") is not True or not payload.get("owner_token"):
+                    raise ValueError("Confirm the external writer and supply its current owner_token")
+                self._require_takeover_presence(thread_id, payload)
+                try:
+                    await asyncio.to_thread(
+                        self.ownership.terminate, thread_id, payload["owner_token"]
+                    )
+                except (RuntimeError, TimeoutError) as exc:
+                    raise ValueError(str(exc)) from exc
+                ownership = await asyncio.to_thread(self.ownership.inspect, thread_id, managed=False)
+                state = ownership.get("state")
+            if state not in {"managed", "available"}:
+                raise ValueError(ownership.get("reason") or "Cannot safely acquire the thread writer")
+            if thread_id not in runtime.loaded_threads:
+                self._require_takeover_presence(thread_id, payload)
+                await self._resume_thread(runtime, thread_id)
+            self.last_activity[thread_id] = time.time()
+            return {"ownership": await self._publish_ownership(thread_id)}
         if kind == "thread.start":
             cwd = str(resolve_path(payload["cwd"], directory=True))
             settings, revision = requested_settings(payload)
@@ -477,6 +768,24 @@ class NodeService:
             native_id = result["thread"]["id"]
             self.store.save_thread(native_id, cwd)
             runtime.loaded_threads.add(native_id)
+            self.last_activity[native_id] = time.time()
+            self.unstarted_threads.add(native_id)
+            # Codex creates an empty thread's rollout lazily. Setting the user's
+            # requested name persists it without inference, so unloading it does
+            # not destroy the only resumable copy of the new conversation.
+            title = payload.get("title")
+            if isinstance(title, str) and title.strip():
+                try:
+                    await runtime.request(
+                        "thread/name/set", {"threadId": native_id, "name": title.strip()}
+                    )
+                    path = result.get("thread", {}).get("path")
+                    if isinstance(path, str) and Path(path).is_file():
+                        self.unstarted_threads.discard(native_id)
+                except (RpcError, RuntimeGone, OSError):
+                    # Preserve the successful creation response and native ID.
+                    # Older peers can persist the thread on its first real turn.
+                    log.warning("Native conversation naming was unavailable; keeping empty thread loaded")
             fallback = {
                 "approval_policy": params["approvalPolicy"],
                 "sandbox_mode": params["sandbox"],
@@ -518,29 +827,35 @@ class NodeService:
             return await runtime.request("turn/steer", params)
         settings, revision = requested_settings(payload)
         known = self.thread_execution.get(thread_id, {})
-        if kind == "turn.start" and thread_id not in runtime.loaded_threads:
+        if kind == "turn.start" and (
+            thread_id not in runtime.loaded_threads or thread_id in self.release_errors
+        ):
             # Resume original native defaults first. Validation then uses the actual
             # imported model/sandbox rather than the global new-thread defaults.
-            resumed = await runtime.request(
-                "thread/resume",
-                {
-                    "threadId": thread_id,
-                    "cwd": cwd,
-                    "excludeTurns": True,
-                },
-            )
-            runtime.loaded_threads.add(thread_id)
-            # Resume readback is the inherited baseline, not confirmation that
-            # this command's desired settings revision has been applied.
-            self.thread_execution[thread_id] = {
-                "settings": effective_settings(resumed),
-                "sandbox": resumed.get("sandbox"),
-            }
+            await self._resume_thread(runtime, thread_id)
             known = self.thread_execution[thread_id]
         baseline = known.get("settings", {})
         await self.capabilities.validate(runtime, cwd, settings, baseline)
         overrides = turn_overrides(settings, baseline, known.get("sandbox"))
-        result = await runtime.request("turn/start", {**params, **overrides})
+        marker = "pending:" + command["id"]
+        self.active_turns.setdefault(thread_id, marker)
+        try:
+            result = await runtime.request("turn/start", {**params, **overrides})
+        except RpcError:
+            if self.active_turns.get(thread_id) == marker:
+                self.active_turns.pop(thread_id, None)
+            raise
+        turn = result.get("turn", {})
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if isinstance(turn_id, str):
+            self.unstarted_threads.discard(thread_id)
+            if turn_id in self.completed_turns.get(thread_id, set()) or turn.get("status") in {
+                "completed", "failed", "interrupted"
+            }:
+                if self.active_turns.get(thread_id) in {marker, turn_id}:
+                    self.active_turns.pop(thread_id, None)
+            elif self.active_turns.get(thread_id) in {marker, turn_id}:
+                self.active_turns[thread_id] = turn_id
         # A successful turn RPC accepts overrides for this and subsequent turns.
         applied = {**baseline, **settings}
         if "sandboxPolicy" in overrides:
@@ -556,6 +871,28 @@ class NodeService:
             applied,
             raw_result=result,
         )
+
+    async def _resume_thread(self, runtime: CodexRuntime, thread_id: str) -> dict:
+        cwd = self.store.thread_cwd(thread_id)
+        if cwd is None:
+            metadata = await runtime.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+            cwd = metadata.get("thread", {}).get("cwd")
+        cwd = str(resolve_path(cwd, directory=True))
+        resumed = await runtime.request(
+            "thread/resume", {"threadId": thread_id, "cwd": cwd, "excludeTurns": True}
+        )
+        self.store.save_thread(thread_id, cwd)
+        runtime.loaded_threads.add(thread_id)
+        self.thread_closed.setdefault(thread_id, asyncio.Event()).clear()
+        self.thread_execution[thread_id] = {
+            "settings": effective_settings(resumed),
+            "sandbox": resumed.get("sandbox"),
+        }
+        self.last_activity[thread_id] = time.time()
+        self.release_errors.pop(thread_id, None)
+        return resumed
 
     def _execution_result(
         self,
@@ -604,6 +941,7 @@ class NodeService:
                 background = [
                     asyncio.create_task(self._supervise()),
                     asyncio.create_task(self._assets(client)),
+                    asyncio.create_task(self._sweep_threads()),
                 ]
                 await self._network()
         finally:

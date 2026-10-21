@@ -16,6 +16,15 @@ export type Host = {
   capabilities?: string[];
   runtime_id?: string | null;
 };
+export type ThreadOwnership = {
+  state: "managed" | "available" | "external" | "unknown";
+  owners: { pid: number; name: string; started_at?: string | number | null }[];
+  can_terminate: boolean;
+  owner_token: string | null;
+  owner_kind?: "candidate" | "lock_holder";
+  reason?: string;
+  release_error?: string | null;
+};
 export type ExecutionSettings = {
   model?: string;
   effort?: string;

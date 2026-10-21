@@ -7,13 +7,48 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 PROCESS_STOP_TIMEOUT = 5.0
 PIPE_CLOSE_TIMEOUT = 1.0
+
+
+def native_codex_command(command: list[str]) -> list[str]:
+    """Bypass npm's JS launcher so the owned process is the actual writer."""
+    executable = shutil.which(command[0]) or command[0]
+    if os.name != "nt" or not executable.lower().endswith((".cmd", ".bat")):
+        return list(command)
+    wrapper_directory = Path(executable).parent
+    packages = [
+        wrapper_directory / "node_modules" / "@openai" / "codex",
+        wrapper_directory.parent / "@openai" / "codex",  # project node_modules/.bin
+    ]
+    machine = platform.machine().lower()
+    architecture = "arm64" if machine in {"arm64", "aarch64"} else "x64"
+    target = (
+        "aarch64-pc-windows-msvc" if architecture == "arm64" else "x86_64-pc-windows-msvc"
+    )
+    # Both the original bundled layout and the optional platform-package layout
+    # are used by npm releases. Only inspect these installation-owned paths.
+    for package in packages:
+        vendors = [
+            package / "vendor",
+            package / "node_modules" / "@openai" / f"codex-win32-{architecture}" / "vendor",
+            package.parent / f"codex-win32-{architecture}" / "vendor",
+        ]
+        for vendor in vendors:
+            for subdirectory in ("bin", "codex"):
+                binary = vendor / target / subdirectory / "codex.exe"
+                if binary.is_file():
+                    return [str(binary), *command[1:]]
+    raise ValueError(
+        "Cannot locate npm's native Codex executable; use --codex-bin with codex.exe"
+    )
 
 
 class RpcError(Exception):
@@ -56,22 +91,7 @@ class CodexRuntime:
         self.stopped = asyncio.Event()
 
     async def start(self) -> None:
-        command = list(self.command)
-        # Windows npm exposes codex.cmd, which CreateProcess cannot execute directly.
-        # Invoke its installed JS entry point via node.exe without shell interpolation.
-        executable = shutil.which(command[0]) or command[0]
-        if os.name == "nt" and executable.lower().endswith((".cmd", ".bat")):
-            from pathlib import Path
-
-            script = (
-                Path(executable).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-            )
-            node = shutil.which("node")
-            if not node or not script.is_file():
-                raise RuntimeError(
-                    "Use a native Codex executable or install Codex using npm with Node.js"
-                )
-            command = [node, str(script), *command[1:]]
+        command = native_codex_command(self.command)
         self.process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,

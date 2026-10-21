@@ -48,6 +48,7 @@ from .models import (
     new_id,
     thread_activity_at,
 )
+from .ownership import WriterSessions
 from .presentation import browser_event, browser_item
 from .projects import ensure_project
 from .references import quote_references, resolve_references
@@ -309,6 +310,9 @@ def create_app(test_config=None):
     # WebSocket together. Restarting the hub intentionally requires a new login.
     app.extensions["auth_sessions"] = {}
     app.extensions["auth_lock"] = threading.RLock()
+    writers = WriterSessions(app, _issue_command)
+    app.extensions["writer_sessions"] = writers
+    writers.register_routes(_json, _get_thread, _online_host)
     with app.app_context():
         if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
 
@@ -340,6 +344,7 @@ def create_app(test_config=None):
         if isinstance(nonce, str):
             with app.extensions["auth_lock"]:
                 app.extensions["auth_sessions"].pop(nonce, None)
+            writers.release_session(nonce)
 
     def issue_session(username):
         with app.extensions["auth_lock"]:
@@ -479,6 +484,7 @@ def create_app(test_config=None):
             record.value = credentials
             db.session.commit()
             # Only a durable save revokes other browsers and their open sockets.
+            writers.release_all()
             app.extensions["auth_sessions"].clear()
             issue_session(username)
             return jsonify(settings=public_settings(credentials), session=auth_state())

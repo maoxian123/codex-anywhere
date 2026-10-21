@@ -1,4 +1,92 @@
-# Codex Anywhere protocol v4
+# Codex Anywhere protocol v5
+
+## Thread writer ownership and browser leases (v5)
+
+Nodes advertise the independent `threadOwnership` capability. Upgrade the hub,
+browser bundle and nodes together to enable these controls; no database migration
+is needed for this feature. The transport welcome still uses `protocol:1`.
+
+Opening a conversation checks ownership without resuming it or starting inference.
+Authenticated, CSRF-protected browser endpoints journal commands before delivery:
+
+- `POST /api/threads/<id>/ownership` `{}` -> 202 `{command}` (`thread.ownership`).
+  Concurrent pending checks for the same runtime/thread are reused. The result is
+  `{state,owners,can_terminate,owner_token,reason?,owner_kind?,...}`. State is
+  `managed|available|external|unknown`; owner entries contain `pid`, `name` and
+  `started_at`. `managed` means loaded by this node's current app-server, not merely
+  present in the hub's cached history. Permission failures and incomplete process
+  discovery are `unknown`, never proof that a writer is free.
+- `POST /api/threads/<id>/presence` `{client_id,issued_at}` -> 202 `{command}`
+  (`thread.presence`). The hub scopes the page identifier to its authenticated
+  session and supplies an absolute `expires_at` 90 seconds in the future. Browser
+  requests cannot choose a longer lease. The browser renews every 30 seconds only
+  while the selected conversation has had user interaction within five minutes.
+- `POST /api/threads/<id>/release` `{client_id,issued_at}` -> 202 `{command}`
+  (`thread.release`). It removes only this page's lease. Result includes
+  `{released,deferred,reason?,ownership?}`. Another page's valid lease prevents
+  release. Active turns, outstanding start/control commands and pending approvals
+  are retained; release is deferred until work finishes. Switching conversations,
+  page exit and five minutes of user inactivity request release. Logout also
+  journals releases for that authenticated session's known pages. Failed page-exit
+  delivery, crashed browsers and hub outages are covered by the node's lease TTL.
+- `POST /api/threads/<id>/takeover`
+  `{client_id,issued_at,owner_token?,confirmed?:false}` -> 202 `{command}`
+  (`thread.takeover`), result `{ownership}`. A free writer is acquired by resuming
+  the same native thread with `excludeTurns:true`; there is no inference. External
+  process termination requires explicit confirmation and a short-lived node-issued
+  token bound to the inspected process identity and lock file. Arbitrary PIDs are
+  never accepted. The node revalidates identity and waits for actual lock release
+  before resuming. This ends an entire process and can affect its other threads;
+  the browser confirmation names the process and states that impact. Windows
+  Restart Manager candidates are labelled `owner_kind:candidate`, rather than
+  being presented as proven byte-range lock holders. Ambiguous, inaccessible or
+  changed owners cannot be terminated. Successful takeover marks cached history
+  stale so the previous owner's latest native history can be loaded.
+
+`issued_at` is a strictly increasing per-page request-order value. The hub preserves
+it for the node, which ignores older presence/release deliveries; release wins a
+tie. The node uses the hub's absolute expiry, clamped to a 90-second maximum, for
+TTL rather than trusting the browser clock. Duplicate page mutation requests reuse
+their journaled command. An ignored out-of-order request can return 200
+`{command:null,ignored:true}`. Unknown outcomes are never retried automatically.
+Takeover requests superseded by a later page operation return 409. The node also
+checks takeover expiry and request order before any process termination or resume.
+For this capability the welcome carries `server_time` (Unix seconds); nodes map it
+to a monotonic reference when comparing hub-supplied expiries, so ordinary hub/node
+wall-clock differences do not expire valid leases or revive old replayed commands.
+
+Node payloads use `native_thread_id` in place of the hub thread ID. Presence,
+release and takeover additionally carry the session-scoped `client_id`,
+`issued_at` and `expires_at` (`0` for release). Ownership changes are forwarded as
+durable `anywhere/ownership` `{threadId,ownership}` events. Original Codex events,
+including `thread/closed`, remain preserved. Those close/unload events invalidate
+the node's loaded-thread and execution caches so a later message resumes normally.
+
+The node sweeps leases independently of browser and hub lifetimes. Threads used
+without browser leases have a five-minute idle fallback. It starts its own
+app-server with the process-local `thread_unload_delay_secs=0` override and releases
+an idle thread through `thread/unsubscribe`, waiting for `thread/closed`. It never
+edits the user's Codex configuration, deletes writer locks, or stops the shared
+app-server to release a single thread. Unsupported native unloading and release
+timeouts are reported explicitly, without claiming the lock was released. Active
+work survives browser exit and finishes before release; nodes and runtime
+processes remain independent of Flask requests and browser lifetimes. Existing
+approval/sandbox settings are preserved on takeover and subsequent resume.
+
+Native Codex can defer persisting a brand-new empty thread until its first turn.
+After `thread/start`, the node attempts `thread/name/set` using the user's supplied
+title to persist the original thread without inference. If naming is unsupported
+or persistence is not confirmed, the node retains that empty thread and reports
+release as deferred until its first successful turn; it must not unload an empty
+thread that cannot yet be resumed. It never creates a fake turn or silently
+replaces the native thread ID.
+
+Lock inspection uses Codex's `CODEX_HOME/thread-writer-locks` namespace. Linux
+matches kernel locks to file device/inode and verifies same-account Codex process
+identities; Windows uses bounded Restart Manager discovery and stable process
+identity checks. These controls require a native Codex version supporting this
+writer-lock namespace and the unsubscribe/unload protocol. Nodes without
+`threadOwnership` retain their previous browser behavior.
 
 ## Runtime settings, native pages and project inventory (v4)
 

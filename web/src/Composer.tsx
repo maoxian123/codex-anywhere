@@ -30,6 +30,7 @@ import type {
   ThreadDetail,
 } from "./types";
 import { fileName, safeLink } from "./utils";
+import { RemoteCommandError } from "./commands";
 
 function TaskPicker({
   currentId,
@@ -407,6 +408,11 @@ export default function Composer({
       setReferences([]);
       setRetryRequestId(null);
     } catch (reason) {
+      if (
+        reason instanceof RemoteCommandError &&
+        ["failed", "error"].includes(reason.command.status)
+      )
+        setRetryRequestId(null);
       setError(errorText(reason));
     } finally {
       setSending(false);

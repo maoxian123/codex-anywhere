@@ -416,6 +416,9 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 if isinstance(capabilities, list)
                 else []
             )
+            if "threadOwnership" in host.capabilities:
+                # Lease expiries use the hub clock, independent of node clock skew.
+                welcome["server_time"] = time.time()
             if changed:
                 host.runtime_capabilities = None
                 host.capabilities_updated_at = None
@@ -556,6 +559,13 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     host.capabilities_updated_at = time.time()
                 if command.status == "completed" and thread:
                     result = command.result or {}
+                    if command.kind == "thread.takeover" and project_result:
+                        # The previous native owner may have appended history while
+                        # our projection was idle. Reload it before the next turn.
+                        thread.history_stale = True
+                        if thread.status not in {"active", "waiting"}:
+                            thread.status = "idle"
+                            thread.last_error = None
                     if project_result and command.kind in {"thread.start", "turn.start"}:
                         project_effective_settings(
                             thread,

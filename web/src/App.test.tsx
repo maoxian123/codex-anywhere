@@ -10,7 +10,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import App from "./App";
-import type { HubEvent, Thread } from "./types";
+import type { HubEvent, Thread, ThreadOwnership } from "./types";
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -37,7 +37,11 @@ afterEach(() => {
   FakeWebSocket.instances.length = 0;
 });
 
-function setup(threadOverride: Partial<Thread> = {}, pathname = "/tasks/t1") {
+function setup(
+  threadOverride: Partial<Thread> = {},
+  pathname = "/tasks/t1",
+  capabilities: string[] = [],
+) {
   const thread: Thread = {
     id: "t1",
     host_id: "h1",
@@ -106,6 +110,7 @@ function setup(threadOverride: Partial<Thread> = {}, pathname = "/tasks/t1") {
             name: "测试设备",
             platform: "windows",
             online: true,
+            capabilities,
           },
         ],
       };
@@ -161,6 +166,319 @@ function setup(threadOverride: Partial<Thread> = {}, pathname = "/tasks/t1") {
     },
   };
 }
+
+function ownershipServer(
+  initial: ThreadOwnership,
+  releaseResult?: Record<string, unknown>,
+) {
+  const server = setup({ native_id: "native-t1" }, "/tasks/t1", [
+    "threadOwnership",
+  ]);
+  let state = initial;
+  const requests: {
+    path: string;
+    data: Record<string, unknown>;
+    init?: RequestInit;
+  }[] = [];
+  server.intercept((path, init) => {
+    if (
+      !/^\/api\/threads\/t1\/(ownership|presence|release|takeover|messages)$/.test(
+        path,
+      )
+    )
+      return;
+    const data = JSON.parse(String(init?.body || "{}")) as Record<
+      string,
+      unknown
+    >;
+    requests.push({ path, data, init });
+    let result: unknown = {};
+    if (path.endsWith("/ownership")) result = state;
+    if (path.endsWith("/takeover")) {
+      state = {
+        state: "managed",
+        owners: [],
+        can_terminate: false,
+        owner_token: null,
+      };
+      result = { ownership: state };
+    }
+    if (path.endsWith("/release")) {
+      if (releaseResult) result = releaseResult;
+      else {
+        state = {
+          state: "available",
+          owners: [],
+          can_terminate: false,
+          owner_token: null,
+        };
+        result = { released: true, deferred: false, ownership: state };
+      }
+    }
+    if (path.endsWith("/messages")) {
+      state = {
+        state: "external",
+        owners: [{ pid: 512, name: "codex" }],
+        can_terminate: true,
+        owner_token: "changed",
+      };
+      return new Response(
+        JSON.stringify({
+          command: {
+            id: "failed-message",
+            kind: "turn.start",
+            status: "failed",
+            error: "thread native-t1 already has an active writer",
+          },
+        }),
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        command: {
+          id: `cmd-${requests.length}`,
+          kind: path.split("/").at(-1),
+          status: "completed",
+          result,
+        },
+      }),
+    );
+  });
+  return {
+    ...server,
+    requests,
+    setOwnership: (value: ThreadOwnership) => {
+      state = value;
+    },
+  };
+}
+
+test("external writer takeover requires PID confirmation and never sends the draft automatically", async () => {
+  const server = ownershipServer({
+    state: "external",
+    owners: [{ pid: 512, name: "codex", started_at: 1750000000 }],
+    owner_kind: "candidate",
+    can_terminate: true,
+    owner_token: "identity",
+  });
+  const input = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  fireEvent.change(input, { target: { value: "保留我的草稿" } });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "结束进程并接管" }),
+  );
+  await screen.findByRole("heading", { name: "结束占用进程并接管" });
+  assert.match(screen.getByRole("dialog").textContent || "", /PID 512/);
+  assert.match(screen.getByRole("dialog").textContent || "", /其他会话/);
+  assert.ok(
+    screen
+      .getByRole("dialog")
+      .textContent?.includes(new Date(1750000000 * 1000).toLocaleString()),
+  );
+  assert.equal(
+    server.requests.filter((entry) => entry.path.endsWith("/takeover")).length,
+    0,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "确认结束并接管" }));
+  await screen.findByText("本项目托管");
+  const takeover = server.requests.find((entry) =>
+    entry.path.endsWith("/takeover"),
+  )!;
+  assert.equal(takeover.data.confirmed, true);
+  assert.equal(takeover.data.owner_token, "identity");
+  assert.equal(typeof takeover.data.client_id, "string");
+  assert.equal(typeof takeover.data.issued_at, "number");
+  assert.equal((input as HTMLTextAreaElement).value, "保留我的草稿");
+  assert.equal(
+    server.requests.filter((entry) => entry.path.endsWith("/messages")).length,
+    0,
+  );
+});
+
+test("a writer conflict checks ownership and preserves the failed message draft", async () => {
+  const server = ownershipServer({
+    state: "available",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+  });
+  const input = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  await screen.findByText("可接管");
+  fireEvent.change(input, { target: { value: "继续之前的任务" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await screen.findByRole("button", { name: "结束进程并接管" });
+  assert.equal((input as HTMLTextAreaElement).value, "继续之前的任务");
+  assert.equal(
+    server.requests.filter((entry) => entry.path.endsWith("/messages")).length,
+    1,
+  );
+  assert.ok(
+    server.requests.filter((entry) => entry.path.endsWith("/ownership"))
+      .length >= 2,
+  );
+});
+
+test("leaving the conversation releases this tab's lease with a later timestamp", async () => {
+  const server = ownershipServer({
+    state: "managed",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+  });
+  await screen.findByText("本项目托管");
+  fireEvent.click(screen.getByLabelText("设备与设置"));
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+  await screen.findByRole("textbox", { name: "管理员用户名" });
+  await waitFor(() =>
+    assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
+  );
+  const lease = server.requests.filter((entry) =>
+    /\/(presence|release)$/.test(entry.path),
+  );
+  const release = lease.at(-1)!;
+  assert.equal(release.path, "/api/threads/t1/release");
+  assert.equal(release.init?.keepalive, true);
+  assert.equal(release.data.client_id, lease[0].data.client_id);
+  assert.ok(Number(release.data.issued_at) > Number(lease[0].data.issued_at));
+});
+
+test("manual release and native ownership events update the displayed management state", async () => {
+  const server = ownershipServer({
+    state: "managed",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
+  await screen.findByText("可接管");
+  const count = server.requests.filter((entry) =>
+    entry.path.endsWith("/release"),
+  ).length;
+  assert.equal(count, 1);
+  server.event("anywhere/ownership", {
+    ownership: {
+      state: "managed",
+      owners: [],
+      can_terminate: false,
+      owner_token: null,
+    },
+  });
+  await screen.findByText("本项目托管");
+  server.setOwnership({
+    state: "unknown",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+    reason: "没有足够权限确认占用进程",
+  });
+  server.event("thread/status/changed", { status: { type: "notLoaded" } });
+  await screen.findByText("占用状态未确定");
+  assert.ok(screen.getByText("没有足够权限确认占用进程"));
+  assert.ok(!screen.queryByRole("button", { name: "结束进程并接管" }));
+});
+
+test("pagehide releases with keepalive and pageshow restores only browser presence", async () => {
+  const server = ownershipServer({
+    state: "managed",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+  });
+  await screen.findByText("本项目托管");
+  act(() => window.dispatchEvent(new Event("pagehide")));
+  await waitFor(() =>
+    assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
+  );
+  assert.equal(
+    server.requests.find((entry) => entry.path.endsWith("/release"))?.init
+      ?.keepalive,
+    true,
+  );
+  act(() => window.dispatchEvent(new Event("pageshow")));
+  await waitFor(() =>
+    assert.equal(
+      server.requests.filter((entry) => entry.path.endsWith("/presence"))
+        .length,
+      2,
+    ),
+  );
+  assert.equal(
+    server.requests.filter((entry) => /\/(takeover|messages)$/.test(entry.path))
+      .length,
+    0,
+  );
+});
+
+for (const result of [
+  { released: false, error: "无法释放：当前节点不支持立即卸载" },
+  { released: false, deferred: false },
+]) {
+  test(`release failures never display a success notice: ${JSON.stringify(result)}`, async () => {
+    ownershipServer(
+      { state: "managed", owners: [], can_terminate: false, owner_token: null },
+      result,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
+    await screen.findByText(
+      result.error || "释放托管失败，请重新检查占用状态。",
+    );
+    assert.ok(!screen.queryByText(/已释放托管/));
+    assert.ok(screen.getByText("本项目托管"));
+  });
+}
+
+test("deferred manual release remains paused while browsing, and sending explicitly renews presence", async () => {
+  const server = ownershipServer(
+    { state: "managed", owners: [], can_terminate: false, owner_token: null },
+    {
+      released: false,
+      deferred: true,
+      reason: "当前任务执行结束后释放托管",
+    },
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
+  await screen.findByText("当前任务执行结束后释放托管");
+  fireEvent.pointerDown(document);
+  fireEvent.wheel(document);
+  fireEvent.keyDown(document, { key: "ArrowDown" });
+  fireEvent.scroll(document);
+  assert.equal(
+    server.requests.filter((entry) => entry.path.endsWith("/presence")).length,
+    1,
+  );
+  const input = screen.getByRole("textbox", { name: "发送消息给 Codex" });
+  fireEvent.change(input, { target: { value: "继续执行" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await waitFor(() =>
+    assert.equal(
+      server.requests.filter((entry) => entry.path.endsWith("/presence"))
+        .length,
+      2,
+    ),
+  );
+});
+
+test("retained leases show the other page explanation and native release errors remain visible", async () => {
+  const server = ownershipServer(
+    { state: "managed", owners: [], can_terminate: false, owner_token: null },
+    { released: false, retained: true },
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
+  await screen.findByText("其他页面仍在使用此会话，当前托管将继续保留。");
+  server.event("anywhere/ownership", {
+    ownership: {
+      state: "managed",
+      owners: [],
+      can_terminate: false,
+      owner_token: null,
+    },
+    release_error: "释放失败：有未保存的临时会话",
+  });
+  await screen.findByText("释放失败：有未保存的临时会话");
+});
 
 test("application settings open from the sidebar and conversations remain reachable", async () => {
   setup();

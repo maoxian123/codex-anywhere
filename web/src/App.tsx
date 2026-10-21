@@ -29,6 +29,8 @@ import ProjectNavigation from "./ProjectNavigation";
 import SidebarMenu from "./SidebarMenu";
 import SettingsPage from "./SettingsPage";
 import Timeline from "./Timeline";
+import OwnershipPanel from "./OwnershipPanel";
+import { useThreadOwnership, writerConflict } from "./useThreadOwnership";
 import { commandFailure, eventFailure } from "./runtime-errors";
 import {
   latestHistory,
@@ -56,6 +58,7 @@ import type {
   Project,
   ThreadPage,
   ExecutionSettings,
+  ThreadOwnership,
 } from "./types";
 import { busyStatus, object, statusLabels, string } from "./utils";
 
@@ -161,6 +164,14 @@ function Workspace({
   selectedRef.current = route.id;
   searchRef.current = search;
   listScopeRef.current = { projectFilter, listPages };
+  const selectedHost = hosts.find((host) => host.id === detail?.thread.host_id);
+  const ownershipEnabled = Boolean(
+    detail?.thread.id === route.id &&
+    detail.thread.native_id &&
+    selectedHost?.online &&
+    selectedHost.capabilities?.includes("threadOwnership"),
+  );
+  const ownership = useThreadOwnership(route.id, ownershipEnabled);
 
   const navigate = useCallback((id: string, item?: string) => {
     const url = id
@@ -528,7 +539,31 @@ function Workspace({
     if (!method.includes("/delta") && !method.endsWith("/outputDelta"))
       scheduleRefresh(true);
     const failure = eventFailure(event);
-    if (failure && current) setError(failure);
+    if (failure && current) {
+      setError(failure);
+      if (writerConflict(failure)) void ownership.check();
+    }
+    if (current && method === "anywhere/ownership") {
+      const value = object(event.params.ownership);
+      if (
+        ["managed", "available", "external", "unknown"].includes(
+          string(value.state),
+        )
+      )
+        ownership.update({
+          ...value,
+          ...(typeof event.params.release_error === "string"
+            ? { release_error: event.params.release_error }
+            : {}),
+        } as ThreadOwnership);
+    } else if (
+      current &&
+      (method === "thread/closed" ||
+        (method.startsWith("thread/status") &&
+          (event.params.status === "notLoaded" ||
+            object(event.params.status).type === "notLoaded")))
+    )
+      void ownership.check();
   };
 
   useEffect(() => {
@@ -612,7 +647,10 @@ function Workspace({
             ].includes(value.status)
           ) {
             const failure = commandFailure(value);
-            if (failure && threadId === selectedRef.current) setError(failure);
+            if (failure && threadId === selectedRef.current) {
+              setError(failure);
+              if (writerConflict(failure)) void ownership.check();
+            }
             scheduleRefresh();
             scheduleRefresh(true);
             commandWatches.current.delete(command.id);
@@ -636,18 +674,32 @@ function Workspace({
       };
       setTimeout(() => void poll(), 350);
     },
-    [scheduleRefresh],
+    [scheduleRefresh, ownership.check],
   );
 
   const sendMessage = async (payload: MessagePayload, steer: boolean) => {
-    const result = await post<{ command: Command }>(
-      `/threads/${route.id}/${steer ? "steer" : "messages"}`,
-      payload,
-    );
-    watchCommand(result.command, route.id);
-    if (route.id === selectedRef.current) setError("");
-    scheduleRefresh();
-    scheduleRefresh(true);
+    const id = route.id;
+    try {
+      if (ownershipEnabled) await ownership.ensurePresence();
+      const result = await post<{ command: Command }>(
+        `/threads/${id}/${steer ? "steer" : "messages"}`,
+        payload,
+      );
+      if (ownershipEnabled) {
+        // A failed resume must leave the draft intact. Waiting ends when the
+        // start RPC is accepted, independently of the model's running turn.
+        await waitForCommand(result.command);
+        if (id === selectedRef.current) void ownership.check();
+      } else watchCommand(result.command, id);
+      if (id === selectedRef.current) setError("");
+      scheduleRefresh();
+      scheduleRefresh(true);
+    } catch (reason) {
+      if (id === selectedRef.current && writerConflict(errorText(reason)))
+        void ownership.check();
+      scheduleRefresh();
+      throw reason;
+    }
   };
   const saveThreadSettings = async (settings: ExecutionSettings) => {
     const thread = detail?.thread;
@@ -696,6 +748,7 @@ function Workspace({
   };
   const logout = async () => {
     try {
+      await ownership.releaseOnExit();
       await post("/auth/logout", {});
       const value = await api<Session>("/auth/me");
       setSession(value);
@@ -705,7 +758,6 @@ function Workspace({
       setError(errorText(reason));
     }
   };
-  const selectedHost = hosts.find((host) => host.id === detail?.thread.host_id);
   const historyBusy = useAutomaticHistory({
     selectionId: route.id,
     thread: detail?.thread,
@@ -940,6 +992,21 @@ function Workspace({
               <div className="thread-error">
                 <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
               </div>
+            )}
+            {ownershipEnabled && (
+              <OwnershipPanel
+                key={`ownership:${route.id}`}
+                ownership={ownership.ownership}
+                pending={ownership.pending}
+                error={ownership.error}
+                notice={ownership.notice}
+                onCheck={() => void ownership.check()}
+                onTakeover={async (confirmed) => {
+                  await ownership.takeover(confirmed);
+                  await refreshThread();
+                }}
+                onRelease={() => void ownership.release()}
+              />
             )}
             {historyError && (
               <div className="thread-error">
