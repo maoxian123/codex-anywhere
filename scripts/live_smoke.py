@@ -76,7 +76,6 @@ class LiveSystem:
         self.host = pair_node(
             self.url,
             f"Live verification · {platform.system()}",
-            [str(self.workspace)],
             directory / "node",
             code,
         )
@@ -408,16 +407,150 @@ class LiveSystem:
 
         self.record("real_web_search", web_search)
 
+    def run_projects(self, native_id, expected_context=""):
+        """Import an explicitly selected existing session without creating a model turn."""
+
+        def projects():
+            outside = self.directory / "another-project"
+            opened = self.command(
+                self.post(
+                    "/api/projects",
+                    dict(
+                        host_id=self.host["id"],
+                        cwd=str(outside),
+                        name="跨目录验收项目",
+                        create_directory=True,
+                    ),
+                )["command"]
+            )["result"]["project"]
+            assert outside.is_dir() and Path(opened["cwd"]) == outside
+            listing = self.command(
+                self.post(
+                    f"/api/hosts/{self.host['id']}/directories",
+                    dict(
+                        path=str(self.directory),
+                    ),
+                )["command"]
+            )["result"]
+            assert any(Path(entry["path"]) == outside for entry in listing["directories"])
+            return dict(project_id=opened["id"], cwd=opened["cwd"])
+
+        self.record("real_directory_browser_and_new_project", projects)
+
+        def catalog():
+            result = self.command(
+                self.post(
+                    f"/api/hosts/{self.host['id']}/catalog",
+                    dict(
+                        limit=50,
+                    ),
+                )["command"]
+            )["result"]
+            assert isinstance(result["data"], list) and result["data"]
+            return dict(count=len(result["data"]), has_next_page=bool(result.get("nextCursor")))
+
+        self.record("real_existing_codex_catalog", catalog)
+
+        def imported():
+            result = self.post(
+                f"/api/hosts/{self.host['id']}/imports", dict(native_thread_id=native_id)
+            )
+            self.import_thread_id = result["thread"]["id"]
+            self.command(result["command"])
+            history = wait_for(
+                lambda: (
+                    value
+                    if (value := self.history(self.import_thread_id))["thread"]["history_loaded"]
+                    else None
+                ),
+                "all imported history projected",
+                self.timeout,
+            )
+            assert history["thread"]["native_id"] == native_id
+            assert len(history["items"]) >= 2
+            positions = [item["position"] for item in history["items"]]
+            assert positions == sorted(positions) and len(positions) == len(set(positions))
+            assert history["thread"]["project_id"]
+            return dict(
+                thread_id=self.import_thread_id,
+                item_count=len(positions),
+                original_native_id=True,
+                cwd=history["thread"]["cwd"],
+            )
+
+        self.record("real_history_import", imported)
+
+        def images():
+            def ready():
+                history = self.history(self.import_thread_id)
+                assets = [
+                    asset for item in history["items"] for asset in item["data"].get("_assets", [])
+                ]
+                return assets or None
+
+            assets = wait_for(ready, "historical image uploads", 60)
+            for asset in assets:
+                assert self.client.get(asset["url"]).status_code == 200
+            return dict(image_count=len(assets))
+
+        self.record("real_imported_images", images)
+
+        def duplicate():
+            before = self.history(self.import_thread_id)
+            result = self.post(
+                f"/api/hosts/{self.host['id']}/imports", dict(native_thread_id=native_id)
+            )
+            assert result["thread"]["id"] == self.import_thread_id
+            self.command(result["command"])
+            after = wait_for(
+                lambda: (
+                    h
+                    if (h := self.history(self.import_thread_id))["thread"]["history_loaded"]
+                    else None
+                ),
+                "reimport projected",
+                self.timeout,
+            )
+            assert len(after["items"]) == len(before["items"])
+            return dict(same_thread=True, no_duplicate_items=True)
+
+        self.record("real_duplicate_import", duplicate)
+
+        def continued():
+            marker = "IMPORT_CONTINUE_OK_" + secrets.token_hex(4)
+            prompt = f"继续这个已有会话进行验收。不要调用工具，只回复 {marker}。"
+            if expected_context:
+                prompt += "并附上本会话最开始的 TASK_NONCE_ 开头完整校验串，从历史中读取。"
+            self.send(self.import_thread_id, prompt)
+            history, text = self.answer(self.import_thread_id)
+            assert marker in text, text
+            if expected_context:
+                assert expected_context in text, text
+            assert history["thread"]["native_id"] == native_id
+            return dict(
+                thread_id=self.import_thread_id,
+                original_native_id=True,
+                recalled_history=bool(expected_context),
+                answer=text,
+            )
+
+        self.record("real_continue_imported_original_thread", continued)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=5010)
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--projects-only", action="store_true")
+    parser.add_argument("--import-native-id", help="Explicit existing test session to import")
+    parser.add_argument("--expected-context", default="")
     parser.add_argument(
         "--hold", action="store_true", help="Keep the isolated hub for manual checks"
     )
     args = parser.parse_args()
+    if args.projects_only and not args.import_native_id:
+        parser.error("--projects-only requires --import-native-id")
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     directory = Path("instance/live-tests") / (
         time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
@@ -429,7 +562,10 @@ def main():
     interrupted = False
     try:
         system = LiveSystem(directory, args.port, args.codex_bin, args.timeout)
-        system.run()
+        if args.projects_only:
+            system.run_projects(args.import_native_id, args.expected_context)
+        else:
+            system.run()
     except KeyboardInterrupt:
         interrupted = True
         failed = True

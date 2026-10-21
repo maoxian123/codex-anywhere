@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import time
 
 from .models import Asset, Command, Event, Host, Interaction, Item, Thread, db
+from .projects import ensure_project
 
 
 def emit(method, params, thread_id=None, host_id=None):
@@ -80,7 +82,13 @@ def _refresh_waiting(thread):
         thread.status = "active" if thread.active_turn_id else "idle"
 
 
-def _put_item(thread, data, turn_id):
+def _next_position(thread):
+    return (
+        db.session.query(db.func.max(Item.position)).filter_by(thread_id=thread.id).scalar() or 0
+    ) + 1
+
+
+def _put_item(thread, data, turn_id, position=None, created_at=None):
     native_id = data.get("id")
     if not native_id:
         return
@@ -93,8 +101,13 @@ def _put_item(thread, data, turn_id):
             turn_id=turn_id,
             type=data.get("type", "unknown"),
             data={},
+            position=position if position is not None else _next_position(thread),
         )
+        if created_at is not None:
+            item.created_at = created_at
         db.session.add(item)
+    elif position is not None:
+        item.position = position
     item.type = data.get("type", item.type)
     item.turn_id = turn_id or item.turn_id
     value = copy.deepcopy(data)
@@ -127,8 +140,98 @@ def _put_item(thread, data, turn_id):
     item.data = value
 
 
+def _native_time(value, fallback):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        if 0 < value < 253402300799:
+            return float(value)
+    return fallback
+
+
+def _matching_import(thread, params):
+    command_id = params.get("commandId")
+    if not isinstance(command_id, str):
+        return None
+    command = Command.query.filter_by(
+        id=command_id, host_id=thread.host_id, thread_id=thread.id, kind="thread.import"
+    ).first()
+    if command is None or command.status in {"failed", "unknown"}:
+        return None
+    if thread.history_loaded or thread.status in {"active", "waiting"}:
+        return None
+    newer = Command.query.filter(
+        Command.thread_id == thread.id,
+        Command.kind == "thread.import",
+        Command.created_at > command.created_at,
+    ).first()
+    return None if newer else command
+
+
+def _project_import(thread, method, params, live):
+    if not live:
+        return
+    command = _matching_import(thread, params)
+    if command is None:
+        return
+    if method == "anywhere/import_metadata":
+        native = params.get("thread")
+        if not isinstance(native, dict) or native.get("id") != thread.native_id:
+            raise ValueError("导入会话元数据不匹配")
+        cwd = native.get("cwd")
+        if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+            raise ValueError("Codex 会话没有有效项目目录")
+        host = db.session.get(Host, thread.host_id)
+        project = ensure_project(host, cwd)
+        thread.cwd = cwd
+        thread.project_id = project.id
+        title = native.get("name") or native.get("preview") or thread.title
+        thread.title = str(title).strip()[:240] or "导入会话"
+        thread.created_at = _native_time(native.get("createdAt"), thread.created_at)
+        metadata = {key: value for key, value in native.items() if key != "turns"}
+        command.result = {**(command.result or {}), "thread": metadata}
+    elif method == "anywhere/import_item":
+        item, position = params.get("item"), params.get("position")
+        if not isinstance(item, dict) or type(position) is not int or not 1 <= position < 2**63:
+            raise ValueError("导入消息或排序位置无效")
+        _put_item(
+            thread,
+            item,
+            params.get("turnId"),
+            position=position,
+            created_at=_native_time(params.get("createdAt"), thread.created_at),
+        )
+    elif method == "anywhere/import_complete":
+        native = (command.result or {}).get("thread", {})
+        # A fresh import can reflect a native rollback. Only replace the query
+        # projection after all new items arrived; keep the durable event history.
+        imported_id = Event.params["item"]["id"].as_string()
+        imported_ids = db.session.query(imported_id).filter(
+            Event.thread_id == thread.id,
+            Event.method == "anywhere/import_item",
+            Event.params["commandId"].as_string() == command.id,
+            imported_id.isnot(None),
+        )
+        Item.query.filter(Item.thread_id == thread.id, Item.native_id.not_in(imported_ids)).delete(
+            synchronize_session=False
+        )
+        thread.status = "idle"
+        thread.active_turn_id = None
+        thread.last_error = None
+        thread.history_loaded = True
+        thread.updated_at = _native_time(native.get("updatedAt"), time.time())
+        thread.imported = True
+        # The durable completion is definitive evidence for this read-only
+        # operation even if its separate RPC summary is lost during reconnect.
+        command.result = {**(command.result or {}), "itemCount": params.get("itemCount", 0)}
+        command.status = "completed"
+        command.error = None
+        command.updated_at = time.time()
+
+
 def _project(thread, method, params, live=True):
     if not thread:
+        return
+    if method in {"anywhere/import_metadata", "anywhere/import_item", "anywhere/import_complete"}:
+        _project_import(thread, method, params, live)
         return
     if live:
         thread.updated_at = time.time()
@@ -147,6 +250,7 @@ def _project(thread, method, params, live=True):
                 turn_id=turn_id,
                 type="agentMessage",
                 data={"id": native_id, "type": "agentMessage", "text": ""},
+                position=_next_position(thread),
             )
             db.session.add(item)
         data = dict(item.data)
@@ -252,7 +356,6 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
             changed = host.runtime_id and host.runtime_id != epoch
             host.runtime_id = epoch
             host.version = str(message.get("version", host.version))[:120]
-            # Roots are granted at pairing, never silently expanded through hello.
             if changed:
                 for interaction in Interaction.query.filter(
                     Interaction.host_id == host_id,
@@ -275,8 +378,10 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     affected = (
                         db.session.get(Thread, command.thread_id) if command.thread_id else None
                     )
-                    if affected and command.kind in {"thread.start", "turn.start"}:
-                        affected.status = "interrupted"
+                    if affected and command.kind in {"thread.start", "turn.start", "thread.import"}:
+                        affected.status = (
+                            "error" if command.kind == "thread.import" else "interrupted"
+                        )
                         affected.active_turn_id = None
                         affected.last_error = command.error
                 else:
@@ -331,6 +436,12 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     Command.created_at > command.created_at,
                 ).first()
                 project_result = project_result and newer_start is None
+            if thread and command.kind == "thread.import":
+                project_result = (
+                    project_result
+                    and thread.status == "importing"
+                    and _matching_import(thread, {"commandId": command.id}) is not None
+                )
             command.updated_at = time.time()
             if kind == "command_started":
                 command.status = "running"
@@ -341,7 +452,19 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     else ("failed" if message.get("error") else "completed")
                 )
                 command.error = str(message["error"])[:8000] if message.get("error") else None
+                previous_result = command.result
                 command.result = message.get("result")
+                if command.kind == "thread.import" and isinstance(command.result, dict):
+                    command.result = {**(previous_result or {}), **command.result}
+                if command.status == "completed" and command.kind == "project.open":
+                    result = command.result or {}
+                    directory = result.get("project", result)
+                    cwd = directory.get("cwd") if isinstance(directory, dict) else None
+                    if not isinstance(cwd, str) or not cwd:
+                        command.status, command.error = "failed", "节点未返回项目目录"
+                    else:
+                        project = ensure_project(host, cwd, directory.get("name"))
+                        command.result = {"project": project.as_dict()}
                 if command.status == "completed" and thread:
                     result = command.result or {}
                     if command.kind == "thread.start":
@@ -354,6 +477,10 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         else:
                             thread.native_id = str(native["id"])
                             if project_result:
+                                cwd = native.get("cwd") or thread.cwd
+                                if isinstance(cwd, str) and cwd:
+                                    thread.cwd = cwd
+                                    thread.project_id = ensure_project(host, cwd).id
                                 thread.status = "idle"
                                 thread.last_error = None
                     elif command.kind == "turn.start" and project_result:
@@ -362,8 +489,16 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                             thread.active_turn_id = (
                                 turn.get("id") or result.get("turnId") or thread.active_turn_id
                             )
-                elif thread and command.kind in {"thread.start", "turn.start"} and project_result:
-                    thread.status = "interrupted" if command.status == "unknown" else "error"
+                elif (
+                    thread
+                    and command.kind in {"thread.start", "turn.start", "thread.import"}
+                    and project_result
+                ):
+                    thread.status = (
+                        "interrupted"
+                        if command.status == "unknown" and command.kind != "thread.import"
+                        else "error"
+                    )
                     thread.active_turn_id = None
                     thread.last_error = command.error or "Codex 指令未成功完成"
                 if command.kind == "interaction.answer":
@@ -450,8 +585,8 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
             ):
                 interaction.status = "expired"
             for active in Thread.query.filter_by(host_id=host_id):
-                if active.status in {"waiting", "active"}:
-                    active.status = "interrupted"
+                if active.status in {"waiting", "active", "importing"}:
+                    active.status = "error" if active.status == "importing" else "interrupted"
                     active.active_turn_id = None
                     code = params.get("returncode")
                     active.last_error = "Codex 进程已停止，当前执行已中断" + (

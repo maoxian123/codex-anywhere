@@ -23,7 +23,6 @@ class Host(db.Model):
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     name = db.Column(db.String(120), nullable=False)
     platform = db.Column(db.String(80), nullable=False)
-    roots = db.Column(db.JSON, nullable=False, default=list)
     token_hash = db.Column(db.String(64), nullable=False, unique=True)
     version = db.Column(db.String(120), default="")
     runtime_id = db.Column(db.String(100), nullable=True)
@@ -34,7 +33,6 @@ class Host(db.Model):
             id=self.id,
             name=self.name,
             platform=self.platform,
-            roots=self.roots,
             version=self.version,
             online=online,
             last_seen_at=iso(self.last_seen_at),
@@ -48,16 +46,43 @@ class Pairing(db.Model):
     consumed = db.Column(db.Boolean, default=False, nullable=False)
 
 
+class Project(db.Model):
+    __table_args__ = (db.UniqueConstraint("host_id", "cwd_key"),)
+    id = db.Column(db.String(32), primary_key=True, default=new_id)
+    host_id = db.Column(db.String(32), db.ForeignKey("host.id"), nullable=False, index=True)
+    name = db.Column(db.String(240), nullable=False)
+    cwd = db.Column(db.Text, nullable=False)
+    cwd_key = db.Column(db.String(64), nullable=False)
+    created_at = db.Column(db.Float, default=time.time, nullable=False)
+    updated_at = db.Column(db.Float, default=time.time, nullable=False)
+
+    def as_dict(self, thread_count=None):
+        if thread_count is None:
+            thread_count = Thread.query.filter_by(project_id=self.id).count()
+        return dict(
+            id=self.id,
+            host_id=self.host_id,
+            name=self.name,
+            cwd=self.cwd,
+            thread_count=thread_count,
+            created_at=iso(self.created_at),
+            updated_at=iso(self.updated_at),
+        )
+
+
 class Thread(db.Model):
     __table_args__ = (db.UniqueConstraint("host_id", "native_id"),)
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     host_id = db.Column(db.String(32), db.ForeignKey("host.id"), nullable=False, index=True)
+    project_id = db.Column(db.String(32), db.ForeignKey("project.id"), nullable=True, index=True)
     native_id = db.Column(db.String(200), nullable=True)
     title = db.Column(db.String(240), nullable=False)
     cwd = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(24), default="starting", nullable=False)
     active_turn_id = db.Column(db.String(200), nullable=True)
     last_error = db.Column(db.Text, nullable=True)
+    imported = db.Column(db.Boolean, default=False, nullable=False)
+    history_loaded = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.Float, default=time.time, nullable=False)
     updated_at = db.Column(db.Float, default=time.time, nullable=False, index=True)
 
@@ -65,12 +90,15 @@ class Thread(db.Model):
         return dict(
             id=self.id,
             host_id=self.host_id,
+            project_id=self.project_id,
             native_id=self.native_id,
             title=self.title,
             cwd=self.cwd,
             status=self.status,
             active_turn_id=self.active_turn_id,
             last_error=self.last_error,
+            imported=self.imported,
+            history_loaded=self.history_loaded,
             created_at=iso(self.created_at),
             updated_at=iso(self.updated_at),
         )
@@ -115,6 +143,7 @@ class Item(db.Model):
     turn_id = db.Column(db.String(200), nullable=True)
     type = db.Column(db.String(100), nullable=False)
     data = db.Column(db.JSON, nullable=False)
+    position = db.Column(db.BigInteger, default=0, nullable=False)
     created_at = db.Column(db.Float, default=time.time, nullable=False)
 
     def as_dict(self):
@@ -125,6 +154,7 @@ class Item(db.Model):
             turn_id=self.turn_id,
             type=self.type,
             data=self.data,
+            position=self.position,
             created_at=iso(self.created_at),
         )
 

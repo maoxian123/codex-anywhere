@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from functools import wraps
 
 
 class FullWriteSocket:
@@ -35,9 +37,31 @@ class FullWriteSocket:
 
 
 def install_full_writes(ws):
-    """Cover application frames and the library's ping/pong/close writer alike."""
+    """Complete writes and finish server-initiated close independently of its reader."""
     if not isinstance(ws.sock, FullWriteSocket):
         ws.sock = FullWriteSocket(ws.sock)
+        original_close = getattr(ws, "close", None)
+        if original_close is None:
+            return
+
+        @wraps(original_close)
+        def close(*args, **kwargs):
+            try:
+                return original_close(*args, **kwargs)
+            finally:
+                # simple-websocket only sets connected=False after sending the
+                # Close frame. Its concurrent reader can overwrite that flag
+                # with an earlier _handle_events() result and wait for the next
+                # ping before closing TCP. A peer may already have both Close
+                # frames yet cannot finish recv() until it observes EOF.
+                ws.connected = False
+                ws.event.set()
+                try:
+                    ws.sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        ws.close = close
 
 
 @dataclass

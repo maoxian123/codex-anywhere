@@ -4,7 +4,7 @@ This repository implements a Codex-only control plane. Read `docs/protocol.md` b
 
 - Preserve native Codex Thread / Turn / Item payloads and unknown events.
 - Keep runtime processes independent from Flask requests and browser lifetimes.
-- Never silently disable Codex approvals or widen paired project roots.
+- Preserve native Codex approvals and sandbox settings. Project directory allowlists are intentionally absent; any absolute directory available to the node account may be selected.
 - Journal commands before delivery. Unknown execution outcomes must not be automatically retried.
 - Keep credentials, `.venv`, node state, databases, generated frontend output and attachments out of Git.
 - For structural code exploration, use the project's CodeGraph tools when indexed. If `.codegraph/` is absent or the server reports not initialized, ask whether to run `codegraph init -i`; do not initialize without the user's answer. Do not delegate architecture exploration.

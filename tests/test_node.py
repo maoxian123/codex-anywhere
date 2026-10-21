@@ -15,7 +15,7 @@ import pytest
 from PIL import Image
 
 from codex_anywhere.node.assets import AssetBridge, extract_images, markdown_local_images
-from codex_anywhere.node.config import checked_path, node_lock, validate_server
+from codex_anywhere.node.config import load_config, node_lock, resolve_path, validate_server
 from codex_anywhere.node.runtime import CodexRuntime, RuntimeGone
 from codex_anywhere.node.service import NodeService, pair_node
 from codex_anywhere.node.store import NodeStore
@@ -26,6 +26,16 @@ pending = None
 pending_resume = None
 calls = []
 call_params = {}
+history_turns = [
+    {"id":"stored-turn-1","startedAt":11,"items":[
+        {"id":"stored-user","type":"userMessage","content":[{"type":"text","text":"Original question"}]},
+        {"id":"stored-answer","type":"agentMessage","text":"Original answer"}]},
+    {"id":"stored-turn-2","startedAt":12,"items":[
+        {"id":"stored-future","type":"futureNativeItem","payload":{"preserve":True}}]},
+]
+def history_metadata(thread_id):
+    return {"id":thread_id,"cwd":os.path.dirname(os.path.abspath(__file__)),"name":"Saved CLI task",
+            "preview":"Original question","createdAt":10,"updatedAt":20,"turns":history_turns}
 def emit(value):
     raw = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
     # Split bytes inside multibyte UTF-8 as well as JSON tokens.
@@ -55,6 +65,37 @@ for line in sys.stdin.buffer:
         emit({"id":pending,"result":{"approval_id":rpc_id,"response":message["result"]}})
     elif method == "thread/start":
         emit({"id":rpc_id,"result":{"thread":{"id":"native-1","cwd":message["params"]["cwd"]}}})
+    elif method == "thread/list":
+        emit({"id":rpc_id,"result":{"data":[history_metadata("imported-1")],"nextCursor":"catalog-next"}})
+    elif method == "thread/read":
+        thread_id = message["params"]["threadId"]
+        if thread_id == "denied-import":
+            emit({"id":rpc_id,"error":{"code":-32000,"message":"Permission denied"}})
+        else:
+            metadata=history_metadata(thread_id)
+            if not message["params"].get("includeTurns"):
+                metadata.pop("turns")
+            emit({"id":rpc_id,"result":{"thread":metadata}})
+    elif method == "thread/turns/list":
+        thread_id = message["params"]["threadId"]
+        if thread_id == "legacy-import":
+            emit({"id":rpc_id,"error":{"code":-32601,"message":"Unknown method thread/turns/list"}})
+        elif thread_id == "broken-import":
+            emit({"id":rpc_id,"error":{"code":-32000,"message":"History storage failed"}})
+        else:
+            cursor = message["params"].get("cursor")
+            next_cursor = "page-2" if not cursor or thread_id == "repeated-import" else None
+            turn = dict(history_turns[0 if not cursor else 1])
+            if message["params"].get("itemsView") == "notLoaded":
+                turn["items"] = []
+            emit({"id":rpc_id,"result":{"data":[turn],"nextCursor":next_cursor}})
+    elif method == "thread/items/list":
+        params = message["params"]
+        turn = next(turn for turn in history_turns if turn["id"] == params["turnId"])
+        offset = int(params.get("cursor", "0"))
+        next_cursor = str(offset + 1) if offset + 1 < len(turn["items"]) else None
+        emit({"id":rpc_id,"result":{"data":[{"turnId":turn["id"],"item":turn["items"][offset],
+             "startedAtMs":turn["startedAt"] * 1000,"completedAtMs":None}],"nextCursor":next_cursor}})
     elif method == "thread/resume":
         if message["params"]["threadId"] == "slow-thread":
             pending_resume = rpc_id
@@ -160,7 +201,6 @@ def test_node_websocket_reconnect_keeps_process_and_replays_outbox(peer, tmp_pat
                 "token": "test-token",
                 "host_id": "host",
                 "name": "test",
-                "roots": [str(tmp_path)],
             },
             tmp_path,
         )
@@ -232,7 +272,6 @@ def test_node_completed_commands_cached_and_uncertain_not_repeated(peer, tmp_pat
                 "server": "http://127.0.0.1:9876",
                 "token": "test-token",
                 "host_id": "host",
-                "roots": [str(tmp_path)],
             },
             tmp_path,
         )
@@ -292,27 +331,24 @@ def test_outbox_survives_reopen_and_dedupes_command(tmp_path):
     store.close()
 
 
-def test_paths_reject_traversal_prefixes_and_symlinks(tmp_path):
+def test_paths_can_resolve_any_absolute_accessible_location(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
     sibling = tmp_path / "project-other"
     sibling.mkdir()
     outside = sibling / "secret.png"
     outside.write_bytes(b"secret")
-    assert checked_path(str(root), [str(root)], directory=True) == root
-    with pytest.raises(ValueError, match="outside"):
-        checked_path(str(root / ".." / "project-other" / "secret.png"), [str(root)])
-    with pytest.raises(ValueError, match="outside"):
-        checked_path(str(outside), [str(root)])
+    assert resolve_path(str(root), directory=True) == root
+    assert resolve_path(str(root / ".." / "project-other" / "secret.png")) == outside
+    assert resolve_path(str(outside)) == outside
     with pytest.raises(ValueError, match="absolute"):
-        checked_path("secret.png", [str(root)])
+        resolve_path("secret.png")
     link = root / "escape"
     try:
         link.symlink_to(sibling, target_is_directory=True)
     except OSError:
         return  # Windows may not grant symlink privileges to this test user.
-    with pytest.raises(ValueError, match="outside"):
-        checked_path(str(link / "secret.png"), [str(root)])
+    assert resolve_path(str(link / "secret.png")) == outside
 
 
 def test_server_requires_https_except_loopback():
@@ -362,7 +398,7 @@ def png_bytes():
     return result.getvalue()
 
 
-def test_output_image_bridge_and_no_arbitrary_file_upload(tmp_path):
+def test_output_image_bridge_reads_referenced_images_in_any_directory(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
     image = root / "图像.png"
@@ -370,11 +406,11 @@ def test_output_image_bridge_and_no_arbitrary_file_upload(tmp_path):
     outside = tmp_path / "outside.png"
     outside.write_bytes(png_bytes())
     sources = extract_images(
-        {"type": "agentMessage", "text": f"![yes](<{image}>)\n![no](<{outside}>)"}, [str(root)]
+        {"type": "agentMessage", "text": f"![yes](<{image}>)\n![no](<{outside}>)"}
     )
-    assert len(sources) == 1 and sources[0].source_path == str(image)
+    assert {source.source_path for source in sources} == {str(image), str(outside)}
     encoded = base64.b64encode(png_bytes()).decode()
-    assert len(extract_images({"type": "imageGeneration", "result": encoded}, [str(root)])) == 1
+    assert len(extract_images({"type": "imageGeneration", "result": encoded})) == 1
     assert (
         len(
             extract_images(
@@ -384,7 +420,6 @@ def test_output_image_bridge_and_no_arbitrary_file_upload(tmp_path):
                         "content": [{"type": "image", "mimeType": "image/png", "data": encoded}]
                     },
                 },
-                [str(root)],
             )
         )
         == 1
@@ -413,7 +448,7 @@ def test_output_image_bridge_and_no_arbitrary_file_upload(tmp_path):
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handle), headers={"Authorization": "Bearer token"}
         ) as client:
-            bridge = AssetBridge(store, client, "https://hub.test", [str(root)])
+            bridge = AssetBridge(store, client, "https://hub.test")
             first = await bridge.process(event)
             assert first[0]["source_path"] == str(image)
             assert await bridge.process(event) == first
@@ -459,18 +494,16 @@ def test_native_tool_image_output_containers(
                 container: [{"type": image_type, image_key: encoded}],
             },
         },
-        [str(root)],
     )
-    assert len(sources) == 2
-    assert {source.source_path for source in sources} == {None, str(local_image)}
+    assert len(sources) == 3
+    assert {source.source_path for source in sources} == {None, str(local_image), str(outside)}
 
 
-def test_function_output_string_uses_root_limited_markdown(tmp_path):
+def test_function_output_string_resolves_relative_markdown_using_cwd(tmp_path):
     image = tmp_path / "result.png"
     image.write_bytes(png_bytes())
     sources = extract_images(
         {"type": "functionCallOutput", "output": "![result](result.png)"},
-        [str(tmp_path)],
         str(tmp_path),
     )
     assert len(sources) == 1 and sources[0].source_path == str(image)
@@ -478,7 +511,6 @@ def test_function_output_string_uses_root_limited_markdown(tmp_path):
     assert (
         extract_images(
             {"type": "functionCall", "output": "![result](result.png)"},
-            [str(tmp_path)],
             str(tmp_path),
         )
         == []
@@ -491,7 +523,7 @@ def test_pair_stores_token_locally_without_returning_it(tmp_path, monkeypatch):
 
     def handle(request):
         body = json.loads(request.content)
-        assert body["code"] == "ABC123" and body["roots"] == [str(tmp_path)]
+        assert body["code"] == "ABC123" and "roots" not in body
         return httpx.Response(
             200, json={"host": {"id": "host-1", "name": "laptop"}, "token": "secret-token"}
         )
@@ -500,7 +532,7 @@ def test_pair_stores_token_locally_without_returning_it(tmp_path, monkeypatch):
         return original_client(transport=httpx.MockTransport(handle), **kwargs)
 
     monkeypatch.setattr("codex_anywhere.node.service.httpx.Client", fake_client)
-    result = pair_node("http://localhost:8080", "laptop", [str(tmp_path)], config_dir, "ABC123")
+    result = pair_node("http://localhost:8080", "laptop", config_dir, "ABC123")
     assert result == {"id": "host-1", "name": "laptop"}
     assert json.loads((config_dir / "node.json").read_text())["token"] == "secret-token"
     if os.name != "nt":
@@ -576,7 +608,6 @@ def test_controls_and_approval_do_not_wait_for_slow_thread_resume(peer, tmp_path
                 "server": "http://127.0.0.1:9876",
                 "token": "test-token",
                 "host_id": "host",
-                "roots": [str(tmp_path)],
             },
             tmp_path,
         )
@@ -670,7 +701,6 @@ def test_restart_resumes_owned_thread_once_without_loading_history(peer, tmp_pat
             "server": "http://127.0.0.1:9876",
             "token": "test-token",
             "host_id": "host",
-            "roots": [str(tmp_path)],
         }
         first = NodeService(config, tmp_path)
         runtime = CodexRuntime(peer, first._native_event, first._runtime_exit, timeout=3)
@@ -732,7 +762,6 @@ def test_outbox_window_sends_each_event_once_while_acks_arrive_individually(tmp_
                 "server": "http://127.0.0.1:9876",
                 "token": "test-token",
                 "host_id": "host",
-                "roots": [str(tmp_path)],
             },
             tmp_path,
         )
@@ -812,7 +841,6 @@ def test_outbox_retries_only_after_timeout_and_stops_after_ack(tmp_path, monkeyp
                 "server": "http://127.0.0.1:9876",
                 "token": "test-token",
                 "host_id": "host",
-                "roots": [str(tmp_path)],
             },
             tmp_path,
         )
@@ -994,10 +1022,10 @@ def test_output_image_batch_has_count_and_memory_limits(tmp_path, monkeypatch):
         files.append(path)
     text = "\n".join(f"![image](<{path}>)" for path in files)
     monkeypatch.setattr(node_assets, "MAX_OUTPUT_IMAGES", 2)
-    assert len(extract_images({"type": "agentMessage", "text": text}, [str(tmp_path)])) == 2
+    assert len(extract_images({"type": "agentMessage", "text": text})) == 2
     monkeypatch.setattr(node_assets, "MAX_OUTPUT_IMAGES", 16)
     monkeypatch.setattr(node_assets, "MAX_OUTPUT_BYTES", len(data) * 2)
-    sources = extract_images({"type": "agentMessage", "text": text}, [str(tmp_path)])
+    sources = extract_images({"type": "agentMessage", "text": text})
     assert len(sources) == 2 and sum(len(source.data) for source in sources) == len(data) * 2
 
 
@@ -1024,7 +1052,7 @@ def test_local_image_read_is_bounded_even_if_file_grows(tmp_path, monkeypatch):
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", growing_open)
-    assert extract_images({"type": "imageView", "path": str(image)}, [str(tmp_path)]) == []
+    assert extract_images({"type": "imageView", "path": str(image)}) == []
     assert reads == [limit + 1]
 
 
@@ -1037,3 +1065,338 @@ def test_image_pixel_limit_matches_hub_before_pixel_decode():
     data[29:33] = struct.pack(">I", zlib.crc32(data[12:29]))
     with pytest.raises(ValueError, match="25 megapixel"):
         verified_image(bytes(data), "large.png")
+
+
+def test_old_node_config_discards_roots_and_preserves_identity(tmp_path):
+    path = tmp_path / "node.json"
+    path.write_text(
+        json.dumps(
+            {
+                "server": "https://hub.test",
+                "host_id": "host-1",
+                "token": "keep-me",
+                "roots": ["/no-longer-existing-root"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(tmp_path)
+    assert config == {"server": "https://hub.test", "host_id": "host-1", "token": "keep-me"}
+    assert json.loads(path.read_text(encoding="utf-8")) == config
+
+
+def test_node_cli_has_no_project_or_artifact_allowlist_options():
+    from click.testing import CliRunner
+
+    from codex_anywhere.cli import main
+
+    runner = CliRunner()
+    pair_help = runner.invoke(main, ["node", "pair", "--help"])
+    run_help = runner.invoke(main, ["node", "run", "--help"])
+    assert pair_help.exit_code == run_help.exit_code == 0
+    assert "--root" not in pair_help.output
+    assert "--asset-root" not in run_help.output
+
+
+def test_directory_browsing_and_explicit_project_creation_use_any_absolute_path(tmp_path):
+    async def scenario():
+        service = NodeService(
+            {"server": "http://localhost:9876", "host_id": "test", "token": "test"},
+            tmp_path / "node",
+        )
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "z-child").mkdir()
+        (elsewhere / "a-child").mkdir()
+        (elsewhere / "file.txt").write_text("not a directory", encoding="utf-8")
+        try:
+            result = await service.handle_command(
+                {"id": "browse", "kind": "directory.list", "payload": {"path": str(elsewhere)}}
+            )
+            listing = result["result"]
+            assert listing["path"] == str(elsewhere) and listing["parent"] == str(tmp_path)
+            assert [item["name"] for item in listing["directories"]] == ["a-child", "z-child"]
+            assert listing["locations"] and listing["home"] and not listing["truncated"]
+            path = tmp_path / "not-present" / "new-project"
+            missing = await service.handle_command(
+                {"id": "missing", "kind": "project.open", "payload": {"cwd": str(path)}}
+            )
+            assert "error" in missing and not path.exists()
+            opened = await service.handle_command(
+                {
+                    "id": "create",
+                    "kind": "project.open",
+                    "payload": {"cwd": str(path), "name": "Example", "create_directory": True},
+                }
+            )
+            assert opened["result"] == {"cwd": str(path), "name": "Example"} and path.is_dir()
+            relative = await service.handle_command(
+                {
+                    "id": "relative",
+                    "kind": "project.open",
+                    "payload": {"cwd": "relative-directory", "create_directory": True},
+                }
+            )
+            assert "error" in relative
+        finally:
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_directory_listing_is_bounded(tmp_path, monkeypatch):
+    from codex_anywhere.node import directories
+
+    for name in ["a", "b", "c"]:
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(directories, "MAX_DIRECTORIES", 2)
+    result = directories.list_directories({"path": str(tmp_path)})
+    assert len(result["directories"]) == 2 and result["truncated"] is True
+
+
+def test_catalog_includes_all_sources_and_delegates_filters_to_codex(peer, tmp_path):
+    async def scenario():
+        service = NodeService(
+            {"server": "http://localhost:9876", "host_id": "test", "token": "test"}, tmp_path
+        )
+        runtime = CodexRuntime(peer, service._native_event, service._runtime_exit, timeout=3)
+        service.runtime = runtime
+        await runtime.start()
+        try:
+            result = await service.handle_command(
+                {
+                    "id": "catalog",
+                    "kind": "thread.list",
+                    "payload": {
+                        "cursor": "first-cursor",
+                        "limit": 20,
+                        "archived": True,
+                        "search": "Original",
+                        "cwd": str(tmp_path),
+                    },
+                }
+            )
+            catalog = result["result"]
+            assert catalog["nextCursor"] == "catalog-next"
+            assert catalog["data"][0]["id"] == "imported-1" and "turns" not in catalog["data"][0]
+            inspected = await runtime.request("inspect", {})
+            params = inspected["params"]["thread/list"][0]
+            assert set(params["sourceKinds"]) == {
+                "cli",
+                "vscode",
+                "appServer",
+                "exec",
+                "unknown",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+            }
+            assert "useStateDbOnly" not in params
+            assert params["cursor"] == "first-cursor" and params["limit"] == 20
+            assert params["archived"] is True and params["searchTerm"] == "Original"
+            assert params["cwd"] == str(tmp_path) and params["modelProviders"] == []
+            assert (
+                "thread/resume" not in inspected["calls"] and "turn/start" not in inspected["calls"]
+            )
+        finally:
+            await runtime.close()
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("thread_id", ["imported-1", "legacy-import"])
+def test_read_only_import_streams_ordered_native_history_and_can_later_resume(
+    peer, tmp_path, thread_id
+):
+    async def scenario():
+        service = NodeService(
+            {"server": "http://localhost:9876", "host_id": "test", "token": "test"}, tmp_path
+        )
+        runtime = CodexRuntime(peer, service._native_event, service._runtime_exit, timeout=3)
+        service.runtime = runtime
+        await runtime.start()
+        command = {
+            "id": "import-history",
+            "kind": "thread.import",
+            "thread_id": "hub-import",
+            "payload": {"native_thread_id": thread_id, "title": "Selected task"},
+        }
+        try:
+            result = await service.handle_command(command)
+            assert "error" not in result, result
+            summary = result["result"]
+            assert summary["itemCount"] == 3 and summary["thread"]["id"] == thread_id
+            assert summary["thread"]["title"] == "Selected task"
+            assert summary["thread"]["createdAt"] == 10 and summary["thread"]["updatedAt"] == 20
+            assert "turns" not in summary["thread"] and "Original answer" not in json.dumps(summary)
+            assert service.store.thread_cwd(thread_id) == str(tmp_path)
+            assert thread_id not in runtime.loaded_threads
+            events = service.store.pending_events()
+            assert [event["method"] for event in events] == [
+                "anywhere/import_metadata",
+                "anywhere/import_item",
+                "anywhere/import_item",
+                "anywhere/import_item",
+                "anywhere/import_complete",
+            ]
+            items = [
+                event["params"] for event in events if event["method"] == "anywhere/import_item"
+            ]
+            assert [item["position"] for item in items] == [1, 2, 3]
+            assert [item["createdAt"] for item in items] == [11, 11, 12]
+            assert [item["item"]["id"] for item in items] == [
+                "stored-user",
+                "stored-answer",
+                "stored-future",
+            ]
+            assert items[-1]["item"] == {
+                "id": "stored-future",
+                "type": "futureNativeItem",
+                "payload": {"preserve": True},
+            }
+            assert all(event["params"]["commandId"] == command["id"] for event in events)
+            assert len(service.store.asset_jobs()) == 3
+            assert await service.handle_command(command) == result
+            assert (
+                len(service.store.pending_events()) == 5
+            )  # Deduped command emits no duplicate history.
+            inspected = await runtime.request("inspect", {})
+            assert (
+                "thread/resume" not in inspected["calls"] and "turn/start" not in inspected["calls"]
+            )
+            page_params = inspected["params"]["thread/turns/list"]
+            assert all(
+                p["itemsView"] == "notLoaded" and p["limit"] == 50 and p["sortDirection"] == "asc"
+                for p in page_params
+            )
+            if thread_id == "legacy-import":
+                assert len(page_params) == 1
+                assert [p["includeTurns"] for p in inspected["params"]["thread/read"]] == [
+                    False,
+                    True,
+                ]
+            else:
+                assert len(page_params) == 2 and page_params[1]["cursor"] == "page-2"
+                item_pages = inspected["params"]["thread/items/list"]
+                assert len(item_pages) == 3
+                assert all(
+                    page["limit"] == 1 and page["sortDirection"] == "asc" for page in item_pages
+                )
+            continued = await service.handle_command(
+                {
+                    "id": "continue-import",
+                    "kind": "turn.start",
+                    "payload": {
+                        "native_thread_id": thread_id,
+                        "input": [{"type": "text", "text": "Continue this task"}],
+                    },
+                }
+            )
+            assert "error" not in continued
+            inspected = await runtime.request("inspect", {})
+            assert inspected["params"]["thread/resume"][0]["threadId"] == thread_id
+            assert inspected["params"]["turn/start"][0]["threadId"] == thread_id
+        finally:
+            await runtime.close()
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("thread_id", ["denied-import", "broken-import", "repeated-import"])
+def test_failed_import_does_not_hydrate_or_signal_completion(peer, tmp_path, thread_id):
+    async def scenario():
+        service = NodeService(
+            {"server": "http://localhost:9876", "host_id": "test", "token": "test"}, tmp_path
+        )
+        runtime = CodexRuntime(peer, service._native_event, service._runtime_exit, timeout=3)
+        service.runtime = runtime
+        await runtime.start()
+        try:
+            result = await service.handle_command(
+                {
+                    "id": "bad-import",
+                    "kind": "thread.import",
+                    "payload": {"native_thread_id": thread_id},
+                }
+            )
+            assert "error" in result
+            assert not any(
+                event["method"] == "anywhere/import_complete"
+                for event in service.store.pending_events()
+            )
+            inspected = await runtime.request("inspect", {})
+            assert all(not p["includeTurns"] for p in inspected["params"]["thread/read"])
+            assert (
+                "thread/resume" not in inspected["calls"] and "turn/start" not in inspected["calls"]
+            )
+        finally:
+            await runtime.close()
+            service.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_imported_user_images_bridge_data_and_local_urls_without_remote_download(tmp_path):
+    image = tmp_path / "historical.png"
+    image.write_bytes(png_bytes())
+    url = "data:image/png;base64," + base64.b64encode(png_bytes()).decode()
+    item = {
+        "id": "historical-user",
+        "type": "userMessage",
+        "content": [
+            {"type": "image", "url": url},
+            {"type": "localImage", "path": str(image)},
+            {"type": "image", "url": image.as_uri()},
+            {"type": "image", "url": "https://external.test/no-download.png"},
+        ],
+    }
+    images = extract_images(item, str(tmp_path))
+    assert len(images) == 2 and {source.source_path for source in images} == {None, str(image)}
+
+    async def scenario():
+        store = NodeStore(tmp_path / "node.sqlite3")
+        store.save_thread("imported-native", str(tmp_path))
+        uploaded = []
+
+        def handle(request):
+            assert str(request.url) == "https://hub.test/api/node/assets"
+            uploaded.append(request.content)
+            return httpx.Response(
+                200,
+                json={"asset": {"id": str(len(uploaded)), "url": f"/api/assets/{len(uploaded)}"}},
+            )
+
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                bridge = AssetBridge(store, client, "https://hub.test")
+                assets = await bridge.process(
+                    {
+                        "method": "anywhere/import_item",
+                        "params": {
+                            "threadId": "imported-native",
+                            "commandId": "import-1",
+                            "item": item,
+                        },
+                    }
+                )
+                assert len(assets) == 2 and uploaded
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_history_fallback_only_handles_unsupported_pagination():
+    from codex_anywhere.node.history import _pagination_unsupported
+    from codex_anywhere.node.runtime import RpcError
+
+    assert _pagination_unsupported(RpcError("Method not found", code=-32601))
+    assert _pagination_unsupported(
+        RpcError("thread/turns/list is only supported for paginated threads")
+    )
+    assert not _pagination_unsupported(RpcError("thread/turns/list failed: thread not found"))
+    assert not _pagination_unsupported(RpcError("thread/turns/list failed: permission denied"))

@@ -19,6 +19,11 @@ PIPE_CLOSE_TIMEOUT = 1.0
 class RpcError(Exception):
     """The peer returned a definitive JSON-RPC error."""
 
+    def __init__(self, message: str, *, code: int | None = None, data=None):
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
 
 class RuntimeGone(Exception):
     """An RPC may have reached Codex, but no definitive response was received."""
@@ -215,7 +220,13 @@ class CodexRuntime:
                     if future and not future.done():
                         if "error" in message:
                             error = message["error"]
-                            future.set_exception(RpcError(str(error.get("message", error))))
+                            future.set_exception(
+                                RpcError(
+                                    str(error.get("message", error)),
+                                    code=error.get("code"),
+                                    data=error.get("data"),
+                                )
+                            )
                         else:
                             future.set_result(message.get("result", {}))
         except asyncio.CancelledError:

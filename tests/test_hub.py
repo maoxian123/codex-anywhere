@@ -49,7 +49,6 @@ def test_pairing_code_is_single_use(client, api, tmp_path):
         "code": pairing["code"],
         "name": "pair-once",
         "platform": "test",
-        "roots": [str(tmp_path.resolve())],
         "version": "test",
     }
     first = client.post("/api/hosts/pair", json=payload)
@@ -70,7 +69,6 @@ def test_expired_pairing_is_rejected(app, client, api, tmp_path):
             "code": code,
             "name": "expired",
             "platform": "test",
-            "roots": [str(tmp_path.resolve())],
             "version": "test",
         },
     )
@@ -78,7 +76,7 @@ def test_expired_pairing_is_rejected(app, client, api, tmp_path):
 
 
 @pytest.mark.parametrize("outside", ["../outside", "../workstation-evil"])
-def test_task_cwd_cannot_escape_project_root(api, paired_host, outside):
+def test_task_cwd_can_use_any_absolute_directory(api, paired_host, outside):
     host = paired_host()
     response = api(
         "POST",
@@ -89,7 +87,7 @@ def test_task_cwd_cannot_escape_project_root(api, paired_host, outside):
             "cwd": str(Path(host["root"]) / outside),
         },
     )
-    assert response.status_code == 400
+    assert response.status_code == 202
 
 
 def test_relative_cwd_is_rejected(api, paired_host):

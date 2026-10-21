@@ -31,6 +31,9 @@ import {
   useInitialSession,
 } from "./Dialogs";
 import Interactions from "./Interactions";
+import { ProjectDialog } from "./Projects";
+import { ImportDialog } from "./Imports";
+import ProjectNavigation from "./ProjectNavigation";
 import Timeline from "./Timeline";
 import { commandFailure, eventFailure } from "./runtime-errors";
 import type {
@@ -42,6 +45,8 @@ import type {
   StreamItem,
   Thread,
   ThreadDetail,
+  Project,
+  ThreadPage,
 } from "./types";
 import {
   busyStatus,
@@ -105,13 +110,20 @@ function Workspace({
 }) {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectFilter, setProjectFilter] = useState<string | null>(null);
+  const [listPages, setListPages] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [search, setSearch] = useState("");
   const [route, setRoute] = useState(readRoute);
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingThread, setLoadingThread] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [dialog, setDialog] = useState<"pair" | "new" | "about" | null>(null);
+  const [dialog, setDialog] = useState<
+    "pair" | "new" | "about" | "project" | "import" | null
+  >(null);
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(
     null,
   );
@@ -125,6 +137,11 @@ function Workspace({
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
+  const listScopeRef = useRef({ projectFilter, listPages });
+  const listOffsetsRef = useRef<{ key: string; offsets: number[] }>({
+    key: "",
+    offsets: [0],
+  });
   const threadFetchRef = useRef(0);
   const listFetchRef = useRef(0);
   const threadRequests = useRef(
@@ -140,6 +157,7 @@ function Workspace({
   const lastCursor = useRef(Number(sessionStorage.getItem(cursorKey) || 0));
   selectedRef.current = route.id;
   searchRef.current = search;
+  listScopeRef.current = { projectFilter, listPages };
 
   const navigate = useCallback((id: string, item?: string) => {
     const url = id
@@ -199,25 +217,60 @@ function Workspace({
     const request = ++listFetchRef.current;
     try {
       const query = searchRef.current;
-      const [hostData, threadData] = await Promise.all([
+      const scope = listScopeRef.current;
+      const scopeKey = JSON.stringify([query, scope.projectFilter]);
+      const offsets = Array.from({ length: scope.listPages }, (_, index) =>
+        listOffsetsRef.current.key === scopeKey
+          ? (listOffsetsRef.current.offsets[index] ?? index * 50)
+          : index * 50,
+      );
+      const [hostData, projectData, ...threadPages] = await Promise.all([
         api<{ hosts: Host[] }>("/hosts"),
-        api<{ threads: Thread[] }>(`/threads?q=${encodeURIComponent(query)}`),
+        api<{ projects: Project[] }>("/projects"),
+        ...Array.from({ length: scope.listPages }, (_, index) =>
+          api<ThreadPage>(
+            `/threads?q=${encodeURIComponent(query)}&limit=50&offset=${offsets[index]}${scope.projectFilter ? `&project_id=${encodeURIComponent(scope.projectFilter)}` : ""}`,
+          ),
+        ),
       ]);
       if (
         liveRef.current &&
         request === listFetchRef.current &&
-        query === searchRef.current
+        query === searchRef.current &&
+        scope.projectFilter === listScopeRef.current.projectFilter &&
+        scope.listPages === listScopeRef.current.listPages
       ) {
         setHosts(hostData.hosts);
-        setThreads(threadData.threads);
+        setProjects(projectData.projects);
+        setThreads([
+          ...new Map(
+            threadPages
+              .flatMap((page) => page.threads)
+              .map((thread) => [thread.id, thread]),
+          ).values(),
+        ]);
+        setHasMore(Boolean(threadPages.at(-1)?.has_more));
+        listOffsetsRef.current = {
+          key: scopeKey,
+          offsets: [
+            0,
+            ...threadPages.map((page, index) =>
+              typeof page.next_offset === "number"
+                ? page.next_offset
+                : offsets[index] + page.threads.length,
+            ),
+          ],
+        };
         setNetworkError("");
       }
     } catch (reason) {
       if (liveRef.current && request === listFetchRef.current)
         setNetworkError(errorText(reason));
     } finally {
-      if (liveRef.current && request === listFetchRef.current)
+      if (liveRef.current && request === listFetchRef.current) {
         setLoading(false);
+        setLoadingMore(false);
+      }
     }
   }, []);
   const refreshThread = useCallback(async (id = selectedRef.current) => {
@@ -293,7 +346,11 @@ function Workspace({
   useEffect(() => {
     const timer = setTimeout(() => void refreshList(), search ? 220 : 0);
     return () => clearTimeout(timer);
-  }, [search, refreshList]);
+  }, [search, projectFilter, listPages, refreshList]);
+  useEffect(() => {
+    setListPages(1);
+    setHasMore(false);
+  }, [search, projectFilter]);
   useEffect(() => {
     setDetail(null);
     setStreams({});
@@ -526,7 +583,7 @@ function Workspace({
         <div className="search-box">
           <Search size={15} />
           <input
-            placeholder="搜索任务…"
+            placeholder={projectFilter ? "搜索项目会话…" : "搜索全部会话…"}
             aria-label="搜索任务"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
@@ -541,54 +598,33 @@ function Workspace({
             </button>
           )}
         </div>
-        <div className="sidebar-section-label">
-          <span>任务</span>
-          <span className="count-badge">{threads.length}</span>
-          <button
-            className="icon-button"
-            title="刷新列表"
-            aria-label="刷新任务列表"
-            onClick={() => void refreshList()}
-          >
-            <RefreshCw size={13} />
+        <div className="sidebar-project-actions">
+          <button className="text-button" onClick={() => setDialog("project")}>
+            <Plus size={14} />
+            新建项目
+          </button>
+          <button className="text-button" onClick={() => setDialog("import")}>
+            导入本机会话
           </button>
         </div>
-        <nav className="thread-list" aria-label="任务列表">
-          {loading ? (
-            <div className="sidebar-empty">
-              <Spinner label="加载任务" />
-            </div>
-          ) : threads.length ? (
-            threads.map((thread) => (
-              <a
-                className={`thread-row ${route.id === thread.id ? "selected" : ""}`}
-                key={thread.id}
-                href={`/tasks/${thread.id}`}
-                onClick={(event) => {
-                  event.preventDefault();
-                  navigate(thread.id);
-                }}
-              >
-                <span className={`thread-dot status-${thread.status}`} />
-                <span className="thread-text">
-                  <strong>{thread.title || "未命名任务"}</strong>
-                  <small>
-                    {fileName(thread.cwd)}
-                    <span>{relativeDate(thread.updated_at)}</span>
-                  </small>
-                </span>
-                {thread.status === "waiting" && (
-                  <span className="attention-dot" title="等待处理" />
-                )}
-              </a>
-            ))
-          ) : (
-            <div className="sidebar-empty">
-              <Folder size={24} />
-              <p>{search ? "没有匹配的任务" : "你的任务会出现在这里"}</p>
-            </div>
-          )}
-        </nav>
+        <ProjectNavigation
+          hosts={hosts}
+          projects={projects}
+          threads={threads}
+          selectedProjectId={projectFilter}
+          currentThreadId={route.id}
+          loading={loading}
+          loadingMore={loadingMore}
+          hasMore={hasMore}
+          onFilter={setProjectFilter}
+          onNavigate={(id) => navigate(id)}
+          onNewProject={() => setDialog("project")}
+          onRefresh={() => void refreshList()}
+          onMore={() => {
+            setLoadingMore(true);
+            setListPages((value) => value + 1);
+          }}
+        />
         <div className="sidebar-devices">
           <div className="sidebar-section-label">
             <span>工作设备</span>
@@ -767,6 +803,10 @@ function Workspace({
               streams={streams}
               busy={busyStatus(detail?.thread.status)}
               loading={loadingThread}
+              importing={
+                detail?.thread.status === "importing" ||
+                detail?.thread.history_loaded === false
+              }
               targetItem={route.item}
               onImage={(src, alt) => setLightbox({ src, alt })}
               onNavigate={navigate}
@@ -956,14 +996,56 @@ function Workspace({
       {dialog === "new" && (
         <NewTaskDialog
           hosts={hosts}
+          projects={projects}
+          initialProjectId={projectFilter}
+          onNewProject={() => setDialog("project")}
           onClose={() => setDialog(null)}
           onCreated={(thread, command) => {
             setThreads((current) => [
               thread,
               ...current.filter((entry) => entry.id !== thread.id),
             ]);
+            setProjectFilter(thread.project_id || null);
             navigate(thread.id);
             watchCommand(command, thread.id);
+          }}
+        />
+      )}
+      {dialog === "project" && (
+        <ProjectDialog
+          hosts={hosts}
+          onClose={() => setDialog(null)}
+          onCreated={(project) => {
+            setProjects((current) => [
+              project,
+              ...current.filter((value) => value.id !== project.id),
+            ]);
+            setProjectFilter(project.id);
+            setDialog("new");
+            void refreshList();
+          }}
+        />
+      )}
+      {dialog === "import" && (
+        <ImportDialog
+          hosts={hosts}
+          onClose={() => {
+            setDialog(null);
+            void refreshList();
+          }}
+          onImported={(thread) => {
+            setThreads((current) =>
+              current.some((value) => value.id === thread.id)
+                ? current
+                : projectFilter && thread.project_id !== projectFilter
+                  ? current
+                  : [thread, ...current],
+            );
+            void refreshList();
+          }}
+          onNavigate={(id, projectId) => {
+            setProjectFilter(projectId || null);
+            navigate(id);
           }}
         />
       )}

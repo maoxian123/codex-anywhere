@@ -17,14 +17,15 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .assets import AssetBridge, _base64_image
 from .config import (
-    checked_path,
     load_config,
     node_lock,
-    normalize_roots,
+    resolve_path,
     save_config,
     validate_server,
     websocket_url,
 )
+from .directories import list_directories, open_project
+from .history import import_thread, list_threads
 from .runtime import CodexRuntime, RpcError, RuntimeGone
 from .store import NodeStore
 
@@ -37,13 +38,11 @@ OUTBOX_WINDOW = 100
 def pair_node(
     server: str,
     name: str,
-    roots: list[str],
     state_dir: str | Path,
     code: str,
     allow_insecure: bool = False,
 ) -> dict:
     server = validate_server(server, allow_insecure)
-    normalized = normalize_roots(roots)
     directory = Path(state_dir).expanduser().resolve()
     if (directory / "node.json").exists():
         raise ValueError("This state directory is already paired; use a new state directory")
@@ -55,7 +54,6 @@ def pair_node(
             json={
                 "code": code.strip(),
                 "name": name.strip(),
-                "roots": normalized,
                 "platform": platform.system().lower(),
                 "version": VERSION,
             },
@@ -76,7 +74,6 @@ def pair_node(
             "token": result["token"],
             "host_id": result["host"]["id"],
             "name": name.strip(),
-            "roots": normalized,
         },
     )
     return result["host"]
@@ -88,13 +85,10 @@ class NodeService:
         config: dict,
         state_dir: Path,
         codex_bin: str = "codex",
-        asset_roots: list[str] | None = None,
         allow_insecure: bool = False,
     ):
-        self.config = config
+        self.config = {key: value for key, value in config.items() if key != "roots"}
         self.server = validate_server(config["server"], allow_insecure)
-        self.roots = normalize_roots(config["roots"])
-        self.asset_roots = self.roots + (normalize_roots(asset_roots) if asset_roots else [])
         self.codex_bin = codex_bin
         self.store = NodeStore(state_dir / "node.sqlite3")
         self.store.recover_uncertain()
@@ -121,10 +115,14 @@ class NodeService:
     async def _native_event(self, method: str, params: dict, rpc_id) -> None:
         assert self.runtime
         self.store.record_event(
-            self.runtime.runtime_id, method, params, rpc_id, asset_job=method == "item/completed"
+            self.runtime.runtime_id,
+            method,
+            params,
+            rpc_id,
+            asset_job=method in {"item/completed", "anywhere/import_item"},
         )
         self.event_wake.set()
-        if method == "item/completed":
+        if method in {"item/completed", "anywhere/import_item"}:
             self.asset_wake.set()
 
     async def _runtime_exit(self, epoch: str, returncode: int | None) -> None:
@@ -236,7 +234,6 @@ class NodeService:
                         "type": "hello",
                         "runtime_id": self.runtime.runtime_id,
                         "version": VERSION,
-                        "roots": self.roots,
                         "platform": platform.system().lower(),
                     }
                 )
@@ -298,7 +295,7 @@ class NodeService:
             await asyncio.sleep(min(30, 2**attempt) + random.random())
 
     async def _assets(self, client: httpx.AsyncClient) -> None:
-        bridge = AssetBridge(self.store, client, self.server, self.asset_roots)
+        bridge = AssetBridge(self.store, client, self.server)
         while True:
             self.asset_wake.clear()
             for event in self.store.asset_jobs():
@@ -327,13 +324,15 @@ class NodeService:
                     self.store.finish_asset_job(event["event_id"])
                     continue
                 if assets:
+                    params = event["params"]
                     self.store.record_event(
                         event["runtime_id"],
                         "anywhere/assets",
                         {
-                            "threadId": event["params"]["threadId"],
-                            "itemId": event["params"]["item"]["id"],
+                            "threadId": params["threadId"],
+                            "itemId": params["item"]["id"],
                             "assets": assets,
+                            **({"commandId": params["commandId"]} if "commandId" in params else {}),
                         },
                     )
                     self.event_wake.set()
@@ -406,12 +405,16 @@ class NodeService:
         return result
 
     async def _execute(self, command: dict) -> dict:
+        kind, payload = command["kind"], command.get("payload", {})
+        if kind == "directory.list":
+            return await asyncio.to_thread(list_directories, payload)
+        if kind == "project.open":
+            return await asyncio.to_thread(open_project, payload)
         runtime = self.runtime
         if not runtime or not runtime.process or runtime.process.returncode is not None:
             raise ValueError("Codex is restarting; submit a new command after it reconnects")
-        kind, payload = command["kind"], command.get("payload", {})
         if kind == "thread.start":
-            cwd = str(checked_path(payload["cwd"], self.roots, directory=True))
+            cwd = str(resolve_path(payload["cwd"], directory=True))
             params = {"cwd": cwd, "approvalPolicy": "on-request", "sandbox": "workspace-write"}
             if payload.get("model"):
                 params["model"] = payload["model"]
@@ -420,6 +423,15 @@ class NodeService:
             self.store.save_thread(native_id, cwd)
             runtime.loaded_threads.add(native_id)
             return result
+        if kind == "thread.list":
+            return await list_threads(runtime, payload)
+        if kind == "thread.import":
+
+            def wake_import() -> None:
+                self.event_wake.set()
+                self.asset_wake.set()
+
+            return await import_thread(runtime, self.store, command, wake_import)
         if kind == "interaction.answer":
             if payload.get("runtime_id") != runtime.runtime_id:
                 raise ValueError("Interaction belongs to an expired Codex process")
@@ -432,7 +444,7 @@ class NodeService:
         cwd = self.store.thread_cwd(thread_id)
         if cwd is None:
             raise ValueError("Thread was not created by this node")
-        checked_path(cwd, self.roots, directory=True)
+        resolve_path(cwd, directory=True)
         if kind == "turn.start" and thread_id not in runtime.loaded_threads:
             await runtime.request(
                 "thread/resume",
@@ -486,13 +498,12 @@ class NodeService:
 def run_node(
     state_dir: str | Path,
     codex_bin: str = "codex",
-    asset_roots: list[str] | None = None,
     allow_insecure: bool = False,
 ) -> None:
     directory = Path(state_dir).expanduser().resolve()
     config = load_config(directory)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     with node_lock(directory):
-        service = NodeService(config, directory, codex_bin, asset_roots, allow_insecure)
+        service = NodeService(config, directory, codex_bin, allow_insecure)
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(service.run())

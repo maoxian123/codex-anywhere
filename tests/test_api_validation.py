@@ -98,7 +98,7 @@ def test_invalid_unicode_is_a_json_error_instead_of_an_encoding_exception(api):
 
 def test_bad_node_name_does_not_consume_a_valid_pairing_code(client, api, tmp_path):
     code = api("POST", "/api/pairings", json={}).get_json()["code"]
-    payload = {"code": code, "name": ["invalid"], "roots": [str(tmp_path)], "platform": "test"}
+    payload = {"code": code, "name": ["invalid"], "platform": "test"}
     assert client.post("/api/hosts/pair", json=payload).status_code == 400
     payload["name"] = "Valid workstation"
     assert client.post("/api/hosts/pair", json=payload).status_code == 200

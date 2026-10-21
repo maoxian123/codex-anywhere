@@ -93,7 +93,6 @@ def paired_host(app, client, api, tmp_path, pump_nodes):
                 "code": pairing["code"],
                 "name": name,
                 "platform": "test",
-                "roots": [str(root.resolve())],
                 "version": "test",
             },
         )
@@ -112,7 +111,6 @@ def paired_host(app, client, api, tmp_path, pump_nodes):
                     "type": "hello",
                     "runtime_id": runtime_id,
                     "version": "test",
-                    "roots": [str(root.resolve())],
                     "platform": "test",
                 },
             )

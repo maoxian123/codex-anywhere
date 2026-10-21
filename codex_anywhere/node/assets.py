@@ -1,4 +1,4 @@
-"""Transfer only images actually referenced by native output, within allowed roots."""
+"""Transfer referenced native images, with bounded reads and image validation."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 from PIL import Image, UnidentifiedImageError
 
-from .config import checked_path
+from .config import resolve_path
 from .store import NodeStore
 
 log = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ def _base64_image(value: str, name: str) -> ImageSource:
     return verified_image(decoded, name)
 
 
-def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list[ImageSource]:
+def extract_images(item: dict, cwd: str | None = None) -> list[ImageSource]:
     result: list[ImageSource] = []
     seen_paths: set[str] = set()
     seen_images: set[tuple[str, str | None]] = set()
@@ -142,7 +142,7 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
             warn_limit()
             return
         try:
-            path = checked_path(value, roots, base=cwd)
+            path = resolve_path(value, base=cwd)
             if str(path) in seen_paths:
                 return
             seen_paths.add(str(path))
@@ -157,7 +157,7 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
                 return
             append(verified_image(data, path.name, str(path)))
         except (ValueError, OSError):
-            # Missing and unauthorized files are intentionally not read or uploaded.
+            # Missing files and OS permission failures remain unavailable.
             return
 
     if item.get("type") == "imageView" and isinstance(item.get("path"), str):
@@ -181,7 +181,9 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
                     append(_base64_image(value["data"], "tool-image.png"))
                 except ValueError:
                     pass
-            image_key = {"inputImage": "imageUrl", "input_image": "image_url"}.get(
+            if value.get("type") == "localImage" and isinstance(value.get("path"), str):
+                local(value["path"])
+            image_key = {"inputImage": "imageUrl", "input_image": "image_url", "image": "url"}.get(
                 value.get("type")
             )
             if image_key and isinstance(value.get(image_key), str):
@@ -193,6 +195,10 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
                         append(_base64_image(encoded, "tool-image.png"))
                     except ValueError:
                         pass
+                elif encoded.startswith("file://"):
+                    paths = markdown_local_images(f"![image](<{encoded}>)")
+                    for path in paths:
+                        local(path)
             # Only output text fields, never arguments/code/paths, are parsed.
             if value.get("type") in {
                 "agentMessage",
@@ -223,8 +229,8 @@ def extract_images(item: dict, roots: list[str], cwd: str | None = None) -> list
 
 
 class AssetBridge:
-    def __init__(self, store: NodeStore, client: httpx.AsyncClient, server: str, roots: list[str]):
-        self.store, self.client, self.server, self.roots = store, client, server, roots
+    def __init__(self, store: NodeStore, client: httpx.AsyncClient, server: str):
+        self.store, self.client, self.server = store, client, server
 
     async def process(self, event: dict) -> list[dict]:
         params = event["params"]
@@ -233,7 +239,7 @@ class AssetBridge:
         if not thread_id or not item_id:
             return []
         cwd = self.store.thread_cwd(thread_id)
-        images = extract_images(item, self.roots, cwd)
+        images = extract_images(item, cwd)
         assets = []
         for image in images:
             digest = hashlib.sha256(image.data).hexdigest()

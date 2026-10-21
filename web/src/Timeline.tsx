@@ -29,6 +29,7 @@ export type TimelineProps = {
   busy: boolean;
   targetItem?: string;
   loading: boolean;
+  importing?: boolean;
   onImage: (src: string, alt: string) => void;
   onNavigate: (id: string, item?: string) => void;
 };
@@ -378,6 +379,7 @@ export default function Timeline({
   streams,
   busy,
   loading,
+  importing = false,
   targetItem,
   onImage,
   onNavigate,
@@ -445,11 +447,15 @@ export default function Timeline({
             <span className="empty-orbit">
               <Bot size={28} />
             </span>
-            <h2>从一个想法开始</h2>
+            <h2>{importing ? "正在导入会话历史" : "从一个想法开始"}</h2>
             <p>
-              描述目标、附上截图，或引用已有任务。
+              {importing
+                ? "历史消息和图片会逐步显示，导入完成后可以继续原会话。"
+                : "描述目标、附上截图，或引用已有任务。"}
               <br />
-              Codex 将在所选设备的项目目录中执行。
+              {importing
+                ? "导入历史不会发起模型推理。"
+                : "Codex 将在所选设备的项目目录中执行。"}
             </p>
           </div>
         )}

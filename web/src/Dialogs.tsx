@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { api, errorText, post, setSession } from "./api";
 import { CopyButton, ErrorMessage, Modal, Spinner } from "./components";
-import type { Command, Host, Session, Thread } from "./types";
+import type { Command, Host, Project, Session, Thread } from "./types";
 
 export function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   const [username, setUsername] = useState("");
@@ -136,7 +136,7 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
     ? now >= new Date(pairing.expires_at).getTime()
     : false;
   const command = pairing
-    ? `codex-anywhere node pair --server ${window.location.origin} --code ${pairing.code} --name "my-computer" --root "PROJECT_PATH"`
+    ? `codex-anywhere node pair --server ${window.location.origin} --code ${pairing.code} --name "my-computer"`
     : "";
   return (
     <Modal
@@ -195,8 +195,7 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
           <div>
             <h3>执行配对并启动</h3>
             <p>
-              将 PROJECT_PATH 替换为允许 Codex
-              工作的绝对项目路径。远程连接请使用 HTTPS。
+              配对后可在网页浏览此设备的目录并创建项目。远程连接请使用 HTTPS。
             </p>
             {pairing && !expired ? (
               <>
@@ -234,23 +233,49 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
 
 export function NewTaskDialog({
   hosts,
+  projects,
+  initialProjectId,
   onClose,
   onCreated,
+  onNewProject,
 }: {
   hosts: Host[];
+  projects: Project[];
+  initialProjectId?: string | null;
   onClose: () => void;
   onCreated: (thread: Thread, command: Command) => void;
+  onNewProject: () => void;
 }) {
-  const online = hosts.filter((host) => host.online);
-  const [hostId, setHostId] = useState(online[0]?.id || "");
-  const host = hosts.find((entry) => entry.id === hostId);
-  const [cwd, setCwd] = useState(host?.roots[0] || "");
+  const initial = projects.find((project) => project.id === initialProjectId);
+  const [hostId, setHostId] = useState(
+    initial?.host_id || hosts.find((host) => host.online)?.id || "",
+  );
+  const [projectId, setProjectId] = useState(
+    initial?.id ||
+      projects.find((project) => project.host_id === hostId)?.id ||
+      "",
+  );
+  const project = projects.find(
+    (value) => value.id === projectId && value.host_id === hostId,
+  );
+  const host = hosts.find((value) => value.id === hostId);
   const [title, setTitle] = useState("");
   const [model, setModel] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (
+      !projects.some(
+        (value) => value.id === projectId && value.host_id === hostId,
+      )
+    )
+      setProjectId(
+        projects.find((value) => value.host_id === hostId)?.id || "",
+      );
+  }, [projects, hostId, projectId]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (!project || !host?.online) return;
     setBusy(true);
     setError("");
     try {
@@ -258,7 +283,7 @@ export function NewTaskDialog({
         "/threads",
         {
           host_id: hostId,
-          cwd: cwd.trim(),
+          project_id: projectId,
           title: title.trim() || "新任务",
           ...(model.trim() ? { model: model.trim() } : {}),
         },
@@ -274,7 +299,7 @@ export function NewTaskDialog({
   return (
     <Modal
       title="创建新任务"
-      subtitle="选择一台在线设备和项目目录，开始新的 Codex 会话。"
+      subtitle="选择工作设备和项目，在对应目录中开始 Codex 会话。"
       onClose={onClose}
     >
       <form className="form-stack" onSubmit={(event) => void submit(event)}>
@@ -296,23 +321,17 @@ export function NewTaskDialog({
           </span>
           <select
             value={hostId}
-            onChange={(event) => {
-              setHostId(event.target.value);
-              setCwd(
-                hosts.find((entry) => entry.id === event.target.value)
-                  ?.roots[0] || "",
-              );
-            }}
+            onChange={(event) => setHostId(event.target.value)}
             required
             disabled={busy}
           >
             <option value="" disabled>
               选择在线设备
             </option>
-            {hosts.map((entry) => (
-              <option key={entry.id} value={entry.id} disabled={!entry.online}>
-                {entry.name} · {entry.platform}
-                {!entry.online ? " · 离线" : ""}
+            {hosts.map((value) => (
+              <option key={value.id} value={value.id} disabled={!value.online}>
+                {value.name}
+                {value.online ? "" : " · 离线"}
               </option>
             ))}
           </select>
@@ -320,23 +339,36 @@ export function NewTaskDialog({
         <label>
           <span className="label-with-icon">
             <FolderOpen size={14} />
-            工作目录
+            项目
           </span>
-          <input
-            list="host-roots"
-            value={cwd}
-            onChange={(event) => setCwd(event.target.value)}
-            placeholder="项目的绝对路径"
+          <select
+            value={projectId}
+            onChange={(event) => setProjectId(event.target.value)}
             required
             disabled={busy}
-          />
-          <datalist id="host-roots">
-            {host?.roots.map((root) => (
-              <option key={root} value={root} />
-            ))}
-          </datalist>
+          >
+            <option value="" disabled>
+              选择项目
+            </option>
+            {projects
+              .filter((value) => value.host_id === hostId)
+              .map((value) => (
+                <option key={value.id} value={value.id}>
+                  {value.name} · {value.cwd}
+                </option>
+              ))}
+          </select>
         </label>
-        <p className="field-hint">目录必须位于节点配置的工作根目录中。</p>
+        {project && <p className="field-hint">工作目录：{project.cwd}</p>}
+        <button
+          type="button"
+          className="text-button"
+          onClick={onNewProject}
+          disabled={busy}
+        >
+          <Plus size={14} />
+          新建项目 / 选择设备目录
+        </button>
         <details className="advanced-settings">
           <summary>
             <Code2 size={14} />
@@ -352,8 +384,8 @@ export function NewTaskDialog({
             />
           </label>
         </details>
-        {!online.length && (
-          <ErrorMessage>当前没有在线设备，请先连接一台工作电脑。</ErrorMessage>
+        {!host?.online && (
+          <ErrorMessage>当前设备离线，请选择在线设备。</ErrorMessage>
         )}
         {error && <ErrorMessage>{error}</ErrorMessage>}
         <div className="modal-actions">
@@ -367,7 +399,7 @@ export function NewTaskDialog({
           <button
             type="submit"
             className="button button-primary"
-            disabled={busy || !online.length}
+            disabled={busy || !host?.online || !project}
           >
             {busy ? (
               <Spinner label="创建中" />

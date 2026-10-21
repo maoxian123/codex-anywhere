@@ -1,4 +1,4 @@
-"""Configuration and filesystem boundaries for a node."""
+"""Node identity and filesystem path normalization."""
 
 from __future__ import annotations
 
@@ -43,37 +43,20 @@ def websocket_url(server: str) -> str:
     )
 
 
-def normalize_roots(roots: list[str]) -> list[str]:
-    if not roots:
-        raise ValueError("At least one project root is required")
-    result = []
-    for root in roots:
-        path = Path(root).expanduser().resolve(strict=True)
-        if not path.is_dir():
-            raise ValueError(f"Project root is not a directory: {path}")
-        if str(path) not in result:
-            result.append(str(path))
-    return result
-
-
-def checked_path(
-    value: str, roots: list[str], *, directory: bool = False, base: str | None = None
+def resolve_path(
+    value: str, *, directory: bool = False, base: str | None = None, must_exist: bool = True
 ) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("A filesystem path is required")
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         if base is None:
             raise ValueError("Path must be absolute")
         candidate = Path(base) / candidate
-    lexical = Path(os.path.abspath(candidate))
-    if not any(lexical.is_relative_to(Path(os.path.abspath(root))) for root in roots):
-        raise ValueError("Path is outside the configured node roots")
-    candidate = candidate.resolve(strict=True)
-    allowed = any(candidate.is_relative_to(Path(root).resolve(strict=True)) for root in roots)
-    if not allowed:
-        raise ValueError("Path is outside the configured node roots")
-    if directory and not candidate.is_dir():
+    candidate = candidate.resolve(strict=must_exist)
+    if must_exist and directory and not candidate.is_dir():
         raise ValueError("Working directory is not a directory")
-    if not directory and not candidate.is_file():
+    if must_exist and not directory and not candidate.is_file():
         raise ValueError("Artifact is not a file")
     return candidate
 
@@ -98,7 +81,11 @@ def load_config(state_dir: Path) -> dict:
     if not path.exists():
         raise ValueError("This node has not been paired; run node pair first")
     with path.open(encoding="utf-8") as stream:
-        return json.load(stream)
+        config = json.load(stream)
+    if "roots" in config:
+        config.pop("roots")
+        save_config(state_dir, config)
+    return config
 
 
 @contextmanager

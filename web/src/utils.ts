@@ -89,6 +89,7 @@ export function busyStatus(status?: string) {
   return status === "active" || status === "waiting" || status === "starting";
 }
 export const statusLabels: Record<string, string> = {
+  importing: "导入历史中",
   idle: "就绪",
   active: "运行中",
   waiting: "等待处理",

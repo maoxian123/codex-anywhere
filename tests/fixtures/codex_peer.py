@@ -1,6 +1,7 @@
 """Deterministic JSONL peer for integration tests; never calls a model or network."""
 
 import argparse
+import base64
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,53 @@ def main():
     args = parser.parse_args()
     root = Path(args.root)
     threads = {}
+    history_cwd = root.parent / "previous-project"
+    history_cwd.mkdir(exist_ok=True)
+    (history_cwd / "history.png").write_bytes((root / "output.png").read_bytes())
+    historical = {
+        "id": "native-history",
+        "cwd": str(history_cwd),
+        "name": "Existing desktop conversation",
+        "preview": "Historical question",
+        "createdAt": 1700000000,
+        "updatedAt": 1700000100,
+        "source": "appServer",
+        "turns": [],
+    }
+    image_url = (
+        "data:image/png;base64,"
+        + base64.b64encode((history_cwd / "history.png").read_bytes()).decode()
+    )
+    history_turns = [
+        {
+            "id": "old-turn-1",
+            "startedAt": 1700000000,
+            "items": [
+                {
+                    "id": "old-user-1",
+                    "type": "userMessage",
+                    "content": [
+                        {"type": "text", "text": "Historical question"},
+                        {"type": "image", "url": image_url},
+                    ],
+                },
+                {"id": "old-answer-1", "type": "agentMessage", "text": "Historical answer"},
+            ],
+        },
+        {
+            "id": "old-turn-2",
+            "startedAt": 1700000100,
+            "items": [
+                {"id": "old-image", "type": "imageView", "path": str(history_cwd / "history.png")},
+                {
+                    "id": "old-search",
+                    "type": "webSearch",
+                    "status": "completed",
+                    "action": {"type": "openPage", "url": "https://example.com/history"},
+                },
+            ],
+        },
+    ]
     pending = None
     sequence = 0
     with Path(args.audit).open("a", encoding="utf-8", buffering=1) as audit:
@@ -41,6 +89,38 @@ def main():
                 native_id = f"native-thread-{len(threads) + 1}"
                 threads[native_id] = params["cwd"]
                 send({"id": rpc_id, "result": {"thread": {"id": native_id, "cwd": params["cwd"]}}})
+            elif method == "thread/list":
+                send({"id": rpc_id, "result": {"data": [historical], "nextCursor": None}})
+            elif method == "thread/read":
+                send({"id": rpc_id, "result": {"thread": historical}})
+            elif method == "thread/turns/list":
+                second = bool(params.get("cursor"))
+                turn = history_turns[1 if second else 0]
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "data": [{**turn, "items": []}]
+                            if params.get("itemsView") == "notLoaded"
+                            else [turn],
+                            "nextCursor": None if second else "older-page-2",
+                        },
+                    }
+                )
+            elif method == "thread/items/list":
+                turn = next(turn for turn in history_turns if turn["id"] == params["turnId"])
+                index = int(params.get("cursor", "0"))
+                send(
+                    {
+                        "id": rpc_id,
+                        "result": {
+                            "data": [{"turnId": turn["id"], "item": turn["items"][index]}],
+                            "nextCursor": str(index + 1)
+                            if index + 1 < len(turn["items"])
+                            else None,
+                        },
+                    }
+                )
             elif method == "thread/resume":
                 send({"id": rpc_id, "result": {"thread": {"id": params["threadId"]}}})
             elif method == "turn/start":
@@ -61,7 +141,7 @@ def main():
                         },
                     },
                 )
-                if sequence == 1:
+                if sequence == 1 and native_id != historical["id"]:
                     notify(
                         "item/agentMessage/delta",
                         {**base, "itemId": "answer-1", "delta": "Connected "},

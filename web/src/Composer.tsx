@@ -308,7 +308,9 @@ export default function Composer({
   const inputRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const busy = ["active", "waiting"].includes(thread.status);
-  const ready = hostOnline && thread.status !== "starting";
+  const historyReady =
+    thread.history_loaded !== false && thread.status !== "importing";
+  const ready = hostOnline && thread.status !== "starting" && historyReady;
   useEffect(() => {
     const input = textRef.current;
     if (input) {
@@ -485,7 +487,11 @@ export default function Composer({
             edited();
           }}
           placeholder={
-            busy ? "补充要求，帮助 Codex 调整当前任务…" : "描述你想完成的工作…"
+            !historyReady
+              ? "正在导入历史，完成后即可继续对话…"
+              : busy
+                ? "补充要求，帮助 Codex 调整当前任务…"
+                : "描述你想完成的工作…"
           }
           aria-label={busy ? "补充任务要求" : "发送消息给 Codex"}
           rows={2}
@@ -611,11 +617,13 @@ export default function Composer({
         <span>
           {!hostOnline
             ? "设备离线，重新连接后可发送消息"
-            : thread.status === "starting"
-              ? "正在启动 Codex 会话…"
-              : busy
-                ? "任务在远程设备持续运行，关闭页面不影响执行。"
-                : "Codex 在远程设备执行，请留意审批与结果。"}
+            : !historyReady
+              ? "正在导入本机会话历史，完成后可继续原会话。"
+              : thread.status === "starting"
+                ? "正在启动 Codex 会话…"
+                : busy
+                  ? "任务在远程设备持续运行，关闭页面不影响执行。"
+                  : "Codex 在远程设备执行，请留意审批与结果。"}
         </span>
         <span className="keyboard-hint">Enter 发送 · Shift+Enter 换行</span>
       </div>

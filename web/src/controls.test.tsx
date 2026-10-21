@@ -359,3 +359,44 @@ test("tool image galleries are preserved", () => {
   assert.equal(screen.getAllByRole("img").length, 1);
   assert.equal(view.container.querySelectorAll(".asset-gallery img").length, 1);
 });
+
+test("imported history must finish loading before continuing the native session", async () => {
+  const sent: MessagePayload[] = [];
+  const props = {
+    hostOnline: true,
+    onSend: async (payload: MessagePayload) => {
+      sent.push(payload);
+    },
+    onInterrupt: async () => {},
+    onNavigate: () => {},
+  };
+  const view = render(
+    <Composer
+      thread={{
+        ...baseThread,
+        imported: true,
+        history_loaded: false,
+        status: "idle",
+      }}
+      {...props}
+    />,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "发送消息给 Codex" }), {
+    target: { value: "continue the imported conversation" },
+  });
+  assert.equal(
+    (screen.getByRole("button", { name: "发送消息" }) as HTMLButtonElement)
+      .disabled,
+    true,
+  );
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  assert.equal(sent.length, 0);
+  view.rerender(
+    <Composer
+      thread={{ ...baseThread, imported: true, history_loaded: true }}
+      {...props}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => assert.equal(sent.length, 1));
+});

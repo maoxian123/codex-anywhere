@@ -21,13 +21,28 @@ from flask import Flask, current_app, jsonify, request, send_file, send_from_dir
 from flask_sock import Sock
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import event as sa_event
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from .broker import Broker, install_full_writes
-from .models import Asset, Command, Event, Host, Interaction, Item, Pairing, Thread, db, iso, new_id
+from .models import (
+    Asset,
+    Command,
+    Event,
+    Host,
+    Interaction,
+    Item,
+    Pairing,
+    Project,
+    Thread,
+    db,
+    iso,
+    new_id,
+)
+from .projects import ensure_project
 from .references import quote_references, resolve_references
 from .transport import emit, handle_node_message
 
@@ -36,25 +51,36 @@ def token_hash(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def valid_cwd(cwd, roots):
+def is_absolute_directory(cwd):
     if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
         return False
     # Validate in the host's path syntax, not the hub operating system's syntax.
     windows = bool(ntpath.splitdrive(cwd)[0])
     pathmod = ntpath if windows else posixpath
-    if not pathmod.isabs(cwd):
-        return False
-    target = pathmod.normcase(pathmod.normpath(cwd))
-    for root in roots:
-        if not isinstance(root, str):
-            continue
-        root = pathmod.normcase(pathmod.normpath(root))
-        try:
-            if pathmod.commonpath([target, root]) == root:
-                return True
-        except ValueError:
-            pass
-    return False
+    return pathmod.isabs(cwd)
+
+
+def _integer(value, name, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{name} 必须是整数")
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{name} 必须在 {minimum}–{maximum} 之间")
+    return result
+
+
+def _online_host(host_id):
+    from flask import abort
+
+    host = db.session.get(Host, _identifier(host_id, "host_id"))
+    if not host:
+        abort(404, "节点不存在")
+    if not current_app.extensions["broker"].is_online(host.id):
+        abort(409, "节点当前离线")
+    return host
 
 
 def node_host():
@@ -400,15 +426,12 @@ def create_app(test_config=None):
     def pair_host():
         data = _json()
         code = str(data.get("code", "")).strip().upper()
-        roots = data.get("roots", [])
         name = data.get("name", "")
         if not isinstance(name, str):
             raise ValueError("节点名称必须是字符串")
         name = name.strip()
-        if not name or len(name) > 120 or not isinstance(roots, list) or not 1 <= len(roots) <= 32:
-            raise ValueError("请提供节点名称和 1–32 个工作目录")
-        if not all(isinstance(r, str) and valid_cwd(r, [r]) for r in roots):
-            raise ValueError("工作目录必须是绝对路径")
+        if not name or len(name) > 120:
+            raise ValueError("请提供有效的节点名称")
         with app.extensions["broker"].command_lock:
             record = Pairing.query.filter_by(code_hash=token_hash(code), consumed=False).first()
             if not record or record.expires_at < time.time():
@@ -424,7 +447,6 @@ def create_app(test_config=None):
             host = Host(
                 name=name,
                 platform=str(data.get("platform", "unknown"))[:80],
-                roots=roots,
                 version=str(data.get("version", ""))[:120],
                 token_hash=token_hash(token),
             )
@@ -438,23 +460,157 @@ def create_app(test_config=None):
         search = request.args.get("q", "").strip()[:200]
         if search:
             query = query.filter(Thread.title.ilike(f"%{search}%"))
-        return jsonify(
-            threads=[t.as_dict() for t in query.order_by(Thread.updated_at.desc()).limit(200)]
+        for field in ("host_id", "project_id"):
+            if field in request.args:
+                query = query.filter(
+                    getattr(Thread, field) == _identifier(request.args[field], field)
+                )
+        limit = _integer(request.args.get("limit", 200), "limit", 1, 200)
+        offset = _integer(request.args.get("offset", 0), "offset", 0, 2**31 - 1)
+        rows = (
+            query.order_by(Thread.updated_at.desc(), Thread.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+            .all()
         )
+        has_more = len(rows) > limit
+        return jsonify(
+            threads=[t.as_dict() for t in rows[:limit]],
+            has_more=has_more,
+            next_offset=offset + limit if has_more else None,
+        )
+
+    @app.get("/api/projects")
+    def projects():
+        query = db.session.query(Project, func.count(Thread.id)).outerjoin(
+            Thread, Thread.project_id == Project.id
+        )
+        if "host_id" in request.args:
+            query = query.filter(Project.host_id == _identifier(request.args["host_id"], "host_id"))
+        rows = (
+            query.group_by(Project.id).order_by(Project.updated_at.desc(), Project.id.desc()).all()
+        )
+        return jsonify(projects=[project.as_dict(thread_count=count) for project, count in rows])
+
+    @app.post("/api/projects")
+    def open_project():
+        data = _json()
+        host = _online_host(data.get("host_id"))
+        cwd = data.get("cwd")
+        if not is_absolute_directory(cwd):
+            raise ValueError("项目目录必须是绝对路径")
+        create = data.get("create_directory", False)
+        if not isinstance(create, bool):
+            raise ValueError("create_directory 必须是布尔值")
+        payload = dict(cwd=cwd, create_directory=create)
+        if "name" in data:
+            if not isinstance(data["name"], str) or not 1 <= len(data["name"].strip()) <= 240:
+                raise ValueError("项目名称必须是 1–240 个字符")
+            payload["name"] = data["name"].strip()
+        return jsonify(command=_issue_command(host, None, "project.open", payload)), 202
+
+    @app.post("/api/hosts/<host_id>/directories")
+    def directories(host_id):
+        data = _json()
+        host = _online_host(host_id)
+        payload = {}
+        if data.get("path") is not None:
+            if not is_absolute_directory(data["path"]):
+                raise ValueError("浏览目录必须是绝对路径")
+            payload["path"] = data["path"]
+        return jsonify(command=_issue_command(host, None, "directory.list", payload)), 202
+
+    @app.post("/api/hosts/<host_id>/catalog")
+    def catalog(host_id):
+        data = _json()
+        host = _online_host(host_id)
+        archived = data.get("archived", False)
+        if not isinstance(archived, bool):
+            raise ValueError("archived 必须是布尔值")
+        payload = dict(limit=_integer(data.get("limit", 50), "limit", 1, 100), archived=archived)
+        for key, maximum in (("cursor", 4000), ("search", 200)):
+            if data.get(key) is not None:
+                if not isinstance(data[key], str) or len(data[key]) > maximum:
+                    raise ValueError(f"{key} 格式无效")
+                payload[key] = data[key]
+        if data.get("cwd") is not None:
+            if not is_absolute_directory(data["cwd"]):
+                raise ValueError("会话目录筛选必须是绝对路径")
+            payload["cwd"] = data["cwd"]
+        return jsonify(command=_issue_command(host, None, "thread.list", payload)), 202
+
+    @app.post("/api/hosts/<host_id>/imports")
+    def import_thread(host_id):
+        data = _json()
+        host = _online_host(host_id)
+        native_id = _identifier(data.get("native_thread_id"), "native_thread_id")
+        if len(native_id) > 200:
+            raise ValueError("native_thread_id 最多 200 个字符")
+        cwd = data.get("cwd", "")
+        if cwd != "" and not is_absolute_directory(cwd):
+            raise ValueError("会话目录必须是绝对路径")
+        title = data.get("title", "")
+        if not isinstance(title, str) or len(title) > 240:
+            raise ValueError("会话标题格式无效")
+        with app.extensions["broker"].command_lock:
+            thread = Thread.query.filter_by(host_id=host.id, native_id=native_id).first()
+            if thread and thread.status in {"active", "waiting"}:
+                return jsonify(error="正在运行或等待交互的任务不能重新导入"), 409
+            if thread and thread.status == "importing":
+                pending = (
+                    Command.query.filter(
+                        Command.thread_id == thread.id,
+                        Command.kind == "thread.import",
+                        Command.status.in_(["queued", "sent", "running", "completed"]),
+                    )
+                    .order_by(Command.created_at.desc(), Command.id.desc())
+                    .first()
+                )
+                if pending:
+                    return jsonify(thread=thread.as_dict(), command=pending.as_dict()), 202
+            if thread is None:
+                thread = Thread(
+                    host_id=host.id, native_id=native_id, cwd=cwd, title=title.strip() or "导入会话"
+                )
+                db.session.add(thread)
+            else:
+                if cwd:
+                    thread.cwd = cwd
+                if title.strip():
+                    thread.title = title.strip()
+            thread.imported = True
+            thread.history_loaded = False
+            thread.status = "importing"
+            thread.active_turn_id = None
+            thread.last_error = None
+            if thread.cwd:
+                thread.project_id = ensure_project(host, thread.cwd).id
+            db.session.flush()
+            command = _issue_command(
+                host, thread, "thread.import", dict(native_thread_id=native_id)
+            )
+            return jsonify(thread=thread.as_dict(), command=command), 202
 
     @app.post("/api/threads")
     def create_thread():
         data = _json()
-        host = db.session.get(Host, _identifier(data.get("host_id"), "host_id"))
-        if not host:
-            return jsonify(error="节点不存在"), 404
-        if not app.extensions["broker"].is_online(host.id):
-            return jsonify(error="节点当前离线"), 409
-        cwd = data.get("cwd", "")
-        if not valid_cwd(cwd, host.roots):
-            raise ValueError("工作目录必须在节点已授权的目录内")
+        project = None
+        if data.get("project_id") is not None:
+            project = db.session.get(Project, _identifier(data["project_id"], "project_id"))
+            if not project:
+                return jsonify(error="项目不存在"), 404
+            if data.get("host_id") is not None and data["host_id"] != project.host_id:
+                raise ValueError("项目不属于所选节点")
+            host = _online_host(project.host_id)
+            cwd = project.cwd
+        else:
+            host = _online_host(data.get("host_id"))
+            cwd = data.get("cwd", "")
+            if not is_absolute_directory(cwd):
+                raise ValueError("工作目录必须是绝对路径")
+            project = ensure_project(host, cwd)
         title = str(data.get("title", "新任务")).strip()[:240] or "新任务"
-        thread = Thread(host_id=host.id, title=title, cwd=cwd)
+        thread = Thread(host_id=host.id, project_id=project.id, title=title, cwd=cwd)
         db.session.add(thread)
         db.session.flush()
         payload = dict(cwd=cwd, title=title)
@@ -466,7 +622,7 @@ def create_app(test_config=None):
     @app.get("/api/threads/<thread_id>")
     def thread_detail(thread_id):
         thread = _get_thread(thread_id)
-        items = Item.query.filter_by(thread_id=thread.id).order_by(Item.created_at, Item.id).all()
+        items = Item.query.filter_by(thread_id=thread.id).order_by(Item.position, Item.id).all()
         interactions = (
             Interaction.query.filter_by(thread_id=thread.id).order_by(Interaction.created_at).all()
         )
@@ -508,6 +664,8 @@ def create_app(test_config=None):
                     return jsonify(error="同一个请求 ID 对应了不同内容"), 409
                 return jsonify(command=existing.as_dict()), 202
             thread = _get_thread(thread_id)
+            if not thread.history_loaded or thread.status == "importing":
+                return jsonify(error="会话历史仍在导入，请稍后重试"), 409
             host = db.session.get(Host, thread.host_id)
             if not app.extensions["broker"].is_online(host.id):
                 return jsonify(error="节点当前离线"), 409

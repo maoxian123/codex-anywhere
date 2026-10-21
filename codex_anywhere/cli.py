@@ -94,14 +94,13 @@ def default_state():
 @click.option("--server", required=True)
 @click.option("--code", required=True)
 @click.option("--name", required=True)
-@click.option("--root", "roots", multiple=True, required=True, type=click.Path(exists=True))
 @click.option("--state-dir", type=click.Path(path_type=Path), default=default_state)
 @click.option("--allow-insecure", is_flag=True, help="Allow HTTP to a non-loopback hub explicitly.")
-def pair(server, code, name, roots, state_dir, allow_insecure):
+def pair(server, code, name, state_dir, allow_insecure):
     from .node import pair_node
 
     try:
-        host = pair_node(server, name, list(roots), state_dir, code, allow_insecure)
+        host = pair_node(server, name, state_dir, code, allow_insecure)
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Paired {host['name']} ({host['id']}). Credentials stored in {state_dir}.")
@@ -110,14 +109,13 @@ def pair(server, code, name, roots, state_dir, allow_insecure):
 @node.command("run")
 @click.option("--state-dir", type=click.Path(path_type=Path), default=default_state)
 @click.option("--codex-bin", default="codex", show_default=True)
-@click.option("--asset-root", "asset_roots", multiple=True, type=click.Path(exists=True))
 @click.option("--allow-insecure", is_flag=True)
-def run(state_dir, codex_bin, asset_roots, allow_insecure):
+def run(state_dir, codex_bin, allow_insecure):
     from .node import run_node
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        run_node(state_dir, codex_bin, list(asset_roots), allow_insecure)
+        run_node(state_dir, codex_bin, allow_insecure)
     except KeyboardInterrupt:
         click.echo("Node stopped.")
     except Exception as exc:

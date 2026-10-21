@@ -9,13 +9,15 @@ export type Host = {
   name: string;
   platform: string;
   online: boolean;
-  roots: string[];
   version?: string;
   last_seen_at?: string;
 };
 export type Thread = {
   id: string;
   host_id: string;
+  project_id?: string | null;
+  imported?: boolean;
+  history_loaded?: boolean;
   native_id?: string;
   title: string;
   cwd: string;
@@ -51,6 +53,29 @@ export type Item = {
   type: string;
   data: JsonObject & { _assets?: Asset[]; _references?: Reference[] };
   created_at?: string;
+  position?: number;
+};
+export type Project = {
+  id: string;
+  host_id: string;
+  name: string;
+  cwd: string;
+  thread_count: number;
+  created_at: string;
+  updated_at: string;
+};
+export type ThreadPage = {
+  threads: Thread[];
+  has_more?: boolean;
+  next_offset?: number | null;
+};
+export type DirectoryListing = {
+  path: string;
+  parent: string | null;
+  home: string;
+  locations: { name: string; path: string }[];
+  directories: { name: string; path: string }[];
+  truncated: boolean;
 };
 export type Interaction = {
   id: string;

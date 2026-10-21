@@ -56,6 +56,17 @@ function setup(threadOverride: Partial<Thread> = {}) {
   let refreshes = 0;
   let sequence = 0;
   const threads = [thread];
+  const projects = [
+    {
+      id: "p1",
+      host_id: "h1",
+      name: "work",
+      cwd: "C:\\work",
+      thread_count: 1,
+      created_at: thread.created_at,
+      updated_at: thread.updated_at,
+    },
+  ];
   let intercept:
     | ((
         path: string,
@@ -83,6 +94,7 @@ function setup(threadOverride: Partial<Thread> = {}) {
         JSON.stringify({ error: "Authentication required" }),
         { status: 401 },
       );
+    else if (path === "/api/projects") result = { projects };
     else if (path === "/api/hosts")
       result = {
         hosts: [
@@ -91,13 +103,19 @@ function setup(threadOverride: Partial<Thread> = {}) {
             name: "测试设备",
             platform: "windows",
             online: true,
-            roots: ["C:\\work"],
           },
         ],
       };
     else if (path.startsWith("/api/threads?")) {
       refreshes += 1;
-      result = { threads };
+      const query = new URLSearchParams(path.split("?")[1]);
+      const offset = Number(query.get("offset") || 0);
+      const limit = Number(query.get("limit") || 50);
+      result = {
+        threads: threads.slice(offset, offset + limit),
+        has_more: offset + limit < threads.length,
+        next_offset: offset + limit < threads.length ? offset + limit : null,
+      };
     } else if (path === "/api/threads/t1")
       result = { thread, items: [], interactions: [] };
     else if (path.startsWith("/api/threads/")) {
@@ -119,6 +137,7 @@ function setup(threadOverride: Partial<Thread> = {}) {
     authentication,
     loginHeaders,
     threads,
+    projects,
     intercept: (handler: typeof intercept) => {
       intercept = handler;
     },
@@ -285,7 +304,6 @@ test("out-of-order list responses cannot replace a newer host online state", asy
           name: "恢复后的设备",
           platform: "windows",
           online: true,
-          roots: ["C:\\work"],
         },
       ],
     });
@@ -303,7 +321,6 @@ test("out-of-order list responses cannot replace a newer host online state", asy
             name: "过期离线设备",
             platform: "windows",
             online: false,
-            roots: ["C:\\work"],
           },
         ],
       }),
@@ -413,4 +430,62 @@ test("switching tasks does not wait for or display an older pending snapshot", a
   });
   assert.ok(screen.getByRole("heading", { name: "新选择的任务" }));
   assert.equal(screen.queryByText("过期的旧任务内容") === null, true);
+});
+
+test("all sessions remain reachable when the catalog contains more than 200 tasks", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  server.threads.splice(
+    0,
+    server.threads.length,
+    ...Array.from({ length: 251 }, (_, index) => ({
+      ...server.thread,
+      id: `paged-${index + 1}`,
+      title: `分页会话 ${index + 1}`,
+    })),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await screen.findByText("分页会话 50");
+  for (const boundary of [100, 150, 200, 250, 251]) {
+    fireEvent.click(screen.getByRole("button", { name: "加载更多会话" }));
+    await screen.findByText(`分页会话 ${boundary}`, {}, { timeout: 3000 });
+  }
+  assert.equal(
+    screen.queryByRole("button", { name: "加载更多会话" }) === null,
+    true,
+  );
+});
+
+test("load more follows the server next_offset rather than assuming a full first page", async () => {
+  const server = setup();
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  const offsets: number[] = [];
+  server.intercept((path) => {
+    if (!path.startsWith("/api/threads?")) return undefined;
+    const offset = Number(
+      new URLSearchParams(path.split("?")[1]).get("offset"),
+    );
+    offsets.push(offset);
+    return response(
+      offset === 0
+        ? {
+            threads: [{ ...server.thread, id: "first", title: "第一页元数据" }],
+            has_more: true,
+            next_offset: 17,
+          }
+        : {
+            threads: [
+              { ...server.thread, id: "second", title: "后续页元数据" },
+            ],
+            has_more: false,
+            next_offset: null,
+          },
+    );
+  });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await screen.findByText("第一页元数据");
+  fireEvent.click(screen.getByRole("button", { name: "加载更多会话" }));
+  await screen.findByText("后续页元数据");
+  assert.ok(offsets.includes(17));
+  assert.equal(offsets.includes(50), false);
 });

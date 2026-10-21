@@ -101,7 +101,7 @@ def live_system(tmp_path):
         login = post("/api/auth/login", json={"username": "admin", "password": "e2e-password"})
         assert login.status_code == 200, login.text
         code = post("/api/pairings", json={}).json()["code"]
-        host = pair_node(url, "test-node", [str(root)], node_state, code)
+        host = pair_node(url, "test-node", node_state, code)
         node_thread = threading.Thread(target=run_node_thread, daemon=True)
         node_thread.start()
         eventually(
@@ -274,3 +274,104 @@ def test_remote_chat_images_approval_references_and_browser_replay(live_system):
         event = json.loads(replay.recv(timeout=5))
         assert event["id"] > last_cursor
         assert event["type"] == "event"
+
+
+def test_projects_catalog_import_images_and_continue_original_thread(live_system):
+    system = live_system
+    client, post = system["client"], system["post"]
+    host_id = system["host"]["id"]
+
+    def command(response):
+        assert response.status_code == 202, response.text
+        command_id = response.json()["command"]["id"]
+
+        def done():
+            value = client.get(f"/api/commands/{command_id}").json()["command"]
+            assert value["status"] not in {"failed", "unknown"}, value
+            return value["result"] if value["status"] == "completed" else None
+
+        return eventually(done, "project/history command")
+
+    unrelated = system["root"].parent / "new-project"
+    result = command(
+        post(
+            "/api/projects",
+            json={
+                "host_id": host_id,
+                "cwd": str(unrelated),
+                "name": "Another project",
+                "create_directory": True,
+            },
+        )
+    )
+    assert unrelated.is_dir()
+    project = result["project"]
+    assert Path(project["cwd"]) == unrelated
+    listing = command(
+        post(f"/api/hosts/{host_id}/directories", json={"path": str(unrelated.parent)})
+    )
+    assert any(Path(entry["path"]) == unrelated for entry in listing["directories"])
+
+    catalog = command(post(f"/api/hosts/{host_id}/catalog", json={}))
+    native = catalog["data"][0]
+    imported = post(f"/api/hosts/{host_id}/imports", json={"native_thread_id": native["id"]})
+    thread_id = imported.json()["thread"]["id"]
+    command(imported)
+
+    def loaded():
+        result = client.get(f"/api/threads/{thread_id}").json()
+        return result if result["thread"]["history_loaded"] else None
+
+    history = eventually(loaded, "durable imported items")
+    assert [item["native_id"] for item in history["items"]] == [
+        "old-user-1",
+        "old-answer-1",
+        "old-image",
+        "old-search",
+    ]
+    assert [item["position"] for item in history["items"]] == [1, 2, 3, 4]
+    assert history["thread"]["imported"] is True
+    assert Path(history["thread"]["cwd"]) == system["root"].parent / "previous-project"
+    assert history["thread"]["project_id"] != project["id"]
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    assert not any(message.get("method") in {"thread/resume", "turn/start"} for message in audit)
+    assert len([m for m in audit if m.get("method") == "thread/turns/list"]) == 2
+
+    def images():
+        result = loaded()
+        return (
+            result
+            if all(result["items"][index]["data"].get("_assets") for index in (0, 2))
+            else None
+        )
+
+    history = eventually(images, "imported input and local output images")
+    for index in (0, 2):
+        assert client.get(history["items"][index]["data"]["_assets"][0]["url"]).status_code == 200
+    repeated = post(f"/api/hosts/{host_id}/imports", json={"native_thread_id": native["id"]})
+    assert repeated.json()["thread"]["id"] == thread_id
+    command(repeated)
+    eventually(loaded, "reimport complete")
+    assert len(loaded()["items"]) == 4
+
+    command(
+        post(
+            f"/api/threads/{thread_id}/messages",
+            json={
+                "text": "Continue the same conversation",
+                "client_request_id": uuid4().hex,
+            },
+        )
+    )
+    eventually(
+        lambda: client.get(f"/api/threads/{thread_id}").json()["thread"]["status"] == "idle",
+        "continued original conversation",
+    )
+    audit = [json.loads(line) for line in system["audit"].read_text(encoding="utf-8").splitlines()]
+    resume = next(message for message in audit if message.get("method") == "thread/resume")
+    assert resume["params"]["threadId"] == "native-history"
+    assert resume["params"]["excludeTurns"] is True
+    assert (
+        next(m for m in audit if m.get("method") == "turn/start")["params"]["threadId"]
+        == "native-history"
+    )
