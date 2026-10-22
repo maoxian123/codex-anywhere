@@ -273,6 +273,7 @@ test("external writer takeover requires PID confirmation and never sends the dra
     name: "发送消息给 Codex",
   });
   fireEvent.change(input, { target: { value: "保留我的草稿" } });
+  fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
   fireEvent.click(
     await screen.findByRole("button", { name: "结束进程并接管" }),
   );
@@ -289,7 +290,7 @@ test("external writer takeover requires PID confirmation and never sends the dra
     0,
   );
   fireEvent.click(screen.getByRole("button", { name: "确认结束并接管" }));
-  await screen.findByText("本项目托管");
+  await screen.findByText("已托管");
   const takeover = server.requests.find((entry) =>
     entry.path.endsWith("/takeover"),
   )!;
@@ -317,6 +318,9 @@ test("a writer conflict checks ownership and preserves the failed message draft"
   await screen.findByText("可接管");
   fireEvent.change(input, { target: { value: "继续之前的任务" } });
   fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await screen.findByRole("button", { name: /^会话托管：其他进程占用/ });
+  assert.equal(screen.queryByRole("button", { name: "结束进程并接管" }), null);
+  fireEvent.click(screen.getByRole("button", { name: /^会话托管：/ }));
   await screen.findByRole("button", { name: "结束进程并接管" });
   assert.equal((input as HTMLTextAreaElement).value, "继续之前的任务");
   assert.equal(
@@ -336,10 +340,11 @@ test("leaving the conversation releases this tab's lease with a later timestamp"
     can_terminate: false,
     owner_token: null,
   });
-  await screen.findByText("本项目托管");
+  await screen.findByText("已托管");
   fireEvent.click(screen.getByLabelText("设备与设置"));
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
   await screen.findByRole("textbox", { name: "管理员用户名" });
+  assert.equal(screen.queryByRole("button", { name: /^会话托管：/ }), null);
   await waitFor(() =>
     assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
   );
@@ -360,6 +365,7 @@ test("manual release and native ownership events update the displayed management
     can_terminate: false,
     owner_token: null,
   });
+  fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
   fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
   await screen.findByText("可接管");
   const count = server.requests.filter((entry) =>
@@ -374,7 +380,7 @@ test("manual release and native ownership events update the displayed management
       owner_token: null,
     },
   });
-  await screen.findByText("本项目托管");
+  await screen.findByText("已托管");
   server.setOwnership({
     state: "unknown",
     owners: [],
@@ -383,7 +389,7 @@ test("manual release and native ownership events update the displayed management
     reason: "没有足够权限确认占用进程",
   });
   server.event("thread/status/changed", { status: { type: "notLoaded" } });
-  await screen.findByText("占用状态未确定");
+  await screen.findByText("状态待确认");
   assert.ok(screen.getByText("没有足够权限确认占用进程"));
   assert.ok(!screen.queryByRole("button", { name: "结束进程并接管" }));
 });
@@ -395,7 +401,7 @@ test("pagehide releases with keepalive and pageshow restores only browser presen
     can_terminate: false,
     owner_token: null,
   });
-  await screen.findByText("本项目托管");
+  await screen.findByText("已托管");
   act(() => window.dispatchEvent(new Event("pagehide")));
   await waitFor(() =>
     assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
@@ -429,12 +435,13 @@ for (const result of [
       { state: "managed", owners: [], can_terminate: false, owner_token: null },
       result,
     );
+    fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
     fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
     await screen.findByText(
       result.error || "释放托管失败，请重新检查占用状态。",
     );
     assert.ok(!screen.queryByText(/已释放托管/));
-    assert.ok(screen.getByText("本项目托管"));
+    assert.ok(screen.getByText("已托管"));
   });
 }
 
@@ -447,6 +454,7 @@ test("deferred manual release remains paused while browsing, and sending explici
       reason: "当前任务执行结束后释放托管",
     },
   );
+  fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
   fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
   await screen.findByText("当前任务执行结束后释放托管");
   fireEvent.pointerDown(document);
@@ -474,6 +482,7 @@ test("retained leases show the other page explanation and native release errors 
     { state: "managed", owners: [], can_terminate: false, owner_token: null },
     { released: false, retained: true },
   );
+  fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
   fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
   await screen.findByText("其他页面仍在使用此会话，当前托管将继续保留。");
   server.event("anywhere/ownership", {

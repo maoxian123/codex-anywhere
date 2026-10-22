@@ -1130,6 +1130,24 @@ function Workspace({
             </h1>
           </div>
           <div className="topbar-right">
+            {!route.settings &&
+              !loadingThread &&
+              detail?.thread.id === route.id &&
+              ownershipEnabled && (
+                <OwnershipPanel
+                  key={`ownership:${route.id}`}
+                  ownership={ownership.ownership}
+                  pending={ownership.pending}
+                  error={ownership.error}
+                  notice={ownership.notice}
+                  onCheck={() => void ownership.check()}
+                  onTakeover={async (confirmed) => {
+                    await ownership.takeover(confirmed);
+                    await refreshThread();
+                  }}
+                  onRelease={() => void ownership.release()}
+                />
+              )}
             <span
               className={`connection-status ${connection === "connected" && online ? "live" : ""}`}
             >
@@ -1227,21 +1245,6 @@ function Workspace({
               <div className="thread-error">
                 <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
               </div>
-            )}
-            {ownershipEnabled && (
-              <OwnershipPanel
-                key={`ownership:${route.id}`}
-                ownership={ownership.ownership}
-                pending={ownership.pending}
-                error={ownership.error}
-                notice={ownership.notice}
-                onCheck={() => void ownership.check()}
-                onTakeover={async (confirmed) => {
-                  await ownership.takeover(confirmed);
-                  await refreshThread();
-                }}
-                onRelease={() => void ownership.release()}
-              />
             )}
             {historyError && (
               <div className="thread-error">

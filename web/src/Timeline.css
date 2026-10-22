@@ -1,0 +1,154 @@
+.work-process {
+  min-width: 0;
+  margin: 0 0 17px 33px;
+  color: #8da5af;
+}
+
+.work-process > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 33px;
+  padding: 5px 0;
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 5px;
+}
+
+.work-process > summary::-webkit-details-marker {
+  display: none;
+}
+
+.work-process > summary:hover {
+  color: #c0d2d9;
+}
+
+.work-process > summary:focus-visible {
+  outline: 1px solid #81ad9e;
+  outline-offset: 4px;
+}
+
+.work-process-arrow {
+  flex: none;
+  color: #66838f;
+  transition: transform 0.15s;
+}
+
+.work-process[open] > summary .work-process-arrow {
+  transform: rotate(90deg);
+}
+
+.work-process-status {
+  display: flex;
+  flex: none;
+  color: #8db4a6;
+}
+
+.work-process-title {
+  flex: none;
+  color: #adc2cb;
+}
+
+.work-process-counts {
+  min-width: 0;
+  color: #6e8996;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-process-failure {
+  flex: none;
+  color: #e6a39a;
+}
+
+.work-process-error .work-process-status {
+  color: #e6a39a;
+}
+
+.work-process-current {
+  margin-left: auto;
+  min-width: 0;
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8db4a6;
+}
+
+.work-process-items {
+  margin: 4px 0 0 6px;
+  padding: 1px 0 1px 16px;
+  min-width: 0;
+  border-left: 1px solid #2c414b;
+}
+
+.work-process-items .tool-item {
+  margin: 0 0 5px;
+}
+
+.work-process-items .tool-card {
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.work-process-items .tool-card > summary {
+  padding: 8px 5px;
+}
+
+.work-process-items .tool-card[open] > summary {
+  background: #1e2e3550;
+  border-bottom: 0;
+}
+
+.work-process-items .tool-content {
+  padding: 9px 12px 12px 26px;
+  border-bottom: 1px solid #2a404a60;
+  min-width: 0;
+}
+
+.work-process-items .item-expansion {
+  margin-top: 0;
+  padding: 0 0 10px 26px;
+}
+
+.work-process-items .system-note {
+  margin: 5px 0 8px;
+}
+
+.work-process-items .references {
+  margin-left: 26px;
+}
+
+@media (max-width: 680px) {
+  .work-process {
+    margin-left: 0;
+    margin-bottom: 13px;
+  }
+
+  .work-process > summary {
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 10px;
+  }
+
+  .work-process-counts {
+    flex: 1 1 110px;
+  }
+
+  .work-process-current {
+    display: none;
+  }
+
+  .work-process-items {
+    padding-left: 10px;
+  }
+
+  .work-process-items .tool-content {
+    padding: 7px 6px 10px 16px;
+  }
+}

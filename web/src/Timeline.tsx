@@ -1,12 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowDown,
+  AlertCircle,
   Bot,
+  Check,
   CheckCheck,
+  ChevronRight,
   FileDiff,
   Globe,
   ImageIcon,
   ListChecks,
+  LoaderCircle,
   MessageSquare,
   Terminal,
   Wrench,
@@ -23,6 +27,14 @@ import type { Asset, Item, Reference, StreamItem } from "./types";
 import { json, list, object, safeLink, string, timeLabel } from "./utils";
 import { galleryAssets } from "./markdown-assets";
 import { api, errorText } from "./api";
+import {
+  activeWorkLabel,
+  entryRunning,
+  timelineUnits,
+  workSummary,
+  type TimelineUnit,
+  type WorkGroup,
+} from "./timeline-work";
 
 export type TimelineProps = {
   items: Item[];
@@ -159,7 +171,11 @@ function NativeTimelineItem({
             <Bot size={16} />
           </span>
           <span>Codex</span>
-          <time>{timeLabel(item.created_at)}</time>
+          {data._pending ? (
+            <span className="live-label">正在生成</span>
+          ) : (
+            <time>{timeLabel(item.created_at)}</time>
+          )}
           <CopyButton text={text} />
         </div>
         <div className="agent-body">
@@ -387,14 +403,25 @@ function TimelineItem(props: {
   stream?: StreamItem;
   onImage: TimelineProps["onImage"];
   onNavigate: TimelineProps["onNavigate"];
+  reveal?: boolean;
 }) {
-  const { item } = props;
+  const { item, reveal } = props;
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const [raw, setRaw] = useState<Item | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => request.current?.abort(), [item.id]);
+  useLayoutEffect(() => {
+    if (reveal) {
+      const details =
+        wrapperRef.current?.querySelector<HTMLDetailsElement>(
+          "details.tool-card",
+        );
+      if (details) details.open = true;
+    }
+  }, [reveal, item.id]);
   const expand = async () => {
     if (expanded) {
       setExpanded(false);
@@ -438,7 +465,7 @@ function TimelineItem(props: {
         }
       : item;
   return (
-    <div className="timeline-item-wrapper">
+    <div className="timeline-item-wrapper" ref={wrapperRef}>
       <NativeTimelineItem {...props} item={shown} full={expanded} />
       {item.data._truncated === true && (
         <div className="item-expansion">
@@ -466,6 +493,94 @@ function TimelineItem(props: {
   );
 }
 
+function WorkProcess({
+  group,
+  active,
+  targetItem,
+  onImage,
+  onNavigate,
+}: {
+  group: WorkGroup;
+  active: boolean;
+  targetItem?: string;
+  onImage: TimelineProps["onImage"];
+  onNavigate: TimelineProps["onNavigate"];
+}) {
+  const containsTarget = Boolean(
+    targetItem &&
+    group.entries.some(
+      ({ item }) => item.id === targetItem || item.native_id === targetItem,
+    ),
+  );
+  const [expanded, setExpanded] = useState(containsTarget);
+  const [mounted, setMounted] = useState(containsTarget);
+  const revealedTarget = useRef(containsTarget ? targetItem : undefined);
+  const reveal = containsTarget && revealedTarget.current !== targetItem;
+  const open = expanded || reveal;
+  useLayoutEffect(() => {
+    if (!containsTarget) revealedTarget.current = undefined;
+    else if (reveal) {
+      revealedTarget.current = targetItem;
+      setExpanded(true);
+      setMounted(true);
+    }
+  }, [containsTarget, reveal, targetItem]);
+  const running = active || group.entries.some(entryRunning);
+  const current = [...group.entries].reverse().find(entryRunning);
+  const { counts, failures } = workSummary(group.entries);
+  return (
+    <details
+      className={`work-process${running ? " work-process-running" : ""}${failures ? " work-process-error" : ""}`}
+      open={open}
+    >
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          setMounted(true);
+          setExpanded(!open);
+        }}
+      >
+        <ChevronRight className="work-process-arrow" size={14} />
+        <span className="work-process-status" aria-hidden="true">
+          {failures ? (
+            <AlertCircle size={14} />
+          ) : running ? (
+            <LoaderCircle className="spin" size={14} />
+          ) : (
+            <Check size={14} />
+          )}
+        </span>
+        <span className="work-process-title">
+          {running ? "正在工作" : "工作过程"}
+        </span>
+        <span className="work-process-counts">{counts}</span>
+        {failures > 0 && (
+          <span className="work-process-failure">{failures} 项失败</span>
+        )}
+        {running && current && (
+          <span className="work-process-current">
+            {activeWorkLabel(current)}
+          </span>
+        )}
+      </summary>
+      {(mounted || open) && (
+        <div className="work-process-items">
+          {group.entries.map(({ item, stream }) => (
+            <TimelineItem
+              key={item.native_id || item.id}
+              item={item}
+              stream={stream}
+              reveal={item.id === targetItem || item.native_id === targetItem}
+              onImage={onImage}
+              onNavigate={onNavigate}
+            />
+          ))}
+        </div>
+      )}
+    </details>
+  );
+}
+
 export default function Timeline({
   items,
   streams,
@@ -485,6 +600,31 @@ export default function Timeline({
   const [nearBottom, setNearBottom] = useState(true);
   const previousLastItem = useRef("");
   const revealedTarget = useRef("");
+  const targetHighlight = useRef<{
+    element: HTMLElement;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      const highlight = targetHighlight.current;
+      if (highlight) {
+        clearTimeout(highlight.timer);
+        highlight.element.classList.remove("referenced-item");
+      }
+    },
+    [],
+  );
+  const previousUnits = useRef<TimelineUnit[]>([]);
+  const units = timelineUnits(items, streams, previousUnits.current);
+  previousUnits.current = units;
+  const pendingCount = units.reduce(
+    (total, unit) =>
+      total +
+      (unit.kind === "work"
+        ? unit.entries.filter((entry) => entry.pending).length
+        : Number(Boolean(unit.entry.pending))),
+    0,
+  );
   const prependPosition = useRef<{ height: number; top: number } | null>(null);
   useLayoutEffect(() => {
     const element = scrollRef.current;
@@ -501,6 +641,7 @@ export default function Timeline({
     0,
   );
   useEffect(() => {
+    if (!targetItem) revealedTarget.current = "";
     if (targetItem && targetItem !== revealedTarget.current) {
       const matching = items.find(
         (item) => item.id === targetItem || item.native_id === targetItem,
@@ -509,14 +650,23 @@ export default function Timeline({
         const element = document.getElementById(
           `item-${matching.native_id || matching.id}`,
         );
-        element?.scrollIntoView({ block: "center", behavior: "smooth" });
-        element?.classList.add("referenced-item");
-        const timer = setTimeout(
-          () => element?.classList.remove("referenced-item"),
-          3500,
-        );
-        revealedTarget.current = targetItem;
-        return () => clearTimeout(timer);
+        if (element) {
+          const previous = targetHighlight.current;
+          if (previous) {
+            clearTimeout(previous.timer);
+            previous.element.classList.remove("referenced-item");
+          }
+          element.scrollIntoView({ block: "center", behavior: "smooth" });
+          element.classList.add("referenced-item");
+          targetHighlight.current = {
+            element,
+            timer: setTimeout(
+              () => element.classList.remove("referenced-item"),
+              3500,
+            ),
+          };
+          revealedTarget.current = targetItem;
+        }
       }
     } else if (nearBottom && !targetItem)
       endRef.current?.scrollIntoView({
@@ -531,10 +681,6 @@ export default function Timeline({
         <Spinner label="正在读取对话" />
       </div>
     );
-  const known = new Set(items.flatMap((item) => [item.id, item.native_id]));
-  const pending = Object.values(streams).filter(
-    (stream) => !known.has(stream.id),
-  );
   return (
     <div
       className="timeline-scroll"
@@ -594,7 +740,7 @@ export default function Timeline({
                   : "未找到这条引用消息。"}
             </p>
           )}
-        {!items.length && !pending.length && (
+        {!items.length && !pendingCount && (
           <div className="thread-empty">
             <span className="empty-orbit">
               <Bot size={28} />
@@ -611,56 +757,43 @@ export default function Timeline({
             </p>
           </div>
         )}
-        {items.map((item) => (
-          <TimelineItem
-            key={item.id}
-            item={item}
-            stream={streams[item.native_id] || streams[item.id]}
-            onImage={onImage}
-            onNavigate={onNavigate}
-          />
-        ))}
-        {pending.map((stream) =>
-          stream.kind === "message" ? (
-            <article className="message agent-message" key={stream.id}>
-              <div className="message-heading">
-                <span className="avatar avatar-agent">
-                  <Bot size={16} />
-                </span>
-                <span>Codex</span>
-                <span className="live-label">正在生成</span>
-              </div>
-              <div className="agent-body">
-                <Markdown
-                  text={stream.text}
-                  onImage={onImage}
-                  onNavigate={onNavigate}
-                />
-                <span className="stream-cursor" />
-              </div>
-            </article>
+        {units.map((unit, index) =>
+          unit.kind === "work" ? (
+            <WorkProcess
+              key={unit.key}
+              group={unit}
+              active={busy && index === units.length - 1}
+              targetItem={targetItem}
+              onImage={onImage}
+              onNavigate={onNavigate}
+            />
           ) : (
-            <div className="tool-item" key={stream.id}>
-              <Disclosure
-                title={stream.kind === "command" ? "执行命令" : "思考过程"}
-                icon={<Terminal size={15} />}
-                running
-              >
-                <pre>{stream.text}</pre>
-              </Disclosure>
-            </div>
+            <TimelineItem
+              key={`item:${unit.key}`}
+              item={unit.entry.item}
+              stream={unit.entry.stream}
+              reveal={
+                unit.entry.item.id === targetItem ||
+                unit.entry.item.native_id === targetItem
+              }
+              onImage={onImage}
+              onNavigate={onNavigate}
+            />
           ),
         )}
-        {busy && !pending.length && !Object.keys(streams).length && (
-          <div className="working-indicator">
-            <span className="working-dots">
-              <i />
-              <i />
-              <i />
-            </span>
-            Codex 正在工作
-          </div>
-        )}
+        {busy &&
+          !pendingCount &&
+          !Object.keys(streams).length &&
+          units.at(-1)?.kind !== "work" && (
+            <div className="working-indicator">
+              <span className="working-dots">
+                <i />
+                <i />
+                <i />
+              </span>
+              Codex 正在工作
+            </div>
+          )}
         <div ref={endRef} className="timeline-end" />
       </div>
       {!nearBottom && items.length > 0 && (

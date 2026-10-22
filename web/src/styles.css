@@ -621,6 +621,7 @@ svg {
 }
 .topbar-left {
   display: flex;
+  flex: 1;
   align-items: center;
   gap: 13px;
   min-width: 0;
@@ -646,7 +647,20 @@ svg {
 .topbar-right {
   display: flex;
   align-items: center;
-  gap: 18px;
+  flex-shrink: 0;
+  gap: 12px;
+}
+@media (max-width: 480px) {
+  .topbar-right .connection-status {
+    width: 12px;
+    justify-content: center;
+    font-size: 0;
+    gap: 0;
+  }
+  .topbar-right .connection-status > span {
+    width: 5px;
+    height: 5px;
+  }
 }
 .connection-status {
   display: flex;
@@ -1006,37 +1020,6 @@ svg {
   padding: 9px 38px;
   flex-shrink: 0;
   border-bottom: 1px solid #28363d88;
-}
-.ownership-panel {
-  flex-shrink: 0;
-  margin: 0 24px 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-size: 12px;
-}
-.ownership-summary {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.ownership-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-left: auto;
-}
-.ownership-panel p {
-  margin: 8px 0 0;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-.ownership-hint {
-  color: var(--muted);
-}
-.ownership-panel .inline-error {
-  margin-top: 8px;
 }
 .task-heading {
   display: flex;
