@@ -451,3 +451,171 @@ def test_capabilities_repeated_cursor_and_unexpected_native_failures_are_bounded
             await RuntimeCapabilities().validate(peer, "cwd", {"approval_policy": "never"})
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
+def test_native_service_tier_is_readback_only_and_preserves_nullable_unknown_values(tier):
+    baseline = {"model": "inherited-model", "service_tier": "baseline-tier"}
+    original = copy.deepcopy(baseline)
+    settings = effective_settings({"serviceTier": tier}, baseline)
+    assert settings["service_tier"] == tier
+    assert settings["model"] == "inherited-model"
+    assert baseline == original
+    assert thread_overrides({"service_tier": tier}) == {}
+    assert turn_overrides({"service_tier": tier}, baseline, None) == {}
+    with pytest.raises(ValueError, match="Unsupported execution_settings"):
+        requested_settings({"execution_settings": {"service_tier": tier}})
+
+
+@pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
+def test_missing_native_service_tier_preserves_baseline_without_inventing_defaults(tier):
+    assert effective_settings({}, {"service_tier": tier})["service_tier"] == tier
+    assert "service_tier" not in effective_settings({})
+    assert "service_tier" not in effective_settings({"thread": {"serviceTier": "fast"}})
+
+
+@pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
+def test_capabilities_read_config_service_tier_without_private_config(tier):
+    async def scenario():
+        peer = Peer()
+        peer.config["service_tier"] = tier
+        result = await RuntimeCapabilities().read(peer, "cwd")
+        assert result["defaults"]["service_tier"] == tier
+        assert result["supported"]["service_tier"] is True
+        assert "SECRET" not in str(result)
+        assert "service_tier" not in next(
+            params for method, params in peer.calls if method == "model/list"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("config_has_null", [False, True])
+def test_new_conversation_default_service_tier_can_come_from_selected_model(config_has_null):
+    async def scenario():
+        peer = Peer()
+        peer.config["model"] = "other-model"
+        if config_has_null:
+            peer.config["service_tier"] = None
+        peer.models[0]["defaultServiceTier"] = "priority"
+        peer.models[1]["defaultServiceTier"] = "future-model-tier"
+        result = await RuntimeCapabilities().read(peer)
+        assert result["defaults"]["service_tier"] == "future-model-tier"
+        assert result["supported"]["service_tier"] is True
+        # An explicit configured tier wins over a catalog default.
+        peer.config["service_tier"] = "fast"
+        result = await RuntimeCapabilities().read(peer)
+        assert result["defaults"]["service_tier"] == "fast"
+
+    asyncio.run(scenario())
+
+
+def test_default_model_service_tier_is_only_used_for_the_selected_model():
+    async def scenario():
+        peer = Peer()
+        peer.config.pop("model")
+        peer.models[0]["defaultServiceTier"] = "default"
+        reader = RuntimeCapabilities()
+        assert (await reader.read(peer))["defaults"]["service_tier"] == "default"
+        peer.config["model"] = "uncatalogued-custom-model"
+        result = await reader.read(peer)
+        assert "service_tier" not in result["defaults"]
+        assert result["supported"]["service_tier"] is False
+
+    asyncio.run(scenario())
+
+
+def test_capabilities_without_service_tier_evidence_remain_unknown():
+    async def scenario():
+        peer = Peer()
+        result = await RuntimeCapabilities().read(peer)
+        assert "service_tier" not in result["defaults"]
+        assert result["supported"]["service_tier"] is False
+
+    asyncio.run(scenario())
+
+
+def test_service_tier_config_changes_invalidate_capabilities_cache():
+    async def scenario():
+        peer, reader = Peer(), RuntimeCapabilities()
+
+        def catalog_reads():
+            return sum(method == "model/list" for method, _ in peer.calls)
+
+        await reader.read(peer, "cwd")
+        assert catalog_reads() == 2
+        peer.config["service_tier"] = "fast"
+        fast = await reader.read(peer, "cwd")
+        assert fast["defaults"]["service_tier"] == "fast" and catalog_reads() == 4
+        fast["defaults"]["service_tier"] = "caller-mutation"
+        cached = await reader.read(peer, "cwd")
+        assert cached["defaults"]["service_tier"] == "fast" and catalog_reads() == 4
+        peer.config["service_tier"] = "priority"
+        priority = await reader.read(peer, "cwd")
+        assert priority["defaults"]["service_tier"] == "priority" and catalog_reads() == 6
+        peer.config["service_tier"] = None
+        nullable = await reader.read(peer, "cwd")
+        assert nullable["defaults"]["service_tier"] is None and catalog_reads() == 8
+        peer.config.pop("service_tier")
+        missing = await reader.read(peer, "cwd")
+        assert "service_tier" not in missing["defaults"]
+        assert missing["supported"]["service_tier"] is False and catalog_reads() == 10
+        peer.models[0]["defaultServiceTier"] = "fast"
+        model_default = await reader.read(peer, "cwd", refresh=True)
+        assert model_default["defaults"]["service_tier"] == "fast" and catalog_reads() == 12
+        peer.models[0]["defaultServiceTier"] = "priority"
+        refreshed = await reader.read(peer, "cwd", refresh=True)
+        assert refreshed["defaults"]["service_tier"] == "priority" and catalog_reads() == 14
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
+def test_service_tier_cannot_be_submitted_to_runtime_settings_validation(tier):
+    async def scenario():
+        peer = Peer()
+        with pytest.raises(ValueError, match="Unsupported execution_settings"):
+            await RuntimeCapabilities().validate(peer, "cwd", {"service_tier": tier})
+        assert peer.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_invalid_service_tier_structures_do_not_expose_config_or_native_secrets():
+    async def scenario():
+        peer = Peer()
+        peer.config["service_tier"] = {"token": "SECRET-TIER"}
+        result = await RuntimeCapabilities().read(peer)
+        assert "service_tier" not in result["defaults"]
+        assert "SECRET" not in str(result)
+        assert "service_tier" not in effective_settings({"serviceTier": {"token": "SECRET-TIER"}})
+
+    asyncio.run(scenario())
+
+
+def test_missing_and_explicit_null_tiers_remain_distinct_in_readback():
+    assert "service_tier" not in effective_settings({})
+    assert effective_settings({"serviceTier": None})["service_tier"] is None
+    assert effective_settings({}, {"service_tier": None})["service_tier"] is None
+    assert (
+        effective_settings({"serviceTier": None}, {"service_tier": "fast"})["service_tier"] is None
+    )
+
+    async def scenario():
+        peer, reader = Peer(), RuntimeCapabilities()
+        missing = await reader.read(peer)
+        assert "service_tier" not in missing["defaults"]
+        peer.config["service_tier"] = None
+        configured_null = await reader.read(peer)
+        assert "service_tier" in configured_null["defaults"]
+        assert configured_null["defaults"]["service_tier"] is None
+        peer.config.pop("service_tier")
+        peer.models[0]["defaultServiceTier"] = None
+        model_null = await reader.read(peer, refresh=True)
+        assert model_null["defaults"]["service_tier"] is None
+        assert model_null["supported"]["service_tier"] is True
+        peer.config["service_tier"] = None
+        peer.models[0]["defaultServiceTier"] = ""
+        assert (await reader.read(peer))["defaults"]["service_tier"] is None
+
+    asyncio.run(scenario())

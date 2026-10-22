@@ -38,7 +38,10 @@ export type NativeExecutionSettings = Omit<
     [Key in keyof ExecutionSettings]?: ExecutionSettings[Key] | null;
   },
   "approval_policy"
-> & { approval_policy?: string | JsonObject | null };
+> & {
+  approval_policy?: string | JsonObject | null;
+  readonly service_tier?: string | null;
+};
 export type RuntimeModel = {
   id: string;
   model: string;

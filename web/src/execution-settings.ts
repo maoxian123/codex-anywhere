@@ -84,9 +84,33 @@ export function permissionLabel(settings?: NativeExecutionSettings) {
     `${settings?.sandbox_mode || "默认沙箱"} · ${typeof settings?.approval_policy === "object" && settings.approval_policy ? "自定义原生审批" : settings?.approval_policy || "默认审批"}`
   );
 }
+/** Native readback only; absence never inherits a different conversation's default. */
+export function serviceTierLabel(serviceTier?: string | null): string {
+  if (serviceTier === null) return "正常模式（默认）";
+  const tier = serviceTier?.trim();
+  if (!tier) return "模式未知";
+  switch (tier.toLowerCase()) {
+    case "fast":
+    case "priority":
+      return "快速模式";
+    case "default":
+      return "正常模式";
+    case "ultrafast":
+      return "超快模式";
+    default:
+      return `其他模式（${tier}）`;
+  }
+}
 export function settingsLabel(settings?: NativeExecutionSettings) {
   if (!settings || !Object.keys(settings).length) return "节点默认设置";
-  return [settings.model, settings.effort, permissionLabel(settings)]
+  return [
+    settings.model,
+    settings.effort,
+    permissionLabel(settings),
+    ...(Object.hasOwn(settings, "service_tier")
+      ? [serviceTierLabel(settings.service_tier)]
+      : []),
+  ]
     .filter(Boolean)
     .join(" · ");
 }
@@ -97,9 +121,13 @@ export function changedOverrides(
   after: NativeExecutionSettings,
   edited?: (keyof ExecutionSettings)[],
 ): ExecutionSettings {
-  const result = { ...desired };
+  const result = Object.fromEntries(
+    Object.entries(desired).filter(([key]) => key !== "service_tier"),
+  ) as ExecutionSettings;
   for (const key of new Set(
-    edited || [...Object.keys(before), ...Object.keys(after)],
+    (edited || [...Object.keys(before), ...Object.keys(after)]).filter(
+      (key) => key !== "service_tier",
+    ),
   ) as Set<keyof ExecutionSettings>) {
     if (!edited && JSON.stringify(before[key]) === JSON.stringify(after[key]))
       continue;

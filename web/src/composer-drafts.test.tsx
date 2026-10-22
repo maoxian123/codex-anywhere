@@ -261,3 +261,53 @@ test("model, effort and current versus next permissions remain visible without o
   assert.ok(screen.getByText(/当前权限：只读/));
   assert.ok(screen.getByText(/下次执行：model-next · high · 工作区写入/));
 });
+
+test("the composer keeps actual Codex mode outside folded settings even on a small screen", () => {
+  const originalWidth = window.innerWidth;
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    value: 375,
+  });
+  try {
+    const view = render(
+      <Composer
+        {...props}
+        thread={{ ...thread(), effective_settings: { service_tier: "fast" } }}
+      />,
+    );
+    const badge = screen.getByRole("status", { name: "当前 Codex 模式" });
+    assert.match(badge.textContent || "", /当前：快速模式/);
+    assert.equal(badge.closest("details"), null);
+    assert.equal(badge.closest("[hidden]"), null);
+    assert.ok(badge.closest(".composer-runtime-summary"));
+    view.rerender(
+      <Composer
+        {...props}
+        hostOnline={false}
+        thread={{
+          ...thread(),
+          effective_settings: { service_tier: "default" },
+        }}
+      />,
+    );
+    assert.match(badge.textContent || "", /正常模式.*离线缓存/);
+    view.rerender(
+      <Composer
+        {...props}
+        thread={{ ...thread(), effective_settings: { service_tier: null } }}
+      />,
+    );
+    assert.match(badge.textContent || "", /正常模式（默认）/);
+    assert.match(badge.getAttribute("title") || "", /未选择加速档位/);
+    view.rerender(
+      <Composer {...props} thread={{ ...thread(), effective_settings: {} }} />,
+    );
+    assert.match(badge.textContent || "", /模式未知/);
+    assert.doesNotMatch(badge.textContent || "", /正常模式/);
+  } finally {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: originalWidth,
+    });
+  }
+});

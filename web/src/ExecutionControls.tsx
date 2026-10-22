@@ -9,6 +9,7 @@ import {
   modelId,
   permissionLabel,
   selectedModel,
+  serviceTierLabel,
   settingsLabel,
 } from "./execution-settings";
 import { useRuntimeCapabilities } from "./useRuntimeCapabilities";
@@ -309,8 +310,47 @@ export function RuntimeSettingsEditor({
       }
     : null;
   const displayed = { ...displaySettings, ...settings };
+  const serviceTier =
+    permissionsMode === "existing"
+      ? displaySettings?.service_tier
+      : runtime.value?.defaults.service_tier;
+  const knownMode =
+    serviceTier === null ||
+    (typeof serviceTier === "string" && Boolean(serviceTier.trim()));
+  const cachedMode = !host?.online || Boolean(runtime.reason || runtime.error);
   return (
     <div className="runtime-settings-editor">
+      <div
+        className="execution-service-tier"
+        role="status"
+        aria-label="运行模式"
+      >
+        <span>
+          {permissionsMode === "existing" ? "当前模式" : "新对话模式"}
+        </span>
+        <strong
+          title={
+            serviceTier === null
+              ? "Codex 未选择加速档位，使用默认正常模式。"
+              : "Codex 原生模式，只读显示。"
+          }
+        >
+          {serviceTierLabel(serviceTier)}
+        </strong>
+        <small>
+          {!knownMode
+            ? runtime.loading
+              ? "读取中"
+              : "节点未返回模式，连接或更新节点后确认"
+            : cachedMode
+              ? !host?.online
+                ? "设备离线 · 缓存"
+                : "读取不可用 · 缓存"
+              : permissionsMode === "existing"
+                ? "来自会话最近同步"
+                : "来自节点默认配置"}
+        </small>
+      </div>
       {capabilities ? (
         <ExecutionFields
           capabilities={capabilities}

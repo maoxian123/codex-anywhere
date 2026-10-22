@@ -150,6 +150,13 @@ class NodeService:
         if not thread_id and isinstance(thread, dict):
             thread_id = thread.get("id")
         if isinstance(thread_id, str):
+            if method == "thread/settings/updated":
+                native = params.get("threadSettings")
+                if isinstance(native, dict) and "serviceTier" in native:
+                    tier = native["serviceTier"]
+                    if tier is None or isinstance(tier, str):
+                        known = self.thread_execution.setdefault(thread_id, {})
+                        known["settings"] = dict(known.get("settings", {}), service_tier=tier)
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             if method == "turn/started" and isinstance(turn_id, str):
@@ -886,10 +893,20 @@ class NodeService:
         self.store.save_thread(thread_id, cwd)
         runtime.loaded_threads.add(thread_id)
         self.thread_closed.setdefault(thread_id, asyncio.Event()).clear()
+        known = self.thread_execution.get(thread_id, {}).get("settings", {})
+        mode = {"service_tier": known["service_tier"]} if "service_tier" in known else {}
+        settings = effective_settings(resumed, mode)
         self.thread_execution[thread_id] = {
-            "settings": effective_settings(resumed),
+            "settings": settings,
             "sandbox": resumed.get("sandbox"),
         }
+        if "service_tier" in settings:
+            self.store.record_event(
+                runtime.runtime_id,
+                "anywhere/service_tier",
+                {"threadId": thread_id, "serviceTier": settings["service_tier"]},
+            )
+            self.event_wake.set()
         self.last_activity[thread_id] = time.time()
         self.release_errors.pop(thread_id, None)
         return resumed
@@ -905,8 +922,11 @@ class NodeService:
         *,
         raw_result: dict | None = None,
     ) -> dict:
-        settings = effective_settings(result, baseline)
         old = self.thread_execution.get(thread_id, {})
+        baseline = dict(baseline or {})
+        if "service_tier" in old.get("settings", {}):
+            baseline["service_tier"] = old["settings"]["service_tier"]
+        settings = effective_settings(result, baseline)
         self.thread_execution[thread_id] = {
             "settings": settings,
             "sandbox": result.get("sandbox", old.get("sandbox")),

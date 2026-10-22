@@ -135,6 +135,7 @@ export default function NewConversation({
           sandbox_mode: "workspace-write",
           approval_policy: "on-request",
           ...settings,
+          service_tier: runtime.value?.defaults.service_tier,
         },
       }
     : null;

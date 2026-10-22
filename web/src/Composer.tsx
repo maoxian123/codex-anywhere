@@ -18,7 +18,11 @@ import { api, errorText } from "./api";
 import { ErrorMessage, Modal, References, Spinner } from "./components";
 import { messageText } from "./Timeline";
 import { ThreadExecutionControls } from "./ExecutionControls";
-import { permissionLabel, settingsLabel } from "./execution-settings";
+import {
+  permissionLabel,
+  serviceTierLabel,
+  settingsLabel,
+} from "./execution-settings";
 import type {
   Asset,
   Host,
@@ -409,6 +413,12 @@ function ComposerInput({
     ...thread.effective_settings,
     ...thread.execution_settings,
   };
+  const newConversation = thread.id.startsWith("new:");
+  const serviceTier = thread.effective_settings?.service_tier;
+  const modeLabel = serviceTierLabel(serviceTier);
+  const modeKnown =
+    serviceTier === null ||
+    (typeof serviceTier === "string" && Boolean(serviceTier.trim()));
   useEffect(() => {
     if (!mention) return;
     let cancelled = false;
@@ -860,47 +870,67 @@ function ComposerInput({
             </button>
             {busy && <span className="composer-mode">补充当前任务</span>}
           </div>
-          {!hideSettings && (
-            <details className="composer-settings">
-              <summary
-                aria-label="运行设置"
-                title={settingsLabel({
-                  ...thread.effective_settings,
-                  ...thread.execution_settings,
-                })}
-              >
-                <Settings2 size={14} />
-                <span>
-                  {pendingSettings ? "下次：" : ""}
-                  {nextSettings.model || "默认模型"}
-                </span>
-                <span className="composer-effort">
-                  {nextSettings.effort || "默认强度"}
-                </span>
-                {(settingsSaving ||
-                  (thread.settings_revision ?? 0) >
-                    (thread.effective_settings_revision ?? 0)) && (
-                  <i title={settingsSaving ? "保存设置中" : "下次执行生效"} />
-                )}
-              </summary>
-              <div className="composer-settings-panel">
-                <ThreadExecutionControls
-                  thread={thread}
-                  host={host}
-                  project={project}
-                  onSave={onSettingsChange}
-                  onProjectSettings={onProjectSettings}
-                  onBusyChange={setSettingsSaving}
-                />
-              </div>
-            </details>
-          )}
-          {hideSettings && (
-            <span className="composer-model-label">
-              {nextSettings.model || "默认模型"} ·{" "}
-              {nextSettings.effort || "默认强度"}
+          <div className="composer-runtime-summary">
+            {!hideSettings && (
+              <details className="composer-settings">
+                <summary
+                  aria-label="运行设置"
+                  title={settingsLabel({
+                    ...thread.effective_settings,
+                    ...thread.execution_settings,
+                  })}
+                >
+                  <Settings2 size={14} />
+                  <span>
+                    {pendingSettings ? "下次：" : ""}
+                    {nextSettings.model || "默认模型"}
+                  </span>
+                  <span className="composer-effort">
+                    {nextSettings.effort || "默认强度"}
+                  </span>
+                  {(settingsSaving ||
+                    (thread.settings_revision ?? 0) >
+                      (thread.effective_settings_revision ?? 0)) && (
+                    <i title={settingsSaving ? "保存设置中" : "下次执行生效"} />
+                  )}
+                </summary>
+                <div className="composer-settings-panel">
+                  <ThreadExecutionControls
+                    thread={thread}
+                    host={host}
+                    project={project}
+                    onSave={onSettingsChange}
+                    onProjectSettings={onProjectSettings}
+                    onBusyChange={setSettingsSaving}
+                  />
+                </div>
+              </details>
+            )}
+            {hideSettings && (
+              <span className="composer-model-label">
+                {nextSettings.model || "默认模型"} ·{" "}
+                {nextSettings.effort || "默认强度"}
+              </span>
+            )}
+            <span
+              className={`composer-service-tier ${modeKnown ? "is-known" : "is-unknown"}${/^(fast|priority|ultrafast)$/i.test(serviceTier || "") ? " is-accelerated" : ""}`}
+              role="status"
+              aria-label={
+                newConversation ? "新对话 Codex 模式" : "当前 Codex 模式"
+              }
+              title={
+                modeKnown
+                  ? `${newConversation ? "来自节点新对话默认配置" : "来自会话最近同步的实际设置"}${serviceTier === null ? "；Codex 未选择加速档位，使用默认正常模式" : ""}${hostOnline ? "" : "；设备离线，显示缓存"}`
+                  : "节点尚未返回此会话的 Codex 模式，无法确认是否启用快速模式。请连接或更新节点后确认。"
+              }
+            >
+              {newConversation ? "新对话模式：" : "当前："}
+              {modeLabel}
+              {!hostOnline && (
+                <small>{modeKnown ? " · 离线缓存" : " · 设备离线"}</small>
+              )}
             </span>
-          )}
+          </div>
           <div className="composer-actions">
             {busy && (
               <button

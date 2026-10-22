@@ -58,6 +58,12 @@ def requested_settings(payload: dict) -> tuple[dict, int]:
 def effective_settings(result: dict, baseline: dict | None = None) -> dict:
     """Read only actual native fields; keep unknown inherited values nullable."""
     settings = {key: (baseline or {}).get(key) for key in SETTINGS}
+    # Service tier is native readback only. Preserve an explicit native null,
+    # but omit an absent field so older peers do not appear to report a tier.
+    if "service_tier" in (baseline or {}):
+        tier = baseline["service_tier"]
+        if tier is None or isinstance(tier, str):
+            settings["service_tier"] = tier
     for native, public in (
         ("model", "model"),
         ("reasoningEffort", "effort"),
@@ -66,6 +72,10 @@ def effective_settings(result: dict, baseline: dict | None = None) -> dict:
     ):
         if native in result:
             settings[public] = copy.deepcopy(result[native])
+    if "serviceTier" in result:
+        tier = result["serviceTier"]
+        if tier is None or isinstance(tier, str):
+            settings["service_tier"] = tier
     sandbox = result.get("sandbox")
     if isinstance(sandbox, dict):
         settings["sandbox_mode"] = next(
@@ -177,6 +187,10 @@ class RuntimeCapabilities:
                     "network_access"
                 ),
             }
+            if "service_tier" in config:
+                tier = config["service_tier"]
+                if tier is None or isinstance(tier, str):
+                    defaults["service_tier"] = tier
             if defaults["sandbox_mode"] == "danger-full-access":
                 defaults["network_access"] = True
             elif defaults["sandbox_mode"] == "read-only":
@@ -214,7 +228,12 @@ class RuntimeCapabilities:
             constraints["approvals_reviewers"] = reviewers
             if required_auto:
                 constraints["auto_review_required_models"] = required_auto
-            safe = (defaults, constraints, config.get("model_provider"))
+            safe = (
+                defaults,
+                constraints,
+                config.get("model_provider"),
+                "service_tier" in config,
+            )
             fingerprint = json.dumps(safe, sort_keys=True, ensure_ascii=False)
             key = (runtime.runtime_id, cwd)
             cached = self._cache.get(key)
@@ -262,6 +281,13 @@ class RuntimeCapabilities:
             )
             if defaults["effort"] is None:
                 defaults["effort"] = selected.get("defaultReasoningEffort")
+            if "defaultServiceTier" in selected:
+                tier = selected["defaultServiceTier"]
+                if "service_tier" not in defaults:
+                    if tier is None or isinstance(tier, str):
+                        defaults["service_tier"] = tier
+                elif defaults["service_tier"] is None and isinstance(tier, str) and tier:
+                    defaults["service_tier"] = tier
             result = {
                 "models": models,
                 "defaults": defaults,
@@ -269,6 +295,7 @@ class RuntimeCapabilities:
                 "supported": {
                     "model": model_supported,
                     "effort": model_supported,
+                    "service_tier": "service_tier" in config or "defaultServiceTier" in selected,
                     "approval_policy": "approval_policy" in config,
                     "sandbox_mode": "sandbox_mode" in config,
                     "approvals_reviewer": reviewer_known,
@@ -288,6 +315,8 @@ class RuntimeCapabilities:
     async def validate(
         self, runtime, cwd: str, settings: dict, baseline: dict | None = None
     ) -> dict:
+        if not isinstance(settings, dict) or set(settings) - set(SETTINGS):
+            raise ValueError("Unsupported execution_settings fields")
         if not settings:
             return {}
         capabilities = await self.read(runtime, cwd)

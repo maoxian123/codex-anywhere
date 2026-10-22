@@ -20,7 +20,9 @@ import { NewTaskDialog } from "./Dialogs";
 import {
   availablePresets,
   changeModel,
+  changedOverrides,
   preserveNewerSettings,
+  serviceTierLabel,
 } from "./execution-settings";
 import { fetchRuntimeCapabilities } from "./useRuntimeCapabilities";
 import type {
@@ -143,6 +145,102 @@ test("model changes choose only a supported native effort and preserve compatibl
     ).effort,
     undefined,
   );
+});
+
+test("native service tiers distinguish fast, normal, ultrafast, missing and future values", () => {
+  for (const [tier, label] of [
+    ["fast", "快速模式"],
+    ["priority", "快速模式"],
+    ["default", "正常模式"],
+    ["ultrafast", "超快模式"],
+    ["flex", "其他模式（flex）"],
+    [undefined, "模式未知"],
+    [null, "正常模式（默认）"],
+    ["", "模式未知"],
+  ] as const)
+    assert.equal(serviceTierLabel(tier), label);
+});
+
+test("changing editable overrides never copies read-only service tier values into a request", () => {
+  const desired = { model: "model-a", service_tier: "fast" };
+  assert.deepEqual(
+    changedOverrides(
+      desired,
+      { model: "model-a", effort: "medium", service_tier: "default" },
+      { model: "model-a", effort: "high", service_tier: "priority" },
+    ),
+    { model: "model-a", effort: "high" },
+  );
+});
+
+test("existing settings show their native mode rather than the new-conversation default", async () => {
+  globalThis.fetch = async () =>
+    response({
+      capabilities: {
+        ...capabilities,
+        defaults: { ...capabilities.defaults, service_tier: "fast" },
+      },
+    });
+  const h = host("mode-existing-host");
+  const view = render(
+    <RuntimeSettingsEditor
+      host={h}
+      cwd="F:\\mode-existing"
+      settings={{}}
+      displaySettings={{ service_tier: "default" }}
+      permissionsMode="existing"
+      onChange={() => {}}
+    />,
+  );
+  await screen.findByRole("option", { name: /Model A/ });
+  const mode = screen.getByRole("status", { name: "运行模式" });
+  assert.match(mode.textContent || "", /当前模式正常模式/);
+  assert.doesNotMatch(mode.textContent || "", /快速模式/);
+  view.rerender(
+    <RuntimeSettingsEditor
+      host={h}
+      cwd="F:\\mode-existing"
+      settings={{}}
+      permissionsMode="existing"
+      onChange={() => {}}
+    />,
+  );
+  assert.match(mode.textContent || "", /模式未知/);
+  assert.doesNotMatch(mode.textContent || "", /快速模式/);
+});
+
+test("settings display cached native modes offline and unknown defaults when a read fails", async () => {
+  const h = host("mode-offline-host");
+  const view = render(
+    <RuntimeSettingsEditor
+      host={{ ...h, online: false }}
+      cwd="F:\\mode-offline"
+      settings={{}}
+      displaySettings={{ service_tier: "priority" }}
+      permissionsMode="existing"
+      onChange={() => {}}
+    />,
+  );
+  assert.match(
+    screen.getByRole("status", { name: "运行模式" }).textContent || "",
+    /快速模式设备离线 · 缓存/,
+  );
+  view.unmount();
+  globalThis.fetch = async () => {
+    throw new Error("cannot read settings");
+  };
+  render(
+    <RuntimeSettingsEditor
+      host={host("mode-unavailable-host")}
+      cwd="F:\\unavailable-mode"
+      settings={{}}
+      onChange={() => {}}
+    />,
+  );
+  await screen.findByText("无法连接管理中心，请检查网络后重试。");
+  const mode = screen.getByRole("status", { name: "运行模式" });
+  assert.match(mode.textContent || "", /新对话模式模式未知/);
+  assert.doesNotMatch(mode.textContent || "", /正常模式/);
 });
 
 test("new-task effort reflects the native configured value before the catalog model default", async () => {
@@ -525,7 +623,13 @@ test("project defaults save native settings and new tasks submit selected dynami
   const bodies: { path: string; body: Record<string, unknown> }[] = [];
   globalThis.fetch = async (input, init) => {
     const path = String(input);
-    if (!init?.method) return response({ capabilities });
+    if (!init?.method)
+      return response({
+        capabilities: {
+          ...capabilities,
+          defaults: { ...capabilities.defaults, service_tier: "fast" },
+        },
+      });
     const body = JSON.parse(String(init.body));
     bodies.push({ path, body });
     if (init.method === "PATCH")
@@ -560,6 +664,10 @@ test("project defaults save native settings and new tasks submit selected dynami
     assert.equal(saved?.execution_settings?.model, "model-b"),
   );
   assert.equal(bodies[0].path, `/api/projects/${project.id}/settings`);
+  assert.equal(
+    Object.hasOwn(bodies[0].body.execution_settings as object, "service_tier"),
+    false,
+  );
   view.unmount();
   render(
     <NewTaskDialog
@@ -624,6 +732,7 @@ test("editing an imported model saves only explicit overrides and leaves granula
         execution_settings: { effort: "high" },
         effective_settings: {
           model: "old-custom",
+          service_tier: "fast",
           approval_policy: { granular: { sandbox_approval: true } },
           sandbox_mode: "danger-full-access",
           approvals_reviewer: "guardian_subagent",

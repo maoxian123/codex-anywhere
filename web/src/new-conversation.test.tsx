@@ -163,6 +163,60 @@ test("project changes remain selectable and drafts stay with their own project",
   );
 });
 
+test("new conversations visibly read the native default mode without sending it as an override", async () => {
+  const requests: Record<string, unknown>[] = [];
+  globalThis.fetch = async (input, init) => {
+    const path = String(input);
+    if (path.includes("/capabilities"))
+      return json({
+        capabilities: {
+          models: [],
+          defaults: { model: "native-model", service_tier: "priority" },
+        },
+      });
+    if (path === "/api/threads") {
+      requests.push(JSON.parse(String(init?.body)));
+      return json({ thread, command: command() });
+    }
+    if (path.includes("?item_limit=1"))
+      return json({ thread, items: [], interactions: [] });
+    if (path.endsWith("/messages"))
+      return json({ command: command("message") });
+    throw new Error(path);
+  };
+  render(
+    <NewConversation
+      hosts={[
+        { ...hosts[0], id: "mode-new-host", capabilities: ["runtimeSettings"] },
+      ]}
+      projects={[{ ...project("mode-new"), host_id: "mode-new-host" }]}
+      loading={false}
+      draftScope="new-mode"
+      onNewProject={() => {}}
+      onPair={() => {}}
+      onNavigate={() => {}}
+      onCreated={() => {}}
+    />,
+  );
+  const badge = screen.getByRole("status", { name: "新对话 Codex 模式" });
+  await waitFor(() =>
+    assert.match(badge.textContent || "", /新对话模式：快速模式/),
+  );
+  assert.equal(badge.closest("details"), null);
+  fireEvent.change(screen.getByRole("textbox", { name: "发送消息给 Codex" }), {
+    target: { value: "保持此消息完整" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => assert.equal(requests.length, 1));
+  assert.equal(
+    Object.hasOwn(requests[0].execution_settings as object, "service_tier"),
+    false,
+  );
+  await waitFor(() =>
+    assert.equal(readComposerDraft("new:mode-new", "new-mode").text, ""),
+  );
+});
+
 test("lost creation response reuses the original creation key even when a later payload changes", async () => {
   const requests: Record<string, unknown>[] = [];
   let first = true;

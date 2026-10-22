@@ -259,6 +259,13 @@ def _project(thread, method, params, live=True):
     if method in {"anywhere/import_metadata", "anywhere/import_item", "anywhere/import_complete"}:
         _project_import(thread, method, params, live)
         return
+    if method in {"thread/settings/updated", "anywhere/service_tier"}:
+        native = params.get("threadSettings") if method == "thread/settings/updated" else params
+        if live and isinstance(native, dict) and "serviceTier" in native:
+            tier = native["serviceTier"]
+            if tier is None or isinstance(tier, str):
+                thread.effective_settings = dict(thread.effective_settings or {}, service_tier=tier)
+        return
     if method == "anywhere/execution_settings":
         if live:
             command = Command.query.filter_by(
@@ -446,6 +453,12 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 ):
                     interaction.status = "expired"
                 for thread in Thread.query.filter_by(host_id=host_id):
+                    if "service_tier" in (thread.effective_settings or {}):
+                        thread.effective_settings = {
+                            key: value
+                            for key, value in thread.effective_settings.items()
+                            if key != "service_tier"
+                        }
                     if thread.status in {"active", "waiting"}:
                         thread.status = "interrupted"
                         thread.active_turn_id = None
@@ -575,9 +588,15 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                             thread.status = "idle"
                             thread.last_error = None
                     if project_result and command.kind in {"thread.start", "turn.start"}:
+                        settings = result.get("effective_settings")
+                        if "serviceTier" in result:
+                            settings = {
+                                **(settings if isinstance(settings, dict) else {}),
+                                "service_tier": result["serviceTier"],
+                            }
                         project_effective_settings(
                             thread,
-                            result.get("effective_settings"),
+                            settings,
                             result.get(
                                 "settings_revision", command.payload.get("settings_revision", 0)
                             ),

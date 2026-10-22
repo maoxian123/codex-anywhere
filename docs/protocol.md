@@ -147,6 +147,40 @@ Project objects add `execution_settings`. Thread objects add desired `execution_
 
 The node maps model/effort overrides to native `model` and `turn/start.effort`, and start/resume effort configuration to `config.model_reasoning_effort`. Approval and reviewer overrides use `approvalPolicy` and `approvalsReviewer`; start/resume sandbox uses hyphenated `sandbox`, whereas turn/start uses structured `sandboxPolicy`. New threads default to `on-request` and `workspace-write` when no explicit approval/sandbox override is selected. Resuming an existing native thread preserves its settings unless explicitly overridden. Model and effort are not hardcoded. Native approval requests and sandbox enforcement remain authoritative.
 
+### Read-only Codex speed mode
+
+Native settings readbacks additionally expose `service_tier?:string|null`. This is
+read-only metadata, never an accepted `ExecutionSettings` override. Browser and
+node validators reject writes to it; changing model, effort or permissions never
+sends a service-tier override or writes Codex configuration.
+
+The node preserves native `serviceTier` from thread start/resume and forwards
+`thread/settings/updated.threadSettings.serviceTier` unchanged. Resume also emits
+durable `anywhere/service_tier` `{threadId,serviceTier}` when known, including after
+an explicit takeover without a turn. The hub accepts these readbacks only from
+the current runtime epoch, retains a known mode when older node readbacks omit
+the field, and clears it on an epoch change. Native start results remain usable
+even from older nodes that omit the normalized field. Raw native events remain
+preserved. Mode updates do not change desired settings or their revision, and
+mode discovery adds no inference or resume operations.
+
+For new-conversation defaults, `runtime.capabilities.defaults.service_tier` reads
+the node's native `config.service_tier`, falling back to the configured model's
+`defaultServiceTier` when no explicit nonnull configuration tier is set. If neither
+source reports the field, omit it rather than fabricate a default. The additional
+`supported.service_tier` flag indicates metadata availability, not write access.
+
+The browser always shows the mode beside the composer model: `fast`/`priority`
+are quick mode, `default` is normal, and `ultrafast` is ultrafast. Explicit native
+null means no accelerated tier is selected and is labelled normal/default;
+missing or empty metadata is labelled unknown. Other tier IDs remain visible.
+Existing conversations use their own effective readback, never the node's new
+conversation default. Offline values are visibly marked as cached. New-node
+readback support requires updating/restarting that node; missing fields from old
+peers remain unknown. These are Codex mode settings, not claims about per-request
+server-side delivery speed or billing. See the official
+[speed documentation](https://learn.chatgpt.com/docs/agent-configuration/speed).
+
 ### Finite native history pages
 
 For a `lazyHistory` node, `POST /api/threads/<id>/history` accepts `{cursor?:string,limit?:50,retry?:false}` and journals `thread.history` payload `{native_thread_id,cursor?,limit,_native_fingerprint?}`. Limit is 1–100; `_native_fingerprint` is an internal creation-time catalog checkpoint. A missing cursor requests the latest tail; an older request must match the thread's current `history_cursor` and cannot use a stale snapshot. Current history and active/waiting/starting tasks return 200 `{thread,command:null}`. Pending reads return/reuse 202 `{thread,command}`, including an RPC-completed command whose page has not yet been projected. Failed/unknown reads require explicit `retry:true`; automatic requests return 409. Unsupported old nodes keep the prior full-import path for an initial load and reject native older cursors. Explicit manual `thread.import` remains separate and compatible.

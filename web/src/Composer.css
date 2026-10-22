@@ -43,6 +43,70 @@
   border-left: 1px solid #40545a;
 }
 
+.composer-runtime-summary {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer-service-tier {
+  display: inline-flex;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  align-items: center;
+  max-width: 60%;
+  padding: 5px 8px;
+  border: 1px solid #46645a;
+  border-radius: 8px;
+  background: #263d35;
+  color: #c5e3d2;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.composer-service-tier.is-unknown {
+  border-color: #715e3d;
+  background: #3b3428;
+  color: #ead4a8;
+}
+
+.composer-service-tier.is-accelerated {
+  border-color: #856b3e;
+  background: #4c3c22;
+  color: #ffe1a4;
+}
+
+.composer-service-tier small {
+  font-size: 11px;
+  color: inherit;
+}
+
+.execution-service-tier {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 10px;
+  margin: 0 0 12px;
+  padding: 9px 10px;
+  border: 1px solid #445a58;
+  border-radius: 8px;
+  color: #b2c5cc;
+  font-size: 12px;
+}
+
+.execution-service-tier strong {
+  color: #d7e7dc;
+  font-weight: 500;
+}
+
+.execution-service-tier small {
+  font-size: 11px;
+  color: #a4b5bf;
+}
+
 .composer-model-label {
   min-width: 0;
   flex: 1;
@@ -176,8 +240,7 @@
     height: 44px;
   }
 
-  .composer-settings,
-  .composer-model-label {
+  .composer-runtime-summary {
     order: 3;
     flex-basis: 100%;
   }

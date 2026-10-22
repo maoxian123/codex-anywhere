@@ -65,5 +65,13 @@ def project_effective_settings(thread, settings, revision):
     # Readbacks can contain native legacy values. Preserve them without making
     # those values newly selectable in the browser.
     safe = {key: copy.deepcopy(value) for key, value in settings.items() if key in SETTINGS_KEYS}
+    if "service_tier" in settings:
+        tier = settings["service_tier"]
+        if tier is None or isinstance(tier, str):
+            safe["service_tier"] = tier
+    elif "service_tier" in (thread.effective_settings or {}):
+        # Older nodes can forward native mode events while omitting this newer
+        # readback field. Do not erase a confirmed mode with an absent value.
+        safe["service_tier"] = thread.effective_settings["service_tier"]
     thread.effective_settings = safe
     thread.effective_settings_revision = revision
