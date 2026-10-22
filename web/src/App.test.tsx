@@ -175,6 +175,30 @@ function setup(
   };
 }
 
+test("history failure exposes a button that explicitly retries native history", async () => {
+  const server = setup({ history_loaded: false, history_stale: true });
+  const requests: unknown[] = [];
+  server.intercept((path, init) => {
+    if (path !== "/api/threads/t1/history") return;
+    requests.push(JSON.parse(String(init?.body)));
+    if (requests.length === 1)
+      return new Response(
+        JSON.stringify({ error: "上次历史读取失败，请显式重试" }),
+        { status: 409 },
+      );
+    server.thread.history_loaded = true;
+    server.thread.history_stale = false;
+    return new Response(
+      JSON.stringify({ thread: server.thread, command: null }),
+    );
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "重试历史读取" }));
+  await waitFor(() => assert.deepEqual(requests, [{}, { retry: true }]));
+  await waitFor(() =>
+    assert.equal(screen.queryByText("上次历史读取失败，请显式重试"), null),
+  );
+});
+
 function ownershipServer(
   initial: ThreadOwnership,
   releaseResult?: Record<string, unknown>,

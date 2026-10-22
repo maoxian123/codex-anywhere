@@ -2,7 +2,14 @@ import "./test-dom";
 import { useState } from "react";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { useAutomaticHistory } from "./useAutomaticHistory";
 import type { Host, Thread } from "./types";
 
@@ -42,7 +49,7 @@ function Harness({
   refresh: (id?: string) => Promise<void>;
 }) {
   const [error, setError] = useState("");
-  const busy = useAutomaticHistory({
+  const { busy, retry } = useAutomaticHistory({
     selectionId: current.id,
     thread: current,
     host: node,
@@ -53,6 +60,9 @@ function Harness({
     <div>
       <span>{busy ? "同步中" : "同步已结束"}</span>
       {error && <p role="alert">{error}</p>}
+      <button onClick={retry} disabled={busy}>
+        重试历史读取
+      </button>
     </div>
   );
 }
@@ -95,6 +105,29 @@ test("opening discovered history loads once per version and polls only bounded m
   );
   await waitFor(() => assert.equal(refreshed, 2));
   assert.equal(requests, 2);
+});
+
+test("explicit history retry bypasses the blocked version and sends retry:true", async () => {
+  const bodies: unknown[] = [];
+  let refreshed = 0;
+  const refresh = async () => {
+    refreshed += 1;
+  };
+  globalThis.fetch = async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return bodies.length === 1
+      ? response({ error: "previous history failed" }, 409)
+      : response({ thread, command: null });
+  };
+  const view = render(<Harness current={thread} refresh={refresh} />);
+  await screen.findByRole("alert");
+  view.rerender(
+    <Harness current={{ ...thread, status: "error" }} refresh={refresh} />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "重试历史读取" }));
+  await waitFor(() => assert.equal(refreshed, 1));
+  assert.deepEqual(bodies, [{}, { retry: true }]);
+  assert.equal(screen.queryByRole("alert"), null);
 });
 test("409 unknown imports stop automatic retries even after unchanged catalog scans and route switches", async () => {
   let requests = 0;

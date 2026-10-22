@@ -976,7 +976,7 @@ function Workspace({
       setError(errorText(reason));
     }
   };
-  const historyBusy = useAutomaticHistory({
+  const { busy: historyBusy, retry: retryHistory } = useAutomaticHistory({
     selectionId: route.id,
     thread: detail?.thread,
     host: selectedHost,
@@ -1249,6 +1249,14 @@ function Workspace({
             {historyError && (
               <div className="thread-error">
                 <ErrorMessage>{historyError}</ErrorMessage>
+                <button
+                  className="button button-small"
+                  disabled={historyBusy || !selectedHost?.online}
+                  onClick={retryHistory}
+                >
+                  <RefreshCw size={14} />
+                  重试历史读取
+                </button>
               </div>
             )}
             {threadError && (

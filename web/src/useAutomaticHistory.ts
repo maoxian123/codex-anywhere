@@ -21,6 +21,8 @@ export function useAutomaticHistory({
   onError: (error: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const manualRetry = useRef<string | null>(null);
   const attempts = useRef(new Set<string>());
   const blocked = useRef(new Set<string>());
   const job = useRef<{ id: string; controller: AbortController } | null>(null);
@@ -36,12 +38,14 @@ export function useAutomaticHistory({
     };
   }, [selectionId, onError]);
   useEffect(() => {
+    const retry = manualRetry.current === selectionId;
+    manualRetry.current = null;
     if (
       !thread ||
       selectionId !== thread.id ||
       !host?.online ||
-      thread.status !== "idle" ||
-      (thread.history_loaded !== false && !thread.history_stale) ||
+      (thread.status !== "idle" && !(retry && thread.status === "error")) ||
+      (!retry && thread.history_loaded !== false && !thread.history_stale) ||
       job.current
     )
       return;
@@ -55,7 +59,11 @@ export function useAutomaticHistory({
       thread.history_native_updated_at ?? null,
       host.last_sync_at ?? null,
     ]);
-    if (attempts.current.has(key) || blocked.current.has(nativeVersion)) return;
+    if (
+      !retry &&
+      (attempts.current.has(key) || blocked.current.has(nativeVersion))
+    )
+      return;
     attempts.current.add(key);
     const controller = new AbortController();
     job.current = { id: thread.id, controller };
@@ -65,7 +73,11 @@ export function useAutomaticHistory({
       try {
         const result = await api<{ thread: Thread; command: Command | null }>(
           `/threads/${encodeURIComponent(thread.id)}/history`,
-          { method: "POST", body: "{}", signal: controller.signal },
+          {
+            method: "POST",
+            body: JSON.stringify(retry ? { retry: true } : {}),
+            signal: controller.signal,
+          },
         );
         if (controller.signal.aborted) return;
         if (result.command) {
@@ -105,6 +117,14 @@ export function useAutomaticHistory({
     busy,
     refresh,
     onError,
+    retryCount,
   ]);
-  return busy;
+  return {
+    busy,
+    retry: () => {
+      if (job.current) return;
+      manualRetry.current = selectionId;
+      setRetryCount((count) => count + 1);
+    },
+  };
 }
