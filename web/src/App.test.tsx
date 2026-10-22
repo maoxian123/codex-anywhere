@@ -104,6 +104,9 @@ function setup(
       loginHeaders.push(new Headers(init?.headers));
       authentication.authenticated = true;
       result = authentication;
+    } else if (path === "/api/auth/logout") {
+      authentication.authenticated = false;
+      result = { ok: true };
     } else if (!authentication.authenticated)
       return new Response(
         JSON.stringify({ error: "Authentication required" }),
@@ -202,9 +205,11 @@ test("history failure exposes a button that explicitly retries native history", 
 function ownershipServer(
   initial: ThreadOwnership,
   releaseResult?: Record<string, unknown>,
+  failMessages = true,
 ) {
   const server = setup({ native_id: "native-t1" }, "/tasks/t1", [
     "threadOwnership",
+    "completionIdleRelease",
   ]);
   let state = initial;
   const requests: {
@@ -247,7 +252,7 @@ function ownershipServer(
         result = { released: true, deferred: false, ownership: state };
       }
     }
-    if (path.endsWith("/messages")) {
+    if (path.endsWith("/messages") && failMessages) {
       state = {
         state: "external",
         owners: [{ pid: 512, name: "codex" }],
@@ -322,6 +327,11 @@ test("external writer takeover requires PID confirmation and never sends the dra
   assert.equal(takeover.data.owner_token, "identity");
   assert.equal(typeof takeover.data.client_id, "string");
   assert.equal(typeof takeover.data.issued_at, "number");
+  assert.equal(typeof takeover.data.client_request_id, "string");
+  assert.equal(
+    server.requests.filter((entry) => entry.path.endsWith("/presence")).length,
+    0,
+  );
   assert.equal((input as HTMLTextAreaElement).value, "保留我的草稿");
   assert.equal(
     server.requests.filter((entry) => entry.path.endsWith("/messages")).length,
@@ -357,7 +367,31 @@ test("a writer conflict checks ownership and preserves the failed message draft"
   );
 });
 
-test("leaving the conversation releases this tab's lease with a later timestamp", async () => {
+test("managed conversations send normally without requesting presence before or after the message", async () => {
+  const server = ownershipServer(
+    { state: "managed", owners: [], can_terminate: false, owner_token: null },
+    undefined,
+    false,
+  );
+  const input = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  await screen.findByText("已托管");
+  fireEvent.change(input, { target: { value: "无需浏览器租约继续对话" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => assert.equal((input as HTMLTextAreaElement).value, ""));
+  const message = server.requests.find((entry) =>
+    entry.path.endsWith("/messages"),
+  );
+  assert.equal(message?.data.text, "无需浏览器租约继续对话");
+  assert.equal(
+    server.requests.filter((entry) => /\/(presence|release)$/.test(entry.path))
+      .length,
+    0,
+  );
+});
+
+test("switching from the conversation to settings never releases ownership or sends presence", async () => {
   const server = ownershipServer({
     state: "managed",
     owners: [],
@@ -368,17 +402,29 @@ test("leaving the conversation releases this tab's lease with a later timestamp"
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
   await screen.findByRole("textbox", { name: "管理员用户名" });
   assert.equal(screen.queryByRole("button", { name: /^会话托管：/ }), null);
-  await waitFor(() =>
-    assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
-  );
-  const lease = server.requests.filter((entry) =>
+  const mutations = server.requests.filter((entry) =>
     /\/(presence|release)$/.test(entry.path),
   );
-  const release = lease.at(-1)!;
-  assert.equal(release.path, "/api/threads/t1/release");
-  assert.equal(release.init?.keepalive, true);
-  assert.equal(release.data.client_id, lease[0].data.client_id);
-  assert.ok(Number(release.data.issued_at) > Number(lease[0].data.issued_at));
+  assert.deepEqual(mutations, []);
+});
+
+test("logging out never sends release or presence for the managed native conversation", async () => {
+  const server = ownershipServer({
+    state: "managed",
+    owners: [],
+    can_terminate: false,
+    owner_token: null,
+  });
+  await screen.findByText("已托管");
+  fireEvent.click(screen.getByLabelText("工作设备"));
+  fireEvent.click(await screen.findByRole("button", { name: "退出登录" }));
+  await screen.findByRole("textbox", { name: "用户名" });
+  assert.equal(server.authentication.authenticated, false);
+  assert.equal(
+    server.requests.filter((entry) => /\/(presence|release)$/.test(entry.path))
+      .length,
+    0,
+  );
 });
 
 test("manual release and native ownership events update the displayed management state", async () => {
@@ -395,6 +441,13 @@ test("manual release and native ownership events update the displayed management
     entry.path.endsWith("/release"),
   ).length;
   assert.equal(count, 1);
+  const manual = server.requests.find((entry) =>
+    entry.path.endsWith("/release"),
+  )!;
+  assert.equal(manual.data.manual, true);
+  assert.equal(typeof manual.data.client_id, "string");
+  assert.equal(typeof manual.data.issued_at, "number");
+  assert.equal(manual.init?.keepalive, undefined);
   server.event("anywhere/ownership", {
     ownership: {
       state: "managed",
@@ -417,7 +470,7 @@ test("manual release and native ownership events update the displayed management
   assert.ok(!screen.queryByRole("button", { name: "结束进程并接管" }));
 });
 
-test("pagehide releases with keepalive and pageshow restores only browser presence", async () => {
+test("pagehide preserves ownership and pageshow only checks the existing native owner", async () => {
   const server = ownershipServer({
     state: "managed",
     owners: [],
@@ -426,24 +479,29 @@ test("pagehide releases with keepalive and pageshow restores only browser presen
   });
   await screen.findByText("已托管");
   act(() => window.dispatchEvent(new Event("pagehide")));
-  await waitFor(() =>
-    assert.ok(server.requests.some((entry) => entry.path.endsWith("/release"))),
-  );
+  const before = server.requests.filter((entry) =>
+    entry.path.endsWith("/ownership"),
+  ).length;
   assert.equal(
-    server.requests.find((entry) => entry.path.endsWith("/release"))?.init
-      ?.keepalive,
-    true,
+    server.requests.filter((entry) => /\/(presence|release)$/.test(entry.path))
+      .length,
+    0,
   );
   act(() => window.dispatchEvent(new Event("pageshow")));
   await waitFor(() =>
     assert.equal(
-      server.requests.filter((entry) => entry.path.endsWith("/presence"))
+      server.requests.filter((entry) => entry.path.endsWith("/ownership"))
         .length,
-      2,
+      before + 1,
     ),
   );
   assert.equal(
     server.requests.filter((entry) => /\/(takeover|messages)$/.test(entry.path))
+      .length,
+    0,
+  );
+  assert.equal(
+    server.requests.filter((entry) => /\/(presence|release)$/.test(entry.path))
       .length,
     0,
   );
@@ -468,46 +526,55 @@ for (const result of [
   });
 }
 
-test("deferred manual release remains paused while browsing, and sending explicitly renews presence", async () => {
-  const server = ownershipServer(
-    { state: "managed", owners: [], can_terminate: false, owner_token: null },
-    {
-      released: false,
-      deferred: true,
-      reason: "当前任务执行结束后释放托管",
-    },
-  );
-  fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
-  await screen.findByText("当前任务执行结束后释放托管");
-  fireEvent.pointerDown(document);
-  fireEvent.wheel(document);
-  fireEvent.keyDown(document, { key: "ArrowDown" });
-  fireEvent.scroll(document);
-  assert.equal(
-    server.requests.filter((entry) => entry.path.endsWith("/presence")).length,
-    1,
-  );
-  const input = screen.getByRole("textbox", { name: "发送消息给 Codex" });
-  fireEvent.change(input, { target: { value: "继续执行" } });
-  fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
-  await waitFor(() =>
+for (const reason of [undefined, "会话尚未持久化，暂不释放托管。"])
+  test(`deferred manual release preserves node feedback or its safe fallback without browser leases: ${reason || "fallback"}`, async () => {
+    const server = ownershipServer(
+      { state: "managed", owners: [], can_terminate: false, owner_token: null },
+      {
+        released: false,
+        deferred: true,
+        reason,
+      },
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
+    await screen.findByText(
+      reason || "当前任务仍在运行或等待处理，暂不释放托管。",
+    );
+    fireEvent.pointerDown(document);
+    fireEvent.wheel(document);
+    fireEvent.keyDown(document, { key: "ArrowDown" });
+    fireEvent.scroll(document);
     assert.equal(
       server.requests.filter((entry) => entry.path.endsWith("/presence"))
         .length,
-      2,
-    ),
-  );
-});
+      0,
+    );
+    const input = screen.getByRole("textbox", { name: "发送消息给 Codex" });
+    fireEvent.change(input, { target: { value: "继续执行" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
+    await waitFor(() =>
+      assert.equal(
+        server.requests.filter((entry) => entry.path.endsWith("/messages"))
+          .length,
+        1,
+      ),
+    );
+    assert.equal(
+      server.requests.filter((entry) => entry.path.endsWith("/presence"))
+        .length,
+      0,
+    );
+  });
 
-test("retained leases show the other page explanation and native release errors remain visible", async () => {
+test("retained manual release shows node feedback and native release errors remain visible", async () => {
   const server = ownershipServer(
     { state: "managed", owners: [], can_terminate: false, owner_token: null },
     { released: false, retained: true },
   );
   fireEvent.click(await screen.findByRole("button", { name: /^会话托管：/ }));
   fireEvent.click(await screen.findByRole("button", { name: "释放托管" }));
-  await screen.findByText("其他页面仍在使用此会话，当前托管将继续保留。");
+  await screen.findByText("节点暂时保留托管，请重新检查占用状态。");
   server.event("anywhere/ownership", {
     ownership: {
       state: "managed",

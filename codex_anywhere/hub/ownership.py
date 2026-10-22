@@ -1,4 +1,4 @@
-"""Journal writer operations and scope browser leases to authenticated sessions."""
+"""Journal explicit writer operations, scoped to authenticated browser sessions."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import time
 
 from flask import abort, jsonify, session
 
-from .models import Command, Host, Thread, db
+from .models import Command
 
-PRESENCE_SECONDS = 90
+REQUEST_SECONDS = 90
 
 
 class WriterSessions:
@@ -36,21 +36,22 @@ class WriterSessions:
         ):
             raise ValueError("issued_at 必须是有效的请求顺序时间")
         nonce = session.get("auth_nonce", "")
-        # Another login/session must not renew or release this page's lease.
+        # Another login/session must not reuse this page's writer operation ID.
         scoped = hashlib.sha256(f"{nonce}:{client_id}".encode()).hexdigest()
         now = time.time()
         payload = {
             "native_thread_id": thread.native_id,
             "client_id": scoped,
             "issued_at": issued_at,
-            "expires_at": 0 if release else now + PRESENCE_SECONDS,
+            "expires_at": now + REQUEST_SECONDS,
         }
         with self.lock:
             self.revoked = {key: until for key, until in self.revoked.items() if until > now}
             if nonce in self.revoked:
                 abort(401, "登录会话已退出")
             pages = self.clients.setdefault(nonce, {})
-            # Keep short-lived tombstones so a late heartbeat cannot undo release.
+            # Keep short-lived order markers so stale takeover requests cannot
+            # undo a newer explicit release. Browser presence never enters here.
             for key in [key for key, value in pages.items() if value["seen_at"] < now - 600]:
                 del pages[key]
             key = (thread.id, scoped)
@@ -66,37 +67,13 @@ class WriterSessions:
         return payload
 
     def release_session(self, nonce):
-        """Logout is authoritative; the node TTL also covers offline delivery."""
+        """Revoke browser operations without changing the native writer lifetime."""
         if not nonce:
             return
         now = time.time()
         with self.lock:
-            pages = self.clients.pop(nonce, {})
+            self.clients.pop(nonce, None)
             self.revoked[nonce] = now + 600
-        with self.app.extensions["broker"].command_lock:
-            for (thread_id, client_id), previous in pages.items():
-                if not previous["expires_at"]:
-                    continue
-                thread = db.session.get(Thread, thread_id)
-                host = db.session.get(Host, thread.host_id) if thread else None
-                if (
-                    not thread
-                    or not host
-                    or "threadOwnership" not in (host.capabilities or [])
-                    or not self.app.extensions["broker"].is_online(host.id)
-                ):
-                    continue
-                self.issue_command(
-                    host,
-                    thread,
-                    "thread.release",
-                    {
-                        "native_thread_id": thread.native_id,
-                        "client_id": client_id,
-                        "issued_at": max(now, previous["issued_at"] + 0.001),
-                        "expires_at": 0,
-                    },
-                )
 
     def release_all(self):
         with self.lock:
@@ -145,8 +122,8 @@ class WriterSessions:
                 abort(409, "会话尚未创建完成")
             return thread, host
 
-        def change(thread_id, kind):
-            data = json_body()
+        def change(thread_id, kind, data=None):
+            data = json_body() if data is None else data
             with app.extensions["broker"].command_lock:
                 thread, host = ready(thread_id)
                 if kind == "thread.takeover":
@@ -162,10 +139,7 @@ class WriterSessions:
                         abort(409, "请先确认结束占用进程")
                 payload = self.client_payload(thread, data, release=kind == "thread.release")
                 ignored = payload.pop("_ignored", False)
-                key = (
-                    f"{thread.id}:{kind}:{payload['client_id']}:"
-                    f"{float(data['issued_at']):.6f}"
-                )
+                key = f"{thread.id}:{kind}:{payload['client_id']}:{float(data['issued_at']):.6f}"
                 existing = Command.query.filter_by(idempotency_key=key).first()
                 if existing:
                     if kind == "thread.takeover" and (
@@ -184,15 +158,28 @@ class WriterSessions:
                     payload.update(confirmed=confirmed)
                     if token:
                         payload["owner_token"] = token
+                elif kind == "thread.release":
+                    payload["manual"] = True
                 return jsonify(command=self.issue_command(host, thread, kind, payload, key)), 202
 
         @app.post("/api/threads/<thread_id>/presence")
         def writer_presence(thread_id):
-            return change(thread_id, "thread.presence")
+            json_body()
+            get_thread(thread_id)
+            # Older pages may keep heartbeating, but only node-observed turn
+            # completion and subsequent messages govern automatic release.
+            return jsonify(command=None, ignored=True)
 
         @app.post("/api/threads/<thread_id>/release")
         def writer_release(thread_id):
-            return change(thread_id, "thread.release")
+            data = json_body()
+            manual = data.get("manual", False)
+            if type(manual) is not bool:
+                raise ValueError("manual 必须是布尔值")
+            if not manual:
+                get_thread(thread_id)
+                return jsonify(command=None, ignored=True)
+            return change(thread_id, "thread.release", data)
 
         @app.post("/api/threads/<thread_id>/takeover")
         def writer_takeover(thread_id):

@@ -45,8 +45,7 @@ VERSION = "0.1.0"
 OUTBOX_RETRY_SECONDS = 5.0
 OUTBOX_WINDOW = 100
 STABLE_CONNECTION_SECONDS = 30.0
-PRESENCE_TTL_SECONDS = 90.0
-LEGACY_IDLE_SECONDS = 300.0
+COMPLETION_IDLE_SECONDS = 120.0
 THREAD_RELEASE_TIMEOUT = 8.0
 
 
@@ -120,14 +119,12 @@ class NodeService:
         self.execution_epoch: str | None = None
         self.thread_execution: dict[str, dict] = {}
         self.ownership = WriterOwnership()
-        self.thread_leases: dict[str, dict[str, float]] = {}
-        self.lease_versions: dict[tuple[str, str], tuple[float, bool]] = {}
-        self.presence_seen: set[str] = set()
-        self.last_activity: dict[str, float] = {}
+        self.writer_request_versions: dict[tuple[str, str], tuple[float, bool]] = {}
+        self.completion_idle_since: dict[str, float] = {}
+        self.latest_turns: dict[str, str] = {}
         self.active_turns: dict[str, str] = {}
-        self.completed_turns: dict[str, set[str]] = {}
+        self.completed_turns: dict[str, dict[str, float]] = {}
         self.pending_thread_commands: dict[str, int] = {}
-        self.release_requested: set[str] = set()
         self.release_errors: dict[str, str] = {}
         self.thread_closed: dict[str, asyncio.Event] = {}
         self.unstarted_threads: set[str] = set()
@@ -160,17 +157,13 @@ class NodeService:
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             if method == "turn/started" and isinstance(turn_id, str):
-                self.active_turns[thread_id] = turn_id
-                self.last_activity[thread_id] = time.time()
-                self.unstarted_threads.discard(thread_id)
+                if turn_id not in self.completed_turns.get(thread_id, set()):
+                    self.active_turns[thread_id] = turn_id
+                    self.latest_turns[thread_id] = turn_id
+                    self.completion_idle_since.pop(thread_id, None)
+                    self.unstarted_threads.discard(thread_id)
             elif method == "turn/completed" and isinstance(turn_id, str):
-                completed = self.completed_turns.setdefault(thread_id, set())
-                if len(completed) >= 100:
-                    completed.clear()
-                completed.add(turn_id)
-                if self.active_turns.get(thread_id) == turn_id:
-                    self.active_turns.pop(thread_id, None)
-                self.last_activity[thread_id] = time.time()
+                self._confirm_turn_end(thread_id, turn_id)
             status = params.get("status", {})
             not_loaded = status == "notLoaded" or (
                 isinstance(status, dict) and status.get("type") == "notLoaded"
@@ -179,8 +172,9 @@ class NodeService:
                 self.runtime.loaded_threads.discard(thread_id)
                 self.thread_execution.pop(thread_id, None)
                 self.active_turns.pop(thread_id, None)
+                self.completion_idle_since.pop(thread_id, None)
+                self.latest_turns.pop(thread_id, None)
                 self.release_errors.pop(thread_id, None)
-                self.release_requested.discard(thread_id)
                 self.unstarted_threads.discard(thread_id)
                 self.thread_closed.setdefault(thread_id, asyncio.Event()).set()
         self.store.record_event(
@@ -201,13 +195,29 @@ class NodeService:
         }:
             self.capabilities.invalidate()
 
-    def _leases(self, thread_id: str, now: float | None = None) -> dict[str, float]:
-        now = time.time() if now is None else now
-        leases = self.thread_leases.setdefault(thread_id, {})
-        for client_id, expires_at in list(leases.items()):
-            if expires_at <= now:
-                leases.pop(client_id, None)
-        return leases
+    def _confirm_turn_end(self, thread_id: str, turn_id: str) -> None:
+        completed = self.completed_turns.setdefault(thread_id, {})
+        completed.setdefault(turn_id, time.monotonic())
+        active = self.active_turns.get(thread_id)
+        latest = self.latest_turns.get(thread_id)
+        if len(completed) > 100:
+            oldest = next(key for key in completed if key not in {latest, turn_id})
+            completed.pop(oldest)
+        # While a new start RPC is unresolved, a notification alone cannot tell
+        # us whether this is that turn or an older replay. Its result/started
+        # event must first identify the active turn. Keep the original end time.
+        if active and active != turn_id:
+            return
+        if (
+            not active
+            and latest is not None
+            and (latest != turn_id or thread_id in self.completion_idle_since)
+        ):
+            return
+        self.latest_turns[thread_id] = turn_id
+        self.active_turns.pop(thread_id, None)
+        self.unstarted_threads.discard(thread_id)
+        self.completion_idle_since[thread_id] = completed[turn_id]
 
     def _sync_hub_clock(self, welcome: dict) -> None:
         server_time = welcome.get("server_time")
@@ -223,9 +233,9 @@ class NodeService:
         server_time, received_at = self.hub_clock
         return server_time + time.monotonic() - received_at
 
-    def _presence(
-        self, thread_id: str, payload: dict, *, release: bool = False, takeover: bool = False
-    ) -> bool:
+    def _validate_writer_request(
+        self, thread_id: str, payload: dict, *, release: bool = False
+    ) -> None:
         client_id, issued_at = payload.get("client_id"), payload.get("issued_at")
         if not isinstance(client_id, str) or not client_id or len(client_id) > 200:
             raise ValueError("A bounded client_id is required")
@@ -234,37 +244,22 @@ class NodeService:
         expires_at = payload.get("expires_at", 0)
         if type(expires_at) not in {int, float} or not math.isfinite(expires_at):
             raise ValueError("A finite expires_at is required")
-        release = release or expires_at <= 0
-        now = time.time()
         remaining = expires_at - self._hub_now()
-        if takeover and (release or remaining <= 0):
-            raise ValueError("Takeover presence has expired; reopen the conversation and try again")
+        if remaining <= 0:
+            raise ValueError("Writer request has expired; reopen the conversation and try again")
         key = (thread_id, client_id)
         version = (issued_at, release)
-        previous = self.lease_versions.get(key, (-math.inf, False))
-        if version <= previous:
-            # A presence and takeover may share the browser's millisecond clock
-            # value. Reuse only that still-live lease; the same-time release has
-            # a higher version and always wins. Never revive an expired lease.
-            if takeover and version == previous and self._leases(thread_id, now).get(client_id, 0) > now:
-                return True
-            return False
-        self.lease_versions[key] = version
-        self.presence_seen.add(thread_id)
-        leases = self._leases(thread_id)
-        if release or remaining <= 0:
-            leases.pop(client_id, None)
-        else:
-            leases[client_id] = now + min(remaining, PRESENCE_TTL_SECONDS)
-            self.release_requested.discard(thread_id)
-        return True
+        previous = self.writer_request_versions.get(key, (-math.inf, False))
+        if version < previous:
+            raise ValueError("Writer request is stale; reopen the conversation and try again")
+        self.writer_request_versions[key] = version
 
-    def _require_takeover_presence(self, thread_id: str, payload: dict) -> None:
+    def _require_takeover_request(self, thread_id: str, payload: dict) -> None:
         # Legacy direct callers have no browser client. The hub always supplies
-        # its bounded lease, which must remain valid before each acquisition or
+        # its bounded request, which must remain valid before each acquisition or
         # external-process action, rather than being applied after side effects.
-        if "client_id" in payload and not self._presence(thread_id, payload, takeover=True):
-            raise ValueError("Takeover presence is stale; reopen the conversation and try again")
+        if "client_id" in payload:
+            self._validate_writer_request(thread_id, payload)
 
     def _thread_busy(self, thread_id: str) -> bool:
         if thread_id in self.active_turns or self.pending_thread_commands.get(thread_id, 0):
@@ -274,18 +269,13 @@ class NodeService:
             runtime
             and any(
                 message.get("params", {}).get("threadId") == thread_id
-                for message in runtime.server_requests.values()
+                for message in getattr(runtime, "server_requests", {}).values()
             )
         )
 
     def _release_due(self, thread_id: str, now: float) -> bool:
-        if self._leases(thread_id, now):
-            return False
-        return (
-            thread_id in self.release_requested
-            or thread_id in self.presence_seen
-            or now - self.last_activity.setdefault(thread_id, now) >= LEGACY_IDLE_SECONDS
-        )
+        completed_at = self.completion_idle_since.get(thread_id)
+        return completed_at is not None and now - completed_at >= COMPLETION_IDLE_SECONDS
 
     async def _publish_ownership(self, thread_id: str, **extra) -> dict:
         runtime = self.runtime
@@ -303,25 +293,16 @@ class NodeService:
 
     async def _release_thread(self, thread_id: str, *, explicit: bool = False) -> dict:
         runtime = self.runtime
-        if self._leases(thread_id):
-            return {
-                "released": False,
-                "retained": True,
-                "deferred": True,
-                "reason": "Another browser tab still holds this conversation",
-            }
+        if self._thread_busy(thread_id):
+            return {"released": False, "deferred": True}
         if not runtime or thread_id not in runtime.loaded_threads:
-            self.release_requested.discard(thread_id)
             return {"released": True}
-        self.release_requested.add(thread_id)
         if thread_id in self.unstarted_threads:
             return {
                 "released": False,
                 "deferred": True,
                 "reason": "Codex has not persisted this empty conversation; release follows its first turn",
             }
-        if self._thread_busy(thread_id):
-            return {"released": False, "deferred": True}
         if thread_id in self.release_errors and not explicit:
             return {"released": False, "error": self.release_errors[thread_id]}
         closed = self.thread_closed.setdefault(thread_id, asyncio.Event())
@@ -341,7 +322,6 @@ class NodeService:
             await self._publish_ownership(thread_id, release_error=error)
             return {"released": False, "error": error}
         self.release_errors.pop(thread_id, None)
-        self.release_requested.discard(thread_id)
         await self._publish_ownership(thread_id)
         return {"released": True}
 
@@ -354,7 +334,7 @@ class NodeService:
             if lock.locked():
                 continue
             async with lock:
-                if self.runtime is runtime and self._release_due(thread_id, time.time()):
+                if self.runtime is runtime and self._release_due(thread_id, time.monotonic()):
                     await self._release_thread(thread_id)
 
     async def _sweep_threads(self) -> None:
@@ -370,6 +350,9 @@ class NodeService:
         self.store.recover_uncertain()
         self.event_wake.set()
         self.active_turns.clear()
+        self.completion_idle_since.clear()
+        self.latest_turns.clear()
+        self.completed_turns.clear()
         self.thread_execution.clear()
         self.release_errors.clear()
         self.unstarted_threads.clear()
@@ -492,6 +475,7 @@ class NodeService:
                             "runtimeSettings",
                             "projectInventory",
                             "threadOwnership",
+                            "completionIdleRelease",
                         ],
                     }
                 )
@@ -627,13 +611,19 @@ class NodeService:
             thread_id = request.get("params", {}).get("threadId")
         guarded = bool(
             isinstance(thread_id, str)
-            and kind in {"turn.start", "turn.steer", "turn.interrupt", "interaction.answer"}
+            and kind
+            in {
+                "turn.start",
+                "turn.steer",
+                "turn.interrupt",
+                "interaction.answer",
+                "thread.takeover",
+            }
         )
         if guarded:
             self.pending_thread_commands[thread_id] = (
                 self.pending_thread_commands.get(thread_id, 0) + 1
             )
-            self.last_activity[thread_id] = time.time()
         try:
             return await self._handle_command(command)
         finally:
@@ -649,7 +639,7 @@ class NodeService:
         key = payload.get("native_thread_id") or command.get("thread_id") or command["id"]
         if command.get("kind") == "interaction.answer":
             key = "interaction:" + str(payload.get("rpc_id"))
-        elif command.get("kind") in {"turn.interrupt", "turn.steer"}:
+        elif command.get("kind") in {"turn.interrupt", "turn.steer", "thread.release"}:
             # Control an active turn even while its start/resume RPC is pending.
             # Identical deliveries still share a lock and the durable journal.
             key = "control:" + command["id"]
@@ -667,6 +657,18 @@ class NodeService:
                 else:
                     await self._send({"type": "command_started", "id": command["id"]})
                 return response
+            previous_completion = None
+            previous_active = None
+            previous_turn = None
+            turn_thread = (
+                payload.get("native_thread_id") if command.get("kind") == "turn.start" else None
+            )
+            marker = "pending:" + command["id"]
+            if isinstance(turn_thread, str):
+                previous_completion = self.completion_idle_since.pop(turn_thread, None)
+                previous_active = self.active_turns.get(turn_thread)
+                previous_turn = self.latest_turns.get(turn_thread)
+                self.active_turns[turn_thread] = marker
             await self._send({"type": "command_started", "id": command["id"]})
             try:
                 result = await self._execute(command)
@@ -679,6 +681,17 @@ class NodeService:
                 )
                 raise
             except (RpcError, ValueError, TypeError, KeyError, OSError) as exc:
+                # A definite refusal before any new native turn leaves the last
+                # confirmed completion unchanged. Unknown outcomes never do.
+                if turn_thread and self.active_turns.get(turn_thread) == marker:
+                    self.active_turns.pop(turn_thread, None)
+                    completed_at = self.completed_turns.get(turn_thread, {}).get(previous_turn)
+                    if completed_at is not None or previous_completion is not None:
+                        self.completion_idle_since[turn_thread] = (
+                            completed_at if completed_at is not None else previous_completion
+                        )
+                    elif previous_active is not None:
+                        self.active_turns[turn_thread] = previous_active
                 response = self.store.finish(command["id"], error=str(exc))
             except Exception:  # noqa: BLE001 - do not log payloads or exception secrets
                 log.error("Unexpected command failure; execution outcome is uncertain")
@@ -736,35 +749,48 @@ class NodeService:
                     self.ownership.inspect, thread_id, managed=thread_id in runtime.loaded_threads
                 )
             if kind in {"thread.presence", "thread.release"}:
-                changed = self._presence(thread_id, payload, release=kind == "thread.release")
-                if kind == "thread.presence":
-                    return {"accepted": changed, "clients": len(self._leases(thread_id))}
-                if not changed:
-                    return {"released": False, "stale": True}
-                return await self._release_thread(thread_id, explicit=True)
-            self._require_takeover_presence(thread_id, payload)
+                if kind == "thread.presence" or payload.get("manual") is not True:
+                    return {
+                        "ignored": True,
+                        "reason": "Automatic release follows confirmed turn completion",
+                    }
+                self._validate_writer_request(thread_id, payload, release=True)
+                # Publish the user's newer operation before checking the thread
+                # lock, so it can supersede an in-flight takeover. Actual unload
+                # still shares the same lock as new turns and the idle sweep.
+                lock = self.command_locks.setdefault(thread_id, asyncio.Lock())
+                if lock.locked():
+                    return {"released": False, "deferred": True}
+                async with lock:
+                    return await self._release_thread(thread_id, explicit=True)
+            self._require_takeover_request(thread_id, payload)
             ownership = await asyncio.to_thread(
                 self.ownership.inspect, thread_id, managed=thread_id in runtime.loaded_threads
             )
             state = ownership.get("state")
             if state == "external":
                 if payload.get("confirmed") is not True or not payload.get("owner_token"):
-                    raise ValueError("Confirm the external writer and supply its current owner_token")
-                self._require_takeover_presence(thread_id, payload)
+                    raise ValueError(
+                        "Confirm the external writer and supply its current owner_token"
+                    )
+                self._require_takeover_request(thread_id, payload)
                 try:
                     await asyncio.to_thread(
                         self.ownership.terminate, thread_id, payload["owner_token"]
                     )
                 except (RuntimeError, TimeoutError) as exc:
                     raise ValueError(str(exc)) from exc
-                ownership = await asyncio.to_thread(self.ownership.inspect, thread_id, managed=False)
+                ownership = await asyncio.to_thread(
+                    self.ownership.inspect, thread_id, managed=False
+                )
                 state = ownership.get("state")
             if state not in {"managed", "available"}:
-                raise ValueError(ownership.get("reason") or "Cannot safely acquire the thread writer")
+                raise ValueError(
+                    ownership.get("reason") or "Cannot safely acquire the thread writer"
+                )
             if thread_id not in runtime.loaded_threads:
-                self._require_takeover_presence(thread_id, payload)
+                self._require_takeover_request(thread_id, payload)
                 await self._resume_thread(runtime, thread_id)
-            self.last_activity[thread_id] = time.time()
             return {"ownership": await self._publish_ownership(thread_id)}
         if kind == "thread.start":
             cwd = str(resolve_path(payload["cwd"], directory=True))
@@ -775,7 +801,6 @@ class NodeService:
             native_id = result["thread"]["id"]
             self.store.save_thread(native_id, cwd)
             runtime.loaded_threads.add(native_id)
-            self.last_activity[native_id] = time.time()
             self.unstarted_threads.add(native_id)
             # Codex creates an empty thread's rollout lazily. Setting the user's
             # requested name persists it without inference, so unloading it does
@@ -792,7 +817,9 @@ class NodeService:
                 except (RpcError, RuntimeGone, OSError):
                     # Preserve the successful creation response and native ID.
                     # Older peers can persist the thread on its first real turn.
-                    log.warning("Native conversation naming was unavailable; keeping empty thread loaded")
+                    log.warning(
+                        "Native conversation naming was unavailable; keeping empty thread loaded"
+                    )
             fallback = {
                 "approval_policy": params["approvalPolicy"],
                 "sandbox_mode": params["sandbox"],
@@ -846,23 +873,25 @@ class NodeService:
         overrides = turn_overrides(settings, baseline, known.get("sandbox"))
         marker = "pending:" + command["id"]
         self.active_turns.setdefault(thread_id, marker)
-        try:
-            result = await runtime.request("turn/start", {**params, **overrides})
-        except RpcError:
-            if self.active_turns.get(thread_id) == marker:
-                self.active_turns.pop(thread_id, None)
-            raise
+        result = await runtime.request("turn/start", {**params, **overrides})
         turn = result.get("turn", {})
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if isinstance(turn_id, str):
             self.unstarted_threads.discard(thread_id)
-            if turn_id in self.completed_turns.get(thread_id, set()) or turn.get("status") in {
-                "completed", "failed", "interrupted"
-            }:
-                if self.active_turns.get(thread_id) in {marker, turn_id}:
-                    self.active_turns.pop(thread_id, None)
+            active = self.active_turns.get(thread_id)
+            if active == marker:
+                self.active_turns[thread_id] = turn_id
+                self.latest_turns[thread_id] = turn_id
+            if turn.get("status") in {
+                "completed",
+                "failed",
+                "interrupted",
+            } or turn_id in self.completed_turns.get(thread_id, {}):
+                self._confirm_turn_end(thread_id, turn_id)
             elif self.active_turns.get(thread_id) in {marker, turn_id}:
                 self.active_turns[thread_id] = turn_id
+                self.latest_turns[thread_id] = turn_id
+                self.completion_idle_since.pop(thread_id, None)
         # A successful turn RPC accepts overrides for this and subsequent turns.
         applied = {**baseline, **settings}
         if "sandboxPolicy" in overrides:
@@ -907,7 +936,6 @@ class NodeService:
                 {"threadId": thread_id, "serviceTier": settings["service_tier"]},
             )
             self.event_wake.set()
-        self.last_activity[thread_id] = time.time()
         self.release_errors.pop(thread_id, None)
         return resumed
 

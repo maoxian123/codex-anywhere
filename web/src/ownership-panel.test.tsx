@@ -30,6 +30,7 @@ function props(ownership: ThreadOwnership | null = managed) {
     onCheck: () => {},
     onTakeover: async (_confirmed?: boolean) => {},
     onRelease: () => {},
+    completionIdleRelease: true,
   };
 }
 function open() {
@@ -48,8 +49,19 @@ test("ownership stays in one collapsed title button until explicitly opened", ()
   const panel = screen.getByRole("dialog", { name: "会话托管" });
   assert.equal(trigger.getAttribute("aria-expanded"), "true");
   assert.equal(trigger.getAttribute("aria-controls"), panel.id);
-  assert.ok(screen.getByText(/连续 5 分钟没有操作后释放托管/));
+  assert.ok(
+    screen.getByText(
+      /最后一轮结束后 2 分钟无新消息自动释放；运行中和待审批保留托管/,
+    ),
+  );
   assert.ok(screen.getByRole("button", { name: "释放托管" }));
+});
+
+test("older nodes explain that completion-based release needs a node update", () => {
+  render(<OwnershipPanel {...props()} completionIdleRelease={false} />);
+  open();
+  assert.ok(screen.getByText(/当前节点尚未支持完成后自动释放，请更新节点/));
+  assert.equal(screen.queryByText(/最后一轮结束后 2 分钟/), null);
 });
 
 test("popover closes from outside or Escape and restores keyboard focus", () => {
@@ -172,11 +184,11 @@ test("closed errors and release notices remain announced and available in the tr
   assert.match(screen.getByRole("alert").textContent || "", /节点无法释放托管/);
   fireEvent.keyDown(document, { key: "Escape" });
   view.rerender(
-    <OwnershipPanel {...props()} notice="当前任务执行结束后释放托管" />,
+    <OwnershipPanel {...props()} notice="当前任务仍在执行，暂不释放托管" />,
   );
   assert.equal(
     screen.getByRole("button", { name: "会话托管：已托管，有提示" }).title,
-    "当前任务执行结束后释放托管",
+    "当前任务仍在执行，暂不释放托管",
   );
   assert.equal(screen.queryByRole("dialog"), null);
 });

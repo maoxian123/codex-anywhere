@@ -46,6 +46,7 @@ export default function OwnershipPanel({
   onCheck,
   onTakeover,
   onRelease,
+  completionIdleRelease = false,
 }: {
   ownership: ThreadOwnership | null;
   pending: boolean;
@@ -54,6 +55,7 @@ export default function OwnershipPanel({
   onCheck: () => void;
   onTakeover: (confirmed?: boolean) => Promise<void>;
   onRelease: () => void;
+  completionIdleRelease?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -252,8 +254,9 @@ export default function OwnershipPanel({
               )}
             </div>
             <p className="ownership-auto-release">
-              离开当前会话或连续 5
-              分钟没有操作后释放托管；正在执行的任务会在完成后释放。
+              {completionIdleRelease
+                ? "最后一轮结束后 2 分钟无新消息自动释放；运行中和待审批保留托管。"
+                : "当前节点尚未支持完成后自动释放，请更新节点。可以手动释放托管。"}
             </p>
           </div>,
           document.body,

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorText, post } from "./api";
 import { waitForCommand } from "./commands";
-import { sendThreadLease, ThreadPresence } from "./thread-presence";
+import {
+  sendManualThreadRelease,
+  ThreadActionIdentity,
+} from "./thread-presence";
 import type { Command, ThreadOwnership } from "./types";
 
 export function writerConflict(error: string) {
@@ -9,17 +12,17 @@ export function writerConflict(error: string) {
 }
 
 export function useThreadOwnership(threadId: string, enabled: boolean) {
-  const [clientId] = useState(() => crypto.randomUUID());
+  const [actions] = useState(
+    () => new ThreadActionIdentity(crypto.randomUUID()),
+  );
   const [ownership, setOwnership] = useState<ThreadOwnership | null>(null);
   const [error, setError] = useState("");
   const [checkError, setCheckError] = useState("");
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
   const [checking, setChecking] = useState(false);
-  const lastIssued = useRef(0);
   const current = useRef({ threadId, enabled });
   current.current = { threadId, enabled };
-  const presence = useRef<ThreadPresence | null>(null);
   const request = useRef(0);
   const checkAbort = useRef<AbortController | null>(null);
 
@@ -61,89 +64,24 @@ export function useThreadOwnership(threadId: string, enabled: boolean) {
     setPending(false);
     setChecking(false);
     if (!enabled || !threadId) return;
-    const lease = new ThreadPresence(
-      clientId,
-      (action, payload, keepalive) =>
-        sendThreadLease(threadId, action, payload, keepalive),
-      () => Date.now(),
-      () => {
-        lastIssued.current = Math.max(
-          lastIssued.current + 0.001,
-          Date.now() / 1000,
-        );
-        return lastIssued.current;
-      },
-    );
-    presence.current = lease;
-    void lease.ensure().catch(() => {});
     void check();
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const tick = () => {
-      if (stopped) return;
-      lease.heartbeat();
-      timer = setTimeout(tick, lease.nextCheck());
-    };
-    timer = setTimeout(tick, lease.nextCheck());
-    const activity = () => lease.activity();
-    // Scroll events also come from the timeline following native output. Count
-    // the user's wheel/touch/key/drag intent, not programmatic scrolling.
-    const events = [
-      "pointerdown",
-      "keydown",
-      "input",
-      "wheel",
-      "touchstart",
-      "touchmove",
-    ];
-    events.forEach((event) =>
-      document.addEventListener(event, activity, {
-        passive: true,
-        capture: true,
-      }),
-    );
-    const drag = (event: Event) => {
-      if ((event as PointerEvent).buttons) lease.activity();
-    };
-    document.addEventListener("pointermove", drag, {
-      passive: true,
-      capture: true,
-    });
-    const onHide = () => void lease.pagehide().catch(() => {});
-    const onShow = () => {
-      void lease.pageshow().catch(() => {});
-      void check();
-    };
-    window.addEventListener("pagehide", onHide);
+    const onShow = () => void check();
     window.addEventListener("pageshow", onShow);
     return () => {
-      stopped = true;
-      clearTimeout(timer);
-      events.forEach((event) =>
-        document.removeEventListener(event, activity, true),
-      );
-      document.removeEventListener("pointermove", drag, true);
-      window.removeEventListener("pagehide", onHide);
       window.removeEventListener("pageshow", onShow);
-      void lease.pagehide().catch(() => {});
-      if (presence.current === lease) presence.current = null;
       request.current += 1;
       checkAbort.current?.abort();
     };
-  }, [threadId, enabled, clientId, check]);
+  }, [threadId, enabled, check]);
 
-  const ensurePresence = useCallback(async () => {
-    await presence.current?.ensure();
-  }, []);
   const release = useCallback(async () => {
-    const lease = presence.current;
-    if (!lease) return;
     const id = current.current.threadId;
+    if (!current.current.enabled || !id) return;
     setPending(true);
     setError("");
     setNotice("");
     try {
-      const result = (await lease.release(true, true)) as { command?: Command };
+      const result = await sendManualThreadRelease(id, actions.payload());
       const value = result.command
         ? await waitForCommand<{
             released: boolean;
@@ -169,11 +107,11 @@ export function useThreadOwnership(threadId: string, enabled: boolean) {
         );
       setNotice(
         value?.deferred
-          ? value.reason || "已请求释放托管，当前任务完成后将释放。"
+          ? value.reason || "当前任务仍在运行或等待处理，暂不释放托管。"
           : value?.retained
-            ? value.reason || "其他页面仍在使用此会话，当前托管将继续保留。"
+            ? value.reason || "节点暂时保留托管，请重新检查占用状态。"
             : value?.stale
-              ? value.reason || "页面租约已更新，请重新检查托管状态。"
+              ? value.reason || "操作请求已过期，请重新检查托管状态。"
               : value?.released
                 ? "已释放托管。下次发送消息或接管时将重新启用托管。"
                 : "释放请求已提交，请重新检查会话占用状态。",
@@ -185,24 +123,19 @@ export function useThreadOwnership(threadId: string, enabled: boolean) {
     } finally {
       if (current.current.threadId === id) setPending(false);
     }
-  }, [check]);
-  const releaseOnExit = useCallback(async () => {
-    await presence.current?.pagehide().catch(() => {});
-  }, []);
+  }, [actions, check]);
   const takeover = useCallback(
     async (confirmed = false) => {
       const id = current.current.threadId;
-      const lease = presence.current;
-      if (!lease || !current.current.enabled) return;
+      if (!id || !current.current.enabled) return;
       setPending(true);
       setError("");
       setNotice("");
       try {
-        await lease.ensure();
         const { command } = await post<{ command: Command }>(
           `/threads/${encodeURIComponent(id)}/takeover`,
           {
-            ...lease.payload(),
+            ...actions.payload(),
             ...(ownership?.owner_token
               ? { owner_token: ownership.owner_token }
               : {}),
@@ -226,7 +159,7 @@ export function useThreadOwnership(threadId: string, enabled: boolean) {
         if (current.current.threadId === id) setPending(false);
       }
     },
-    [ownership?.owner_token, check],
+    [actions, ownership?.owner_token, check],
   );
 
   const update = useCallback((value: ThreadOwnership) => {
@@ -245,8 +178,6 @@ export function useThreadOwnership(threadId: string, enabled: boolean) {
     check,
     takeover,
     release,
-    ensurePresence,
-    releaseOnExit,
     update,
   };
 }

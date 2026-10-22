@@ -1,121 +1,133 @@
-import test from "node:test";
+import "./test-dom";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  CONVERSATION_IDLE,
-  PRESENCE_INTERVAL,
-  ThreadPresence,
-  sendThreadLease,
-  type LeasePayload,
+  act,
+  cleanup,
+  fireEvent,
+  renderHook,
+  waitFor,
+} from "@testing-library/react";
+import {
+  ThreadActionIdentity,
+  sendManualThreadRelease,
 } from "./thread-presence";
+import { useThreadOwnership } from "./useThreadOwnership";
 import { setSession } from "./api";
 
-test("presence renews only from recent user activity and releases once after five idle minutes", async () => {
-  let now = 1_000_000;
-  const calls: { action: string; payload: LeasePayload; keepalive: boolean }[] =
-    [];
-  const presence = new ThreadPresence(
-    "tab-one",
-    async (action, payload, keepalive) => {
-      calls.push({ action, payload, keepalive });
-    },
-    () => now,
-  );
-  await presence.ensure();
-  now += PRESENCE_INTERVAL;
-  presence.heartbeat();
-  assert.deepEqual(
-    calls.map((call) => call.action),
-    ["presence", "presence"],
-  );
-  now += CONVERSATION_IDLE;
-  presence.heartbeat();
-  presence.heartbeat();
-  assert.deepEqual(
-    calls.map((call) => call.action),
-    ["presence", "presence", "release"],
-  );
-  assert.equal(presence.nextCheck(), PRESENCE_INTERVAL);
-  presence.activity();
-  assert.equal(calls.at(-1)?.action, "presence");
-  assert.ok(calls.every((call) => call.payload.client_id === "tab-one"));
-  assert.ok(
-    calls.every(
-      (call, index) =>
-        index === 0 ||
-        call.payload.issued_at > calls[index - 1].payload.issued_at,
-    ),
-  );
+const originalFetch = globalThis.fetch;
+afterEach(() => {
+  cleanup();
+  globalThis.fetch = originalFetch;
 });
 
-test("pagehide releases with keepalive and prevents background renewal until restored", async () => {
-  let now = 1000;
-  const actions: string[] = [];
-  const presence = new ThreadPresence(
-    "tab-two",
-    async (action, _payload, keepalive) => {
-      actions.push(`${action}:${keepalive}`);
-    },
-    () => now,
-  );
-  await presence.ensure();
-  await presence.pagehide();
-  now += PRESENCE_INTERVAL;
-  presence.heartbeat();
-  presence.activity();
-  assert.deepEqual(actions, ["presence:false", "release:true"]);
-  await presence.pageshow();
-  assert.equal(actions.at(-1), "presence:false");
-});
-
-test("manual release stays paused through browsing and restoration until an explicit send or takeover", async () => {
-  let now = 1000;
-  const actions: string[] = [];
-  const presence = new ThreadPresence(
-    "tab-manual",
-    async (action) => {
-      actions.push(action);
-    },
-    () => now,
-  );
-  await presence.ensure();
-  await presence.release(true, true);
-  presence.activity();
-  now += PRESENCE_INTERVAL;
-  presence.heartbeat();
-  await presence.pagehide();
-  await presence.pageshow();
-  presence.activity();
-  assert.deepEqual(actions, ["presence", "release", "release"]);
-  await presence.ensure();
-  assert.equal(actions.at(-1), "presence");
-});
-
-test("release uses authenticated POST with CSRF and keepalive", async () => {
-  const original = globalThis.fetch;
-  const requests: { path: string; init?: RequestInit }[] = [];
-  setSession({ authenticated: true, csrf_token: "lease-csrf" });
+function ownershipServer() {
+  const requests: {
+    path: string;
+    init?: RequestInit;
+    body: Record<string, unknown>;
+  }[] = [];
   globalThis.fetch = async (input, init) => {
-    requests.push({ path: String(input), init });
+    const path = String(input);
+    requests.push({ path, init, body: JSON.parse(String(init?.body || "{}")) });
+    const ownership = {
+      state: "managed",
+      owners: [],
+      can_terminate: false,
+      owner_token: null,
+    };
     return new Response(
-      JSON.stringify({ command: { id: "release", status: "queued" } }),
+      JSON.stringify({
+        command: {
+          id: `action-${requests.length}`,
+          status: "completed",
+          result: path.endsWith("/ownership")
+            ? ownership
+            : { released: true, ownership },
+        },
+      }),
     );
   };
-  try {
-    await sendThreadLease(
-      "native/thread",
-      "release",
-      { client_id: "tab-one", issued_at: 10 },
-      true,
-    );
-    assert.equal(requests[0].path, "/api/threads/native%2Fthread/release");
-    assert.equal(requests[0].init?.method, "POST");
-    assert.equal(requests[0].init?.keepalive, true);
-    assert.equal(requests[0].init?.credentials, "same-origin");
-    assert.equal(
-      new Headers(requests[0].init?.headers).get("X-CSRF-Token"),
-      "lease-csrf",
-    );
-  } finally {
-    globalThis.fetch = original;
-  }
+  return requests;
+}
+
+test("manual actions retain one client identity and strictly ordered timestamps even if the clock goes backwards", () => {
+  let now = 1000000;
+  const identity = new ThreadActionIdentity("tab-one", () => now);
+  const first = identity.payload();
+  const second = identity.payload();
+  now -= 60000;
+  const third = identity.payload();
+  assert.equal(first.client_id, "tab-one");
+  assert.equal(second.client_id, first.client_id);
+  assert.ok(second.issued_at > first.issued_at);
+  assert.ok(third.issued_at > second.issued_at);
+});
+
+test("idle time, input, scroll, visibility, restoration and switching only check ownership without browser leases", async (context) => {
+  const requests = ownershipServer();
+  const view = renderHook(
+    ({ id, enabled }) => useThreadOwnership(id, enabled),
+    {
+      initialProps: { id: "first", enabled: true },
+    },
+  );
+  await waitFor(() =>
+    assert.equal(view.result.current.ownership?.state, "managed"),
+  );
+  context.mock.timers.enable({
+    apis: ["setTimeout", "setInterval", "Date"],
+    now: 1000000,
+  });
+  act(() => {
+    context.mock.timers.tick(30 * 60 * 1000);
+  });
+  fireEvent.input(document);
+  fireEvent.keyDown(document, { key: "ArrowDown" });
+  fireEvent.pointerDown(document);
+  fireEvent.pointerMove(document, { buttons: 1 });
+  fireEvent.wheel(document);
+  fireEvent.scroll(document);
+  fireEvent.touchStart(document);
+  fireEvent.touchMove(document);
+  fireEvent(document, new Event("visibilitychange"));
+  await act(async () => {
+    window.dispatchEvent(new Event("pagehide"));
+    window.dispatchEvent(new Event("pageshow"));
+  });
+  view.rerender({ id: "second", enabled: true });
+  await act(async () => {});
+  view.rerender({ id: "second", enabled: false });
+  view.unmount();
+  assert.ok(
+    requests.some((request) => request.path === "/api/threads/first/ownership"),
+  );
+  assert.ok(
+    requests.some(
+      (request) => request.path === "/api/threads/second/ownership",
+    ),
+  );
+  assert.ok(requests.every((request) => request.path.endsWith("/ownership")));
+});
+
+test("manual release sends an authenticated explicit action without keepalive or browser presence", async () => {
+  const requests = ownershipServer();
+  setSession({ authenticated: true, csrf_token: "manual-csrf" });
+  await sendManualThreadRelease("native/thread", {
+    client_id: "tab-one",
+    issued_at: 10,
+  });
+  assert.equal(requests[0].path, "/api/threads/native%2Fthread/release");
+  assert.deepEqual(requests[0].body, {
+    manual: true,
+    client_id: "tab-one",
+    issued_at: 10,
+  });
+  assert.equal(requests[0].init?.method, "POST");
+  assert.equal(requests[0].init?.keepalive, undefined);
+  assert.equal(requests[0].init?.credentials, "same-origin");
+  assert.equal(
+    new Headers(requests[0].init?.headers).get("X-CSRF-Token"),
+    "manual-csrf",
+  );
 });

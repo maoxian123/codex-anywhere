@@ -997,7 +997,6 @@ function Workspace({
     const id = route.id;
     const thread = detailRef.current?.thread;
     try {
-      if (ownershipEnabled) await ownership.ensurePresence();
       const result = await post<{ command: Command }>(
         `/threads/${id}/${steer ? "steer" : "messages"}`,
         payload,
@@ -1102,7 +1101,6 @@ function Workspace({
   };
   const logout = async () => {
     try {
-      await ownership.releaseOnExit();
       await post("/auth/logout", {});
       const value = await api<Session>("/auth/me");
       setSession(value);
@@ -1311,6 +1309,11 @@ function Workspace({
                 <OwnershipPanel
                   key={`ownership:${route.id}`}
                   ownership={ownership.ownership}
+                  completionIdleRelease={
+                    selectedHost?.capabilities?.includes(
+                      "completionIdleRelease",
+                    ) || false
+                  }
                   pending={ownership.pending}
                   error={ownership.error}
                   notice={ownership.notice}

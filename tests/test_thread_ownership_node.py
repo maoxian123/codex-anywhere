@@ -13,10 +13,13 @@ from codex_anywhere.node import service as service_module
 from codex_anywhere.node.runtime import CodexRuntime
 from codex_anywhere.node.service import NodeService
 
-PEER = r'''
+PEER = r"""
 import json, os, sys
 calls = []
 pending = None
+pending_turn = None
+pending_steer = None
+turn_count = 0
 def emit(value):
     print(json.dumps(value), flush=True)
 for line in sys.stdin:
@@ -53,8 +56,39 @@ for line in sys.stdin:
         emit({"id":pending,"result":{"thread":{"id":"slow"}}})
         emit({"id":rpc_id,"result":{}})
     elif method == "turn/start":
-        emit({"method":"turn/started","params":{"threadId":params["threadId"],"turn":{"id":"turn-1"}}})
-        emit({"id":rpc_id,"result":{"turn":{"id":"turn-1"}}})
+        turn_count += 1
+        turn_id = "turn-" + str(turn_count)
+        text = params["input"][0].get("text", "")
+        if text == "reject":
+            emit({"id":rpc_id,"error":{"code":-32000,"message":"Native start rejected"}})
+        elif text in {"defer", "fast-defer"}:
+            pending_turn = (rpc_id, params["threadId"], turn_id)
+            if text == "fast-defer":
+                emit({"method":"turn/started","params":{"threadId":params["threadId"],"turn":{"id":turn_id}}})
+                emit({"method":"turn/completed","params":{"threadId":params["threadId"],"turn":{"id":turn_id,"status":"completed"}}})
+            emit({"method":"test/turnPending","params":{"threadId":params["threadId"],"turnId":turn_id}})
+        elif text in {"completed", "failed", "interrupted"}:
+            emit({"id":rpc_id,"result":{"turn":{"id":turn_id,"status":text}}})
+        else:
+            emit({"method":"turn/started","params":{"threadId":params["threadId"],"turn":{"id":turn_id}}})
+            emit({"id":rpc_id,"result":{"turn":{"id":turn_id,"status":"inProgress"}}})
+    elif method == "finishTurnRpc":
+        if params.get("reject"):
+            emit({"id":pending_turn[0],"error":{"code":-32000,"message":"Native start rejected"}})
+        else:
+            emit({"id":pending_turn[0],"result":{"turn":{"id":pending_turn[2],"status":params.get("status","inProgress")}}})
+        pending_turn = None
+        emit({"id":rpc_id,"result":{}})
+    elif method == "turn/steer":
+        if params["input"][0].get("text") == "defer":
+            pending_steer = rpc_id
+            emit({"method":"test/steerPending","params":{"threadId":params["threadId"]}})
+        else:
+            emit({"id":rpc_id,"result":{}})
+    elif method == "finishSteerRpc":
+        emit({"id":pending_steer,"result":{}})
+        pending_steer = None
+        emit({"id":rpc_id,"result":{}})
     elif method == "thread/unsubscribe":
         if params["threadId"] == "unsupported":
             emit({"id":rpc_id,"error":{"code":-32601,"message":"Unknown method thread/unsubscribe"}})
@@ -65,7 +99,7 @@ for line in sys.stdin:
             emit({"method":"thread/closed","params":{"threadId":params["threadId"]}})
     elif rpc_id is not None:
         emit({"id":rpc_id,"result":{}})
-'''
+"""
 
 
 class Ownership:
@@ -109,7 +143,7 @@ def command(kind, native_id="native", **payload):
     }
 
 
-def lease(client="tab-1", *, issued_at=None, expires_at=None):
+def writer_request(client="tab-1", *, issued_at=None, expires_at=None):
     return {
         "client_id": client,
         "issued_at": time.time() if issued_at is None else issued_at,
@@ -129,18 +163,23 @@ async def cleanup(service, runtime):
     service.store.close()
 
 
-def test_takeover_preserves_native_settings_and_releases_each_tab(tmp_path):
+def test_takeover_preserves_native_settings_and_manual_release_ignores_browser_presence(tmp_path):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
-            taken = await service.handle_command(command("thread.takeover", **lease()))
+            taken = await service.handle_command(command("thread.takeover", **writer_request()))
             assert taken["result"]["ownership"]["state"] == "managed"
-            await service.handle_command(command("thread.presence", **lease("tab-2")))
-            released = await service.handle_command(command("thread.release", **lease(expires_at=0)))
-            assert released["result"]["retained"] is True
+            presence = await service.handle_command(
+                command("thread.presence", **writer_request("tab-2"))
+            )
+            assert presence["result"]["ignored"] is True
+            legacy = await service.handle_command(
+                command("thread.release", **writer_request(expires_at=0))
+            )
+            assert legacy["result"]["ignored"] is True
             assert "native" in runtime.loaded_threads
             released = await service.handle_command(
-                command("thread.release", **lease("tab-2", expires_at=0))
+                command("thread.release", manual=True, **writer_request())
             )
             assert released["result"]["released"] is True
             assert "native" not in runtime.loaded_threads
@@ -155,49 +194,33 @@ def test_takeover_preserves_native_settings_and_releases_each_tab(tmp_path):
     asyncio.run(scenario())
 
 
-def test_lease_order_expiry_and_legacy_idle_fallback(tmp_path):
+def test_browser_noops_cannot_create_or_change_completion_deadline(tmp_path):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
-            now = time.time()
             await service.handle_command(command("thread.takeover"))
-            presence = command("thread.presence", **lease(issued_at=10, expires_at=now + 500))
-            await service.handle_command(presence)
-            assert service.thread_leases["native"]["tab-1"] <= time.time() + 90
-            await service.handle_command(
-                command("thread.release", **lease(issued_at=10, expires_at=0))
-            )
-            stale = await service.handle_command(
-                command("thread.presence", **lease(issued_at=10, expires_at=now + 90))
-            )
-            assert stale["result"]["accepted"] is False
-            # A replayed command returns its journaled result, without renewing.
-            await service.handle_command(presence)
-            assert not service._leases("native")
-            await service.handle_command(command("thread.takeover"))
+            for kind in ["thread.presence", "thread.release"]:
+                result = await service.handle_command(
+                    command(kind, client_id="old-page", issued_at=10, expires_at=0)
+                )
+                assert result["result"]["ignored"] is True
+            assert not service.writer_request_versions
+            assert not service.completion_idle_since
+            assert not service._release_due("native", 1000000000)
             await service._sweep_threads_once()
-            assert "native" not in runtime.loaded_threads
-            await service.handle_command(command("thread.takeover", "legacy"))
-            await service._sweep_threads_once()
-            assert "legacy" in runtime.loaded_threads
-            service.last_activity["legacy"] = time.time() - 301
-            await service._sweep_threads_once()
-            assert "legacy" not in runtime.loaded_threads
-            await service.handle_command(command("thread.takeover", "expired"))
-            await service.handle_command(
-                command("thread.presence", "expired", **lease(expires_at=now + 30))
-            )
-            service.thread_leases["expired"]["tab-1"] = now - 1
-            await service._sweep_threads_once()
-            assert "expired" not in runtime.loaded_threads
+            assert "native" in runtime.loaded_threads
         finally:
             await cleanup(service, runtime)
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("title,persisted", [("User title", True), ("unsupported", False), (None, False)])
-def test_new_empty_thread_is_persisted_or_kept_until_first_turn(tmp_path, title, persisted):
+@pytest.mark.parametrize(
+    "title,persisted", [("User title", True), ("unsupported", False), (None, False)]
+)
+def test_new_empty_thread_is_persisted_or_kept_until_first_turn(
+    tmp_path, monkeypatch, title, persisted
+):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
@@ -205,9 +228,9 @@ def test_new_empty_thread_is_persisted_or_kept_until_first_turn(tmp_path, title,
                 command("thread.start", cwd=str(tmp_path), title=title)
             )
             assert started["result"]["thread"]["id"] == "created"
-            await service.handle_command(command("thread.presence", "created", **lease()))
+            await service.handle_command(command("thread.presence", "created", **writer_request()))
             result = await service.handle_command(
-                command("thread.release", "created", **lease(expires_at=0))
+                command("thread.release", "created", manual=True, **writer_request())
             )
             assert result["result"]["released"] is persisted
             if not persisted:
@@ -220,6 +243,13 @@ def test_new_empty_thread_is_persisted_or_kept_until_first_turn(tmp_path, title,
                 await notify(
                     runtime, "turn/completed", {"threadId": "created", "turn": {"id": "turn-1"}}
                 )
+                assert "created" in runtime.loaded_threads
+                completed = service.completion_idle_since["created"]
+                monkeypatch.setattr(
+                    service_module,
+                    "time",
+                    SimpleNamespace(time=time.time, monotonic=lambda: completed + 120),
+                )
                 await service._sweep_threads_once()
                 assert "created" not in runtime.loaded_threads
         finally:
@@ -228,34 +258,47 @@ def test_new_empty_thread_is_persisted_or_kept_until_first_turn(tmp_path, title,
     asyncio.run(scenario())
 
 
-def test_web_exit_preserves_turn_and_approval_then_releases(tmp_path):
+def test_web_exit_preserves_turn_and_approval_until_completed_idle_window(tmp_path, monkeypatch):
     async def scenario():
         service, runtime = await make_service(tmp_path)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(
+            service_module, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock["now"])
+        )
         try:
-            await service.handle_command(command("thread.takeover", **lease()))
+            await service.handle_command(command("thread.takeover", **writer_request()))
             started = await service.handle_command(
                 command("turn.start", input=[{"type": "text", "text": "continue"}])
             )
             assert started.get("error") is None
-            released = await service.handle_command(command("thread.release", **lease(expires_at=0)))
-            assert released["result"]["deferred"] is True
+            released = await service.handle_command(
+                command("thread.release", **writer_request(expires_at=0))
+            )
+            assert released["result"]["ignored"] is True
+            clock["now"] += 600
             await service._sweep_threads_once()
             assert "native" in runtime.loaded_threads
             await notify(runtime, "turn/completed", {"threadId": "native", "turn": {"id": "old"}})
+            assert "native" not in service.completion_idle_since
+            await notify(
+                runtime, "item/commandExecution/requestApproval", {"threadId": "native"}, rpc_id=123
+            )
+            clock["now"] += 600
             await service._sweep_threads_once()
             assert "native" in runtime.loaded_threads
             await notify(
-                runtime, "item/commandExecution/requestApproval", {"threadId": "native"}, rpc_id=123
+                runtime, "serverRequest/resolved", {"threadId": "native", "requestId": 123}
             )
             await notify(
                 runtime, "turn/completed", {"threadId": "native", "turn": {"id": "turn-1"}}
             )
+            completed = clock["now"]
+            clock["now"] = completed + 119
             await service._sweep_threads_once()
             assert "native" in runtime.loaded_threads
-            await notify(runtime, "serverRequest/resolved", {"threadId": "native", "requestId": 123})
+            clock["now"] = completed + 120
             await service._sweep_threads_once()
             assert "native" not in runtime.loaded_threads
-            # Same native conversation can subsequently be resumed from its saved cwd.
             await service.handle_command(
                 command("turn.start", input=[{"type": "text", "text": "next"}])
             )
@@ -281,13 +324,15 @@ def test_release_cannot_race_pending_resume_or_turn(tmp_path):
             while not runtime.pending:
                 await asyncio.sleep(0)
             release = asyncio.create_task(
-                service.handle_command(command("thread.release", "slow", **lease(expires_at=0)))
+                service.handle_command(
+                    command("thread.release", "slow", manual=True, **writer_request())
+                )
             )
             await service._sweep_threads_once()
-            assert not start.done() and not release.done()
+            result = await release
+            assert not start.done()
             await runtime.request("releaseResume", {})
             await start
-            result = await release
             assert result["result"]["deferred"] is True
             calls = (await runtime.request("inspect", {}))["calls"]
             assert not any(method == "thread/unsubscribe" for method, _ in calls)
@@ -304,9 +349,9 @@ def test_release_requires_native_confirmation(tmp_path, monkeypatch, native_id):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
-            await service.handle_command(command("thread.takeover", native_id, **lease()))
+            await service.handle_command(command("thread.takeover", native_id, **writer_request()))
             result = await service.handle_command(
-                command("thread.release", native_id, **lease(expires_at=0))
+                command("thread.release", native_id, manual=True, **writer_request())
             )
             assert result["result"]["released"] is False
             assert result["result"]["error"]
@@ -339,7 +384,7 @@ def test_external_takeover_needs_confirmation_and_current_token(tmp_path):
             )
             assert "Writer changed" in denied["error"]
             accepted = await service.handle_command(
-                command("thread.takeover", confirmed=True, owner_token="token", **lease())
+                command("thread.takeover", confirmed=True, owner_token="token", **writer_request())
             )
             assert accepted["result"]["ownership"]["state"] == "managed"
             assert service.ownership.terminated == ["native"]
@@ -362,7 +407,7 @@ def test_late_or_expired_takeover_has_no_side_effects(
         try:
             if prior_release:
                 await service.handle_command(
-                    command("thread.release", **lease(issued_at=20, expires_at=0))
+                    command("thread.release", manual=True, **writer_request(issued_at=20))
                 )
             service.ownership.state = state
             result = await service.handle_command(
@@ -370,7 +415,9 @@ def test_late_or_expired_takeover_has_no_side_effects(
                     "thread.takeover",
                     confirmed=True,
                     owner_token="token",
-                    **lease(issued_at=issued_at, expires_at=time.time() + (-1 if expired else 90)),
+                    **writer_request(
+                        issued_at=issued_at, expires_at=time.time() + (-1 if expired else 90)
+                    ),
                 )
             )
             assert "stale" in result.get("error", "") or "expired" in result.get("error", "")
@@ -379,7 +426,7 @@ def test_late_or_expired_takeover_has_no_side_effects(
             calls = (await runtime.request("inspect", {}))["calls"]
             assert not any(method == "thread/resume" for method, _ in calls)
             if prior_release:
-                assert service.lease_versions[("native", "tab-1")] == (20, True)
+                assert service.writer_request_versions[("native", "tab-1")] == (20, True)
         finally:
             await cleanup(service, runtime)
 
@@ -390,7 +437,7 @@ def test_takeover_can_reuse_same_millisecond_live_presence(tmp_path):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
-            presence = lease(issued_at=10)
+            presence = writer_request(issued_at=10)
             await service.handle_command(command("thread.presence", **presence))
             service.ownership.state = "external"
             result = await service.handle_command(
@@ -405,29 +452,25 @@ def test_takeover_can_reuse_same_millisecond_live_presence(tmp_path):
 
 
 @pytest.mark.parametrize("clock_offset", [-3600, 3600])
-def test_hub_clock_skew_preserves_live_leases_and_rejects_expired_takeovers(tmp_path, clock_offset):
+def test_hub_clock_skew_preserves_request_freshness_without_browser_leases(tmp_path, clock_offset):
     async def scenario():
         service, runtime = await make_service(tmp_path)
         try:
             service._sync_hub_clock({"server_time": time.time() + clock_offset})
-            live = lease(issued_at=10, expires_at=service._hub_now() + 90)
-            accepted = await service.handle_command(command("thread.presence", **live))
-            assert accepted["result"]["accepted"] is True
-            local_deadline = service.thread_leases["native"]["tab-1"]
-            assert time.time() + 88 <= local_deadline <= time.time() + 90
+            live = writer_request(issued_at=10, expires_at=service._hub_now() + 90)
             taken = await service.handle_command(command("thread.takeover", **live))
             assert taken["result"]["ownership"]["state"] == "managed"
-            assert service.thread_leases["native"]["tab-1"] == local_deadline
-            # Reconnecting refreshes the hub clock, never an existing deadline.
-            service._sync_hub_clock({"server_time": time.time() + clock_offset})
-            assert service.thread_leases["native"]["tab-1"] == local_deadline
-            await service.handle_command(
-                command("thread.release", **lease(issued_at=11, expires_at=0))
+            assert not service.completion_idle_since
+            released = await service.handle_command(
+                command(
+                    "thread.release",
+                    manual=True,
+                    **writer_request(issued_at=11, expires_at=service._hub_now() + 90),
+                )
             )
+            assert released["result"]["released"] is True
             service.ownership.state = "external"
-            expired = lease(issued_at=12, expires_at=service._hub_now() - 1)
-            presence = await service.handle_command(command("thread.presence", **expired))
-            assert presence["result"]["clients"] == 0
+            expired = writer_request(issued_at=12, expires_at=service._hub_now() - 1)
             denied = await service.handle_command(
                 command("thread.takeover", confirmed=True, owner_token="token", **expired)
             )
@@ -448,7 +491,8 @@ def test_hub_clock_uses_monotonic_elapsed_and_legacy_fallback(tmp_path, monkeypa
     )
     clock = {"wall": 1000.0, "monotonic": 10.0}
     monkeypatch.setattr(
-        service_module, "time",
+        service_module,
+        "time",
         SimpleNamespace(time=lambda: clock["wall"], monotonic=lambda: clock["monotonic"]),
     )
     try:
@@ -465,11 +509,21 @@ def test_hub_clock_uses_monotonic_elapsed_and_legacy_fallback(tmp_path, monkeypa
 @pytest.mark.parametrize("layout", ["global", "local"])
 @pytest.mark.parametrize("subdirectory", ["bin", "codex"])
 def test_windows_npm_starts_native_writer_directly(tmp_path, monkeypatch, layout, subdirectory):
-    wrapper = tmp_path / "codex.cmd" if layout == "global" else tmp_path / "node_modules" / ".bin" / "codex.cmd"
+    wrapper = (
+        tmp_path / "codex.cmd"
+        if layout == "global"
+        else tmp_path / "node_modules" / ".bin" / "codex.cmd"
+    )
     package = tmp_path / "node_modules" / "@openai" / "codex"
     binary = (
-        package / "node_modules" / "@openai" / "codex-win32-x64"
-        / "vendor" / "x86_64-pc-windows-msvc" / subdirectory / "codex.exe"
+        package
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / "x86_64-pc-windows-msvc"
+        / subdirectory
+        / "codex.exe"
     )
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"test")
@@ -477,7 +531,8 @@ def test_windows_npm_starts_native_writer_directly(tmp_path, monkeypatch, layout
     monkeypatch.setattr(runtime_module.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(runtime_module.shutil, "which", lambda _: str(wrapper))
     assert runtime_module.native_codex_command(["codex", "app-server"]) == [
-        str(binary), "app-server"
+        str(binary),
+        "app-server",
     ]
     binary.unlink()
     with pytest.raises(ValueError, match="native Codex executable"):
