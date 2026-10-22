@@ -156,7 +156,7 @@ test("each node paginates and disables its own button without blocking another n
   );
 });
 
-test("background activity updates preserve row order, project order and each node's scroll element", () => {
+test("background activity updates preserve row order, project order and the shared scroll element", () => {
   const projects = [project("原第一项目"), project("原第二项目")];
   const threads = [
     thread("原第一条", "linux", { project_id: "原第一项目" }),
@@ -170,8 +170,8 @@ test("background activity updates preserve row order, project order and each nod
   const windowsList = screen.getByRole("region", {
     name: "Windows 节点 会话列表",
   });
-  linuxList.scrollTop = 120;
-  windowsList.scrollTop = 35;
+  const sharedList = screen.getByRole("region", { name: "项目与会话列表" });
+  sharedList.scrollTop = 120;
   rerender(
     <ProjectNavigation
       {...defaults}
@@ -194,8 +194,11 @@ test("background activity updates preserve row order, project order and each nod
     screen.getByRole("region", { name: "Windows 节点 会话列表" }),
     windowsList,
   );
-  assert.equal(linuxList.scrollTop, 120);
-  assert.equal(windowsList.scrollTop, 35);
+  assert.equal(
+    screen.getByRole("region", { name: "项目与会话列表" }),
+    sharedList,
+  );
+  assert.equal(sharedList.scrollTop, 120);
   assert.deepEqual(
     within(linuxList)
       .getAllByRole("link")
@@ -208,7 +211,10 @@ test("background activity updates preserve row order, project order and each nod
     ),
     ["原第一项目", "原第二项目"],
   );
-  assert.equal(linuxList.tabIndex, 0);
+  assert.equal(sharedList.tabIndex, 0);
+  assert.equal(linuxList.tabIndex, -1);
+  assert.equal(windowsList.tabIndex, -1);
+  assert.equal(container.querySelectorAll(".host-thread-scroll").length, 0);
 });
 
 test("project filters show only their node and retain project settings with legacy pagination", () => {

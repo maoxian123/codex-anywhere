@@ -81,6 +81,9 @@ export type Thread = {
   history_generation?: string | null;
   native_id?: string;
   title: string;
+  display_title?: string | null;
+  pinned?: boolean;
+  archived?: boolean;
   cwd: string;
   status: string;
   active_turn_id?: string;

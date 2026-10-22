@@ -365,7 +365,6 @@ test("leaving the conversation releases this tab's lease with a later timestamp"
     owner_token: null,
   });
   await screen.findByText("已托管");
-  fireEvent.click(screen.getByLabelText("设备与设置"));
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
   await screen.findByRole("textbox", { name: "管理员用户名" });
   assert.equal(screen.queryByRole("button", { name: /^会话托管：/ }), null);
@@ -524,7 +523,6 @@ test("retained leases show the other page explanation and native release errors 
 test("application settings open from the sidebar and conversations remain reachable", async () => {
   setup();
   await screen.findByRole("textbox", { name: "发送消息给 Codex" });
-  fireEvent.click(screen.getByLabelText("设备与设置"));
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
   const username = await screen.findByRole("textbox", { name: "管理员用户名" });
   assert.equal((username as HTMLInputElement).value, "test");
@@ -532,7 +530,7 @@ test("application settings open from the sidebar and conversations remain reacha
   assert.ok(screen.getByRole("heading", { level: 1, name: "设置" }));
   assert.ok(!screen.queryByRole("textbox", { name: "发送消息给 Codex" }));
   fireEvent.click(screen.getByRole("button", { name: /全部会话/ }));
-  await screen.findByText("选择一个会话继续");
+  await screen.findByText("今天想完成什么？");
   assert.equal(window.location.pathname, "/");
   fireEvent.click(screen.getByRole("link", { name: /集成测试任务/ }));
   await screen.findByRole("textbox", { name: "发送消息给 Codex" });
@@ -637,14 +635,14 @@ test("an expired session returns to login and the next login uses the refreshed 
 
 test("WebSocket reconnection resubscribes and returns to live status", async () => {
   setup();
-  await screen.findByText("实时连接");
+  await screen.findByText("已连接");
   const previous = FakeWebSocket.instances.length;
   act(() => FakeWebSocket.instances.at(-1)!.onclose?.());
   await screen.findByText("正在重连");
   await waitFor(() => assert.ok(FakeWebSocket.instances.length > previous), {
     timeout: 2000,
   });
-  await screen.findByText("实时连接");
+  await screen.findByText("已连接");
 });
 
 function deferred<T>() {
@@ -766,11 +764,12 @@ test("deleting a host clears its active conversation and rejects late snapshots 
   fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
   await waitFor(() => assert.equal(requested, true));
   server.event("anywhere/host_deleted", { host_id: "h1" }, "");
-  await screen.findByRole("heading", { name: "选择一个会话继续" });
+  await screen.findByRole("heading", { name: "今天想完成什么？" });
   assert.equal(window.location.pathname, "/");
   assert.equal(
-    screen.queryByRole("textbox", { name: "发送消息给 Codex" }),
-    null,
+    (screen.getByRole("combobox", { name: "工作项目" }) as HTMLSelectElement)
+      .value,
+    "p2",
   );
   await act(async () => {
     stale.resolve(
@@ -1447,7 +1446,7 @@ test("a reference to an older item searches history by bounded pages", async () 
   assert.equal(olderReads, 1);
 });
 
-test("compact sidebar prioritizes sessions and keeps manual history inside the device menu", async () => {
+test("sidebar keeps history in the explicit device menu and settings in the footer", async () => {
   setup();
   await screen.findByRole("textbox", { name: "发送消息给 Codex" });
   assert.ok(screen.getByRole("button", { name: "新对话" }));
@@ -1456,8 +1455,70 @@ test("compact sidebar prioritizes sessions and keeps manual history inside the d
     screen.queryByRole("button", { name: "更多本机历史" }) === null,
     true,
   );
-  fireEvent.click(screen.getByLabelText("设备与设置"));
+  fireEvent.click(screen.getByLabelText("工作设备"));
   await screen.findByRole("button", { name: "更多本机历史" });
+});
+
+test("new conversation inherits the open thread project without requiring a sidebar filter", async () => {
+  setup({ project_id: "p2", cwd: "C:\\second" }, "/tasks/t1", [], {
+    projects: [
+      {
+        id: "p1",
+        host_id: "h1",
+        name: "第一个项目",
+        cwd: "C:\\first",
+        thread_count: 0,
+        created_at: "",
+        updated_at: "",
+      },
+      {
+        id: "p2",
+        host_id: "h1",
+        name: "当前项目",
+        cwd: "C:\\second",
+        thread_count: 1,
+        created_at: "",
+        updated_at: "",
+      },
+    ],
+  });
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
+  await screen.findByRole("heading", { name: "今天想完成什么？" });
+  assert.equal(
+    (screen.getByRole("combobox", { name: "工作项目" }) as HTMLSelectElement)
+      .value,
+    "p2",
+  );
+  assert.equal(screen.queryByRole("dialog"), null);
+});
+
+test("another browser archiving a background conversation removes its cached sidebar row", async () => {
+  const old = {
+    id: "t2",
+    host_id: "h1",
+    title: "即将归档",
+    cwd: "C:\\work",
+    status: "idle",
+    created_at: "",
+    updated_at: "",
+  };
+  const server = setup({}, "/tasks/t1", [], { threads: [old] });
+  await screen.findByRole("link", { name: /即将归档/ });
+  Object.assign(old, { archived: true });
+  server.event("anywhere/thread_preferences", {
+    threadId: "t2",
+    display_title: null,
+    pinned: false,
+    archived: true,
+  });
+  await waitFor(() =>
+    assert.equal(screen.queryByRole("link", { name: /即将归档/ }), null),
+  );
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 550));
+  });
+  assert.equal(screen.queryByRole("link", { name: /即将归档/ }), null);
 });
 
 test("older native history waits for cursor projection and preserves the loaded tail", async () => {

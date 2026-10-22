@@ -1,0 +1,410 @@
+/* Comfortable reading sizes and one clear conversation context. */
+body {
+  min-width: 320px;
+}
+.sidebar {
+  width: 300px;
+}
+.sidebar-close {
+  display: none;
+}
+.main-panel {
+  min-width: 0;
+}
+.topbar {
+  min-height: 80px;
+  height: auto;
+  padding: 14px 28px;
+  gap: 16px;
+  flex-shrink: 0;
+}
+.topbar-left {
+  flex: 1;
+  min-width: 0;
+  gap: 12px;
+}
+.conversation-title-block {
+  min-width: 0;
+}
+.topbar-title {
+  font-size: 16px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+.conversation-context {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  color: #9babb3;
+  min-width: 0;
+  font-size: 12px;
+}
+.conversation-context > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-context > span > svg {
+  flex: none;
+}
+.conversation-context .status-pill {
+  flex: none;
+  font-size: 11px;
+}
+.conversation-context .host-offline {
+  color: #e3b98b;
+}
+.topbar-right {
+  gap: 8px;
+}
+.connection-status {
+  font-size: 11px;
+}
+.ownership-trigger {
+  min-height: 36px;
+  font-size: 12px;
+}
+.main-panel .timeline-inner {
+  max-width: 920px;
+  padding: 28px 38px 16px;
+}
+.main-panel .user-bubble,
+.main-panel .agent-body {
+  font-size: 15px;
+  line-height: 1.85;
+}
+.message-heading {
+  font-size: 12px;
+}
+.message-heading time {
+  font-size: 11px;
+  color: #91a2ac;
+}
+.markdown pre {
+  font-size: 13px;
+}
+.work-process > summary {
+  font-size: 12px;
+  min-height: 40px;
+}
+.tool-card > summary {
+  font-size: 12px;
+  min-height: 40px;
+}
+.global-error,
+.thread-error,
+.offline-banner {
+  font-size: 13px;
+}
+.modal-header h2 {
+  font-size: 20px;
+}
+.modal-subtitle,
+.modal .field-hint {
+  font-size: 12px;
+}
+.modal .form-stack label,
+.modal input,
+.modal textarea,
+.modal select {
+  font-size: 14px;
+}
+.modal .button,
+.modal .text-button {
+  font-size: 13px;
+  min-height: 40px;
+}
+
+.new-conversation-page {
+  width: min(100%, 840px);
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: auto;
+  padding: max(32px, 10vh) 32px 36px;
+}
+.new-conversation-heading {
+  text-align: center;
+  margin-bottom: 30px;
+}
+.new-conversation-heading > svg {
+  color: #a6c5b8;
+}
+.new-conversation-heading h2 {
+  font-size: 28px;
+  font-weight: 600;
+  margin: 12px 0 8px;
+}
+.new-conversation-heading p {
+  font-size: 14px;
+  color: #9aaeb7;
+  margin: 0;
+}
+.new-conversation-context {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 24px;
+}
+.new-conversation-context label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  min-width: 0;
+  flex: 1;
+}
+.new-conversation-context select {
+  width: auto;
+  max-width: 360px;
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  min-height: 44px;
+  padding: 9px 12px;
+}
+.new-conversation-context .text-button {
+  min-height: 44px;
+  font-size: 13px;
+  flex: none;
+}
+.new-conversation-location {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 24px;
+  font-size: 12px;
+  color: #a1b2bb;
+}
+.new-conversation-location > svg {
+  flex: none;
+}
+.new-conversation-location > span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.new-conversation-page .composer-area {
+  width: 100%;
+  max-width: none;
+  padding-top: 0;
+}
+.new-conversation-page .composer textarea {
+  min-height: 104px;
+}
+.new-conversation-options {
+  margin: 2px 24px 0;
+  color: #a8b9c0;
+  font-size: 13px;
+}
+.new-conversation-options > summary {
+  cursor: pointer;
+  min-height: 44px;
+  padding: 10px 0;
+  width: fit-content;
+}
+.new-conversation-options .execution-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.new-conversation-options .execution-fields label {
+  font-size: 13px;
+}
+.new-conversation-options select {
+  font-size: 14px;
+  min-height: 44px;
+}
+.new-conversation-options .runtime-settings-editor {
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.new-conversation-setup {
+  text-align: center;
+  font-size: 14px;
+  color: var(--muted);
+}
+.new-conversation-setup .button {
+  margin: 12px auto;
+  min-height: 44px;
+  font-size: 14px;
+}
+.pending-conversation-link {
+  margin: 8px 24px;
+  font-size: 13px;
+  min-height: 44px;
+}
+.new-conversation-recovery {
+  margin: 8px 24px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.new-conversation-recovery .text-button {
+  font-size: 13px;
+  min-height: 44px;
+}
+
+@media (max-width: 850px) {
+  .topbar {
+    padding: 12px 18px;
+  }
+  .conversation-context {
+    gap: 8px;
+  }
+  .conversation-context .context-host {
+    max-width: 140px;
+  }
+  .new-conversation-page {
+    padding: 40px 18px 24px;
+  }
+}
+@media (max-width: 680px) {
+  .sidebar {
+    width: min(350px, 92vw);
+  }
+  .sidebar-close {
+    display: inline-flex;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .topbar {
+    min-height: 84px;
+    padding: 10px 12px;
+    gap: 6px;
+  }
+  .topbar-left {
+    gap: 8px;
+  }
+  .topbar-title {
+    font-size: 14px;
+  }
+  .topbar-right {
+    gap: 0;
+  }
+  .conversation-context {
+    gap: 6px;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .conversation-context .status-pill {
+    font-size: 10px;
+  }
+  .conversation-context .context-host {
+    max-width: 125px;
+  }
+  .topbar .icon-button {
+    width: 40px;
+    min-width: 40px;
+    height: 44px;
+  }
+  .topbar-right .ownership-trigger {
+    width: 42px;
+    min-height: 44px;
+    padding: 10px;
+    justify-content: center;
+  }
+  .topbar-right .ownership-trigger > span,
+  .topbar-right .ownership-chevron {
+    display: none;
+  }
+  .topbar-right .ownership-trigger.ownership-needs-attention {
+    border-color: var(--error);
+  }
+  .topbar-right > .icon-button {
+    display: none;
+  }
+  .topbar-right .connection-status {
+    padding: 0 6px;
+    gap: 0;
+    width: auto;
+    font-size: 0;
+  }
+  .main-panel .timeline-inner {
+    padding: 20px 16px 12px;
+  }
+  .main-panel .user-bubble,
+  .main-panel .agent-body {
+    font-size: 15px;
+    margin-left: 0;
+  }
+  .message-heading {
+    font-size: 12px;
+  }
+  .message-heading time {
+    font-size: 11px;
+  }
+  .message-heading .copy-button {
+    width: 44px;
+    height: 44px;
+  }
+  .markdown pre {
+    font-size: 12px;
+  }
+  .work-process {
+    margin-left: 0;
+  }
+  .work-process > summary {
+    min-height: 44px;
+    font-size: 12px;
+  }
+  .thread-error {
+    padding: 12px 16px;
+  }
+  .new-conversation-page {
+    padding: 32px 12px 24px;
+  }
+  .new-conversation-heading {
+    margin-bottom: 24px;
+  }
+  .new-conversation-heading h2 {
+    font-size: 24px;
+  }
+  .new-conversation-heading p {
+    font-size: 14px;
+    line-height: 1.7;
+  }
+  .new-conversation-context {
+    margin: 0 2px;
+    gap: 8px;
+  }
+  .new-conversation-context label {
+    gap: 8px;
+    font-size: 12px;
+  }
+  .new-conversation-context .text-button {
+    font-size: 12px;
+  }
+  .new-conversation-location {
+    margin: 10px 2px;
+    font-size: 12px;
+    flex-wrap: wrap;
+  }
+  .new-conversation-location > span {
+    width: 100%;
+  }
+  .new-conversation-options {
+    margin: 0 2px;
+  }
+  .new-conversation-options .execution-fields {
+    grid-template-columns: 1fr;
+  }
+  .new-conversation-options .execution-fields label,
+  .new-conversation-options select {
+    font-size: 14px;
+  }
+  .modal .icon-button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .modal .button,
+  .modal .text-button {
+    min-height: 44px;
+  }
+}

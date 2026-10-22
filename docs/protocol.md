@@ -170,13 +170,13 @@ Migration `0005` adds runtime capabilities, project/thread desired and effective
 ## Automatic discovery baseline (v3; v4 paging supersedes full loads)
 
 Thread and Project browser objects include `last_activity_at` (ISO timestamp).
-`GET /api/threads` orders by descending activity before applying pagination,
-with descending ID as a stable tie-breaker. Activity uses the latest native
-thread/history version and locally journaled `turn.start`/`turn.steer` input;
+`GET /api/threads` orders by pinned preference, then descending activity before
+applying pagination, with descending ID as a stable tie-breaker. Activity uses the
+latest native thread/history version and locally journaled `turn.start`/`turn.steer` input;
 threads without native versions fall back to `updated_at`, then `created_at`.
-`GET /api/projects` orders by the latest activity across all of each project's
-cached conversations, with creation time for an empty project and descending ID
-for ties. Discovery, inventory and read-only history synchronization do not make
+`GET /api/projects` orders by the latest activity across each project's
+non-archived cached conversations, with creation time for an empty project and
+descending ID for ties. Discovery, inventory and read-only history synchronization do not make
 old native activity recent. These fields are derived without a schema migration.
 
 Nodes advertise `capabilities:["catalogSync"]` in hello. Compatible hubs add `capabilities:{catalogSync:{recentLimit:50,intervalSeconds:60}}` to welcome. The node starts automatic discovery only after receiving that explicit welcome capability; a new node connected to an old hub must not emit automatic catalog events. Old nodes without the hello capability retain their existing behavior. On each negotiated connection the node immediately discovers the most recent 50 non-archived Codex threads and repeats every 60 seconds, independently of browsers. Do not run inference or load full histories for discovery.
@@ -253,11 +253,47 @@ saved credentials take precedence across hub restarts. The settings API does not
 rewrite `.env` or return the stored hash. `/settings` serves the browser settings
 page through the same login-gated application shell as conversation routes.
 
-### Workspace endpoints
+### Conversation organization
 
-The browser sidebar groups conversations only by machine and project/directory.
-It has no date buckets. Each machine retains independent scrolling and pagination;
-initial activity ranking and explicit local conversation promotion are preserved.
+The browser sidebar groups conversations by machine and project/directory and may
+offer recent, running, waiting, pinned and archived views. Projects can collapse
+without filtering out other projects. Thread pagination preserves pinned-first,
+then native/local-input activity ranking.
+
+Thread DTOs add nullable `display_title`, boolean `pinned` and boolean `archived`.
+These are persistent hub presentation preferences, independent of Codex's native
+title, archive state and runtime ownership. Browsers display `display_title` when
+present, falling back to `title`. Native catalog/history synchronization updates
+native metadata without replacing these preferences or changing raw payloads.
+
+`PATCH /api/threads/<id>/preferences` accepts one or more of
+`{display_title:string|null,pinned:boolean,archived:boolean}` and returns `{thread}`.
+Authentication and `X-CSRF-Token` are required. Unknown keys, empty objects, wrong
+types, blank names, names longer than 240 characters and Unicode control/format
+characters are rejected with 400. Display names are trimmed; null restores the
+native title. Omitted fields retain their existing values. Saving works while the
+node is offline, never journals an execution command, never renames/archives a
+native thread, and never starts, stops or unloads it. Presentation edits leave
+conversation activity timestamps unchanged. A changed preference emits the durable
+thread-scoped event `anywhere/thread_preferences`
+`{threadId,display_title,pinned,archived}` in the same database transaction.
+
+`GET /api/threads` defaults to `archived=false`; `archived=true` returns only
+archived hub conversations and `archived=all` includes both. Other values are 400.
+Search matches both native `title` and `display_title`, with archive, host and
+project filters applied before pinned-first activity ordering and pagination.
+Archived threads remain accessible by ID and can be restored with
+`{archived:false}`. Project `thread_count` and `last_activity_at` include only
+non-archived hub conversations; empty projects remain available as directories.
+Archive does not interrupt running work or remove native history or hub messages.
+
+Migration `0007_thread_preferences` follows existing `0006_hub_settings` and adds
+the three preference columns on SQLite/PostgreSQL. Existing conversations retain
+their native title and default to unpinned and unarchived. Run `db-upgrade` before
+starting the upgraded hub. No node upgrade or transport contract change is needed
+for these hub-only preferences.
+
+### Workspace endpoints
 
 `GET /api/settings/hosts` requires browser authentication and returns `{hosts}`.
 Each entry extends the public host DTO with `data:{projects,threads,messages,
@@ -287,8 +323,8 @@ cannot recreate the removed machine's projection.
 
 - GET `/api/hosts` -> `{hosts:[{id,name,platform,online,version,runtime_id,last_seen_at,last_sync_at,sync_error,capabilities}]}`. Sync timestamps are ISO/null; errors are string/null and do not remove cached conversations. Capabilities is the node's advertised feature-name list, separate from the runtime catalog endpoint.
 - POST `/api/pairings` -> `{code,expires_at}`. Node pairing is separate below.
-- GET `/api/threads?q=...&project_id=...&host_id=...&limit=...&offset=...` -> `{threads:[Thread],has_more,next_offset}`. Thread = `{id,host_id,project_id,native_id,title,cwd,status,active_turn_id,last_error,imported,history_loaded,native_updated_at,history_native_updated_at,history_synced_at,history_stale,history_cursor,history_complete,history_generation,execution_settings,effective_settings,settings_revision,effective_settings_revision,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting|importing. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts. Native version fields are Unix seconds/null, `history_synced_at` is ISO/null, and `history_stale` is boolean.
-- POST `/api/threads` `{host_id,title,project_id?,cwd?,model?}` -> HTTP 202 `{thread,command}`. Select a project or supply an absolute directory; an explicit directory is grouped into a project when the node confirms its canonical path. Directory existence/access is checked on the node, never by reading the hub filesystem.
+- GET `/api/threads?q=...&project_id=...&host_id=...&archived=false|true|all&limit=...&offset=...` -> `{threads:[Thread],has_more,next_offset}`. Thread = `{id,host_id,project_id,native_id,title,display_title,pinned,archived,cwd,status,active_turn_id,last_error,imported,history_loaded,native_updated_at,history_native_updated_at,history_synced_at,history_stale,history_cursor,history_complete,history_generation,execution_settings,effective_settings,settings_revision,effective_settings_revision,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting|importing. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts. Native version fields are Unix seconds/null, `history_synced_at` is ISO/null, and `history_stale` is boolean.
+- POST `/api/threads` `{host_id,title,project_id?,cwd?,model?,client_request_id?}` -> HTTP 202 `{thread,command}`. Select a project or supply an absolute directory; an explicit directory is grouped into a project when the node confirms its canonical path. Directory existence/access is checked on the node, never by reading the hub filesystem. Optional `client_request_id` is a non-empty string of at most 200 characters. Identical creation payloads with the same ID return the original thread and durable command, even offline or after a failed/unknown outcome. A changed payload with the same ID returns 409. Replaying the browser request never creates another thread or re-delivers the command; unknown execution outcomes must not be retried automatically. The hub uses the existing command idempotency key and internal `_signature` mechanism, without changing node execution semantics.
 - POST `/api/threads/<id>/history` `{cursor?,limit?:50,retry?:false}` -> 202 `{thread,command}` when starting/reusing a page load; 200 `{thread,command:null}` for current history or a live task. Failed/unknown reads without explicit retry return 409 `{error,thread,command}`; an offline node also returns 409. See the v4 contract for legacy-node compatibility.
 - GET `/api/threads/<id>?item_limit=100[&before_position=N]` -> `{thread,items:[Item],interactions:[Interaction],has_more_items,next_before_position}`. With neither pagination parameter, retain the legacy `{thread,items:[Item],interactions:[Interaction]}` response with all cached raw items. Item = `{id,native_id,thread_id,turn_id,type,data,position,created_at}`. Order by stable `position`, then `id`. Paginated `data` uses the v4 compact DTO, with optional `_assets:[Asset]` / `_references:[Reference]` and `_truncated:true`; the authenticated single-item endpoint returns the preserved original. GET history must survive reload. Imported tasks cannot accept messages until `history_loaded` is true.
 - POST `/api/threads/<id>/messages` `{text,asset_ids:[],references:[],client_request_id}` -> 202 `{command}`. References are `{kind:'task',thread_id,item_id?}` or `{kind:'web',url,title?,excerpt?}`. Resolved immutable snapshots are stored and model-visible quoted text is built by hub. Web content is user-provided excerpt; hub MUST NOT fetch arbitrary URLs.

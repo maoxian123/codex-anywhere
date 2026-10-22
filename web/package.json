@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
-    "test": "node --import tsx --test src/utils.test.ts src/api.test.ts src/runtime-errors.test.ts src/history.test.ts src/automatic-history.test.tsx src/controls.test.tsx src/App.test.tsx src/projects.test.tsx src/execution-settings.test.tsx src/settings.test.tsx src/thread-presence.test.ts src/node-local-ui.test.ts src/sidebar-order.test.ts src/navigation.test.tsx src/host-settings.test.tsx src/ownership-panel.test.tsx src/timeline-work.test.tsx",
+    "test": "node --import tsx --test src/utils.test.ts src/api.test.ts src/runtime-errors.test.ts src/history.test.ts src/automatic-history.test.tsx src/controls.test.tsx src/App.test.tsx src/projects.test.tsx src/execution-settings.test.tsx src/settings.test.tsx src/thread-presence.test.ts src/node-local-ui.test.ts src/sidebar-order.test.ts src/navigation.test.tsx src/host-settings.test.tsx src/ownership-panel.test.tsx src/timeline-work.test.tsx src/composer-drafts.test.tsx src/new-conversation.test.tsx src/sidebar-ux.test.tsx src/focus.test.tsx",
     "preview": "vite preview --host 127.0.0.1",
     "format": "prettier --write src public index.html vite.config.ts tsconfig.json package.json",
     "format:check": "prettier --check src public index.html vite.config.ts tsconfig.json package.json"

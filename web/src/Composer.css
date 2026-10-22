@@ -1,0 +1,202 @@
+.composer-area {
+  max-width: 860px;
+  padding: 12px 24px 16px;
+}
+
+.composer {
+  border-radius: 20px;
+}
+
+.composer textarea {
+  min-height: 64px;
+  padding: 16px 18px 8px;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.composer-toolbar {
+  padding: 4px 10px 10px;
+}
+
+.composer-tools .icon-button,
+.composer-actions .send-button,
+.composer-actions .interrupt-button {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.composer-actions .send-button {
+  border-radius: 50%;
+}
+
+.composer-settings > summary {
+  min-height: 40px;
+  font-size: 12px;
+  padding: 7px 9px;
+}
+
+.composer-settings > summary > .composer-effort {
+  flex-shrink: 0;
+  color: #b4c5ca;
+  padding-left: 7px;
+  border-left: 1px solid #40545a;
+}
+
+.composer-model-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: #a6b9c2;
+}
+
+.composer-context-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 14px;
+  padding: 8px 3px 0;
+  color: #95a9b2;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.composer-context-line > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.composer-context-line .composer-pending-settings {
+  color: #d9bf88;
+}
+
+.composer-context-line .composer-keyboard-hint {
+  margin-left: auto;
+  color: #7c949f;
+}
+
+.composer-footnote {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.composer-mention-panel {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 22;
+  border: 1px solid #425a62;
+  background: #1b2a31;
+  box-shadow: 0 12px 36px #0006;
+  border-radius: 14px;
+  padding: 8px;
+}
+
+.composer-mention-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px 9px;
+  color: #93aab4;
+  font-size: 11px;
+}
+
+.composer-mention-panel [role="listbox"] {
+  max-height: min(320px, 40vh);
+  overflow: auto;
+}
+
+.composer-mention-panel [role="option"] {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 8px;
+  text-align: left;
+  color: #c6d3d8;
+  background: transparent;
+}
+
+.composer-mention-panel [role="option"][aria-selected="true"] {
+  background: #2b4247;
+}
+
+.composer-mention-panel [role="option"] > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.composer-mention-panel strong,
+.composer-mention-panel small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-mention-panel strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.composer-mention-panel small {
+  color: #94a9b2;
+  font-size: 11px;
+}
+
+@media (max-width: 700px) {
+  .composer-area {
+    padding: 8px 12px max(12px, env(safe-area-inset-bottom));
+  }
+
+  .composer textarea {
+    font-size: 16px;
+    padding: 14px 14px 6px;
+  }
+
+  .composer-toolbar {
+    flex-wrap: wrap;
+    gap: 2px 4px;
+    padding: 2px 7px 7px;
+  }
+
+  .composer-tools {
+    flex: 1;
+  }
+
+  .composer-tools .icon-button,
+  .composer-actions .send-button,
+  .composer-actions .interrupt-button {
+    width: 44px;
+    height: 44px;
+  }
+
+  .composer-settings,
+  .composer-model-label {
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  .composer-settings > summary {
+    min-height: 44px;
+  }
+
+  .composer-context-line {
+    font-size: 12px;
+  }
+
+  .composer-keyboard-hint,
+  .composer-mention-heading > span + span {
+    display: none;
+  }
+
+  .composer-mode {
+    font-size: 11px;
+    margin-left: 4px;
+  }
+}

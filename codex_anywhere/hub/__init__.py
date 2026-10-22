@@ -51,6 +51,7 @@ from .models import (
     thread_activity_at,
 )
 from .ownership import WriterSessions
+from .preferences import thread_preferences
 from .presentation import browser_event, browser_item
 from .projects import ensure_project
 from .references import quote_references, resolve_references
@@ -625,7 +626,14 @@ def create_app(test_config=None):
         )
         search = request.args.get("q", "").strip()[:200]
         if search:
-            query = query.filter(Thread.title.ilike(f"%{search}%"))
+            query = query.filter(
+                Thread.title.ilike(f"%{search}%") | Thread.display_title.ilike(f"%{search}%")
+            )
+        archived = request.args.get("archived", "false")
+        if archived not in {"false", "true", "all"}:
+            raise ValueError("archived 必须是 false、true 或 all")
+        if archived != "all":
+            query = query.filter(Thread.archived.is_(archived == "true"))
         for field in ("host_id", "project_id"):
             if field in request.args:
                 query = query.filter(
@@ -634,7 +642,7 @@ def create_app(test_config=None):
         limit = _integer(request.args.get("limit", 200), "limit", 1, 200)
         offset = _integer(request.args.get("offset", 0), "offset", 0, 2**31 - 1)
         rows = (
-            query.order_by(activity.desc(), Thread.id.desc())
+            query.order_by(Thread.pinned.desc(), activity.desc(), Thread.id.desc())
             .offset(offset)
             .limit(limit + 1)
             .all()
@@ -653,7 +661,7 @@ def create_app(test_config=None):
             func.max(thread_activity_at(inputs.c.created_at)), Project.created_at
         )
         query = db.session.query(Project, func.count(Thread.id), last_activity_at).outerjoin(
-            Thread, Thread.project_id == Project.id
+            Thread, (Thread.project_id == Project.id) & Thread.archived.is_(False)
         ).outerjoin(inputs, inputs.c.thread_id == Thread.id)
         if "host_id" in request.args:
             query = query.filter(Project.host_id == _identifier(request.args["host_id"], "host_id"))
@@ -681,6 +689,28 @@ def create_app(test_config=None):
             emit("anywhere/project_settings", {"project_id": project.id}, host_id=host.id)
             db.session.commit()
             return jsonify(project=project.as_dict())
+
+    @app.patch("/api/threads/<thread_id>/preferences")
+    @_command_locked
+    def update_thread_preferences(thread_id):
+        changes = thread_preferences(_json())
+        thread = _get_thread(thread_id)
+        if any(getattr(thread, key) != value for key, value in changes.items()):
+            for key, value in changes.items():
+                setattr(thread, key, value)
+            emit(
+                "anywhere/thread_preferences",
+                {
+                    "threadId": thread.id,
+                    "display_title": thread.display_title,
+                    "pinned": thread.pinned,
+                    "archived": thread.archived,
+                },
+                thread.id,
+                thread.host_id,
+            )
+            db.session.commit()
+        return jsonify(thread=thread.as_dict())
 
     @app.patch("/api/threads/<thread_id>/settings")
     def update_thread_settings(thread_id):
@@ -883,6 +913,27 @@ def create_app(test_config=None):
     @_command_locked
     def create_thread():
         data = _json()
+        key = None
+        signature = None
+        if "client_request_id" in data:
+            client_id = _identifier(data["client_request_id"], "client_request_id")
+            if len(client_id) > 200:
+                raise ValueError("client_request_id 最多 200 个字符")
+            key = f"thread.start:{client_id}"
+            signature = token_hash(
+                json.dumps(
+                    {name: value for name, value in data.items() if name != "client_request_id"},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            )
+            existing = Command.query.filter_by(idempotency_key=key).first()
+            if existing:
+                if existing.payload.get("_signature") != signature:
+                    return jsonify(error="同一个请求 ID 对应了不同内容"), 409
+                return jsonify(
+                    thread=_get_thread(existing.thread_id).as_dict(), command=existing.as_dict()
+                ), 202
         project = None
         if data.get("project_id") is not None:
             project = db.session.get(Project, _identifier(data["project_id"], "project_id"))
@@ -914,6 +965,8 @@ def create_app(test_config=None):
         db.session.add(thread)
         db.session.flush()
         payload = dict(cwd=cwd, title=title)
+        if signature is not None:
+            payload["_signature"] = signature
         if data.get("model"):
             payload["model"] = str(data["model"])[:200]
             if "model" not in settings:
@@ -923,7 +976,7 @@ def create_app(test_config=None):
             payload.update(
                 execution_settings=settings, settings_revision=thread.settings_revision or 0
             )
-        command = _issue_command(host, thread, "thread.start", payload)
+        command = _issue_command(host, thread, "thread.start", payload, key)
         return jsonify(thread=thread.as_dict(), command=command), 202
 
     @app.get("/api/threads/<thread_id>")

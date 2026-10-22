@@ -1,27 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Bot,
+  CircleHelp,
   ExternalLink,
   Folder,
   Menu,
   Monitor,
-  MoreHorizontal,
   Plus,
   RefreshCw,
   Search,
-  ShieldCheck,
   WifiOff,
   X,
 } from "lucide-react";
 import { api, errorText, post, setSession } from "./api";
 import { ErrorMessage, Modal, Spinner } from "./components";
 import Composer from "./Composer";
-import {
-  Login,
-  NewTaskDialog,
-  PairingDialog,
-  useInitialSession,
-} from "./Dialogs";
+import NewConversation from "./NewConversation";
+import { Login, PairingDialog, useInitialSession } from "./Dialogs";
 import Interactions from "./Interactions";
 import { ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
@@ -43,7 +37,6 @@ import { waitForCommand, waitForHistoryPage } from "./commands";
 import { ProjectSettingsDialog } from "./ExecutionControls";
 import {
   applySettingsUpdate,
-  permissionLabel,
   preserveNewerSettings,
 } from "./execution-settings";
 import type {
@@ -73,6 +66,8 @@ function readRoute() {
     id: match ? decodeURIComponent(match[1]) : "",
     item: new URLSearchParams(window.location.search).get("item") || undefined,
     settings: /^\/settings\/?$/.test(window.location.pathname),
+    projectId:
+      new URLSearchParams(window.location.search).get("project_id") || "",
   };
 }
 export default function App() {
@@ -118,6 +113,9 @@ function Workspace({
   const removedHosts = useRef(new Set<string>());
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
+  const [sidebarView, setSidebarView] = useState<
+    "all" | "active" | "waiting" | "archived"
+  >("all");
   const [listPages, setListPages] = useState(1);
   const [hostPageCounts, setHostPageCounts] = useState<Record<string, number>>(
     {},
@@ -138,7 +136,7 @@ function Workspace({
   const [loadingThread, setLoadingThread] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dialog, setDialog] = useState<
-    "pair" | "new" | "about" | "project" | "import" | null
+    "pair" | "about" | "project" | "import" | null
   >(null);
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(
     null,
@@ -156,7 +154,12 @@ function Workspace({
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
-  const listScopeRef = useRef({ projectFilter, listPages, hostPageCounts });
+  const listScopeRef = useRef({
+    projectFilter,
+    listPages,
+    hostPageCounts,
+    sidebarView,
+  });
   const listOffsetsRef = useRef<{
     key: string;
     offsets: Record<string, number[]>;
@@ -184,7 +187,12 @@ function Workspace({
   const lastCursor = useRef(Number(sessionStorage.getItem(cursorKey) || 0));
   selectedRef.current = route.id;
   searchRef.current = search;
-  listScopeRef.current = { projectFilter, listPages, hostPageCounts };
+  listScopeRef.current = {
+    projectFilter,
+    listPages,
+    hostPageCounts,
+    sidebarView,
+  };
   const selectedHost = hosts.find((host) => host.id === detail?.thread.host_id);
   const ownershipEnabled = Boolean(
     detail?.thread.id === route.id &&
@@ -193,6 +201,22 @@ function Workspace({
     selectedHost.capabilities?.includes("threadOwnership"),
   );
   const ownership = useThreadOwnership(route.id, ownershipEnabled);
+  useEffect(() => {
+    if (detail?.thread.id !== route.id || !detail?.thread.project_id) return;
+    try {
+      sessionStorage.setItem(
+        `anywhere:last-project:${session.username || "admin"}`,
+        detail.thread.project_id,
+      );
+    } catch {
+      /* Optional browser preference. */
+    }
+  }, [
+    detail?.thread.id,
+    detail?.thread.project_id,
+    route.id,
+    session.username,
+  ]);
 
   const navigate = useCallback((id: string, item?: string) => {
     const url = id
@@ -200,15 +224,46 @@ function Workspace({
       : "/";
     if (window.location.pathname + window.location.search !== url)
       window.history.pushState({}, "", url);
-    setRoute({ id, item, settings: false });
+    setRoute({ id, item, settings: false, projectId: "" });
     setSidebarOpen(false);
   }, []);
   const navigateSettings = useCallback(() => {
     if (window.location.pathname !== "/settings")
       window.history.pushState({}, "", "/settings");
-    setRoute({ id: "", item: undefined, settings: true });
+    setRoute({ id: "", item: undefined, settings: true, projectId: "" });
     setSidebarOpen(false);
   }, []);
+  const openNewConversation = useCallback(
+    (project?: Project) => {
+      const current =
+        detailRef.current?.thread.id === selectedRef.current
+          ? detailRef.current.thread
+          : threadsRef.current.find(
+              (thread) => thread.id === selectedRef.current,
+            );
+      let remembered = "";
+      try {
+        remembered =
+          sessionStorage.getItem(
+            `anywhere:last-project:${session.username || "admin"}`,
+          ) || "";
+      } catch {
+        /* Optional browser preference. */
+      }
+      const projectId =
+        project?.id ||
+        current?.project_id ||
+        remembered ||
+        listScopeRef.current.projectFilter ||
+        "";
+      const url = `/new${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`;
+      window.history.pushState({}, "", url);
+      setRoute({ id: "", item: undefined, settings: false, projectId });
+      setSidebarOpen(false);
+      setDialog(null);
+    },
+    [session.username],
+  );
   useEffect(() => {
     const listener = () => {
       setRoute(readRoute());
@@ -229,17 +284,16 @@ function Workspace({
         return;
       if (
         event.key.toLowerCase() === "n" &&
-        !event.metaKey &&
-        !event.ctrlKey &&
+        (event.metaKey || event.ctrlKey) &&
         !event.altKey
       ) {
         event.preventDefault();
-        setDialog("new");
+        openNewConversation();
       }
     };
     document.addEventListener("keydown", shortcut);
     return () => document.removeEventListener("keydown", shortcut);
-  }, []);
+  }, [openNewConversation]);
   useEffect(() => {
     liveRef.current = true;
     const onOnline = () => setOnline(navigator.onLine);
@@ -260,7 +314,11 @@ function Workspace({
     try {
       const query = searchRef.current;
       const scope = listScopeRef.current;
-      const scopeKey = JSON.stringify([query, scope.projectFilter]);
+      const scopeKey = JSON.stringify([
+        query,
+        scope.projectFilter,
+        scope.sidebarView === "archived",
+      ]);
       const [hostData, projectData] = await Promise.all([
         api<{ hosts: Host[] }>("/hosts"),
         api<{ projects: Project[] }>("/projects"),
@@ -294,7 +352,7 @@ function Workspace({
           const results = await Promise.all(
             offsets.map((offset) =>
               api<ThreadPage>(
-                `/threads?q=${encodeURIComponent(query)}&limit=50&offset=${offset}${scope.projectFilter ? `&project_id=${encodeURIComponent(scope.projectFilter)}` : `&host_id=${encodeURIComponent(target.hostId)}`}`,
+                `/threads?q=${encodeURIComponent(query)}&limit=50&offset=${offset}${scope.projectFilter ? `&project_id=${encodeURIComponent(scope.projectFilter)}` : `&host_id=${encodeURIComponent(target.hostId)}`}${scope.sidebarView === "archived" ? "&archived=true" : ""}`,
               ),
             ),
           );
@@ -306,6 +364,8 @@ function Workspace({
         request === listFetchRef.current &&
         query === searchRef.current &&
         scope.projectFilter === listScopeRef.current.projectFilter &&
+        (scope.sidebarView === "archived") ===
+          (listScopeRef.current.sidebarView === "archived") &&
         scope.listPages === listScopeRef.current.listPages &&
         scope.hostPageCounts === listScopeRef.current.hostPageCounts
       ) {
@@ -341,9 +401,10 @@ function Workspace({
         for (const [id, local] of localThreadActivity.current) {
           if (
             removedHosts.current.has(local.host_id) ||
+            Boolean(local.archived) !== (scope.sidebarView === "archived") ||
             (scope.projectFilter && local.project_id !== scope.projectFilter) ||
             (query &&
-              !local.title
+              !(local.display_title || local.title)
                 .toLocaleLowerCase()
                 .includes(query.toLocaleLowerCase()))
           )
@@ -664,7 +725,14 @@ function Workspace({
   useEffect(() => {
     const timer = setTimeout(() => void refreshList(), search ? 220 : 0);
     return () => clearTimeout(timer);
-  }, [search, projectFilter, listPages, hostPageCounts, refreshList]);
+  }, [
+    search,
+    projectFilter,
+    sidebarView,
+    listPages,
+    hostPageCounts,
+    refreshList,
+  ]);
   useEffect(() => {
     setListPages(1);
     setHasMore(false);
@@ -672,7 +740,7 @@ function Workspace({
       Object.keys(current).length ? {} : current,
     );
     setHostPages({});
-  }, [search, projectFilter]);
+  }, [search, projectFilter, sidebarView]);
   useEffect(() => {
     setDetail(null);
     setStreams({});
@@ -695,6 +763,39 @@ function Workspace({
     if (method === "anywhere/host_deleted") {
       const hostId = string(event.params.host_id);
       if (hostId) handleHostDeleted(hostId);
+      return;
+    }
+    if (method === "anywhere/thread_preferences") {
+      const id = string(event.params.threadId);
+      if (!id) return;
+      const changes: Partial<Thread> = {};
+      if (typeof event.params.pinned === "boolean")
+        changes.pinned = event.params.pinned;
+      if (typeof event.params.archived === "boolean")
+        changes.archived = event.params.archived;
+      if (
+        event.params.display_title === null ||
+        typeof event.params.display_title === "string"
+      )
+        changes.display_title = event.params.display_title;
+      ++listFetchRef.current;
+      localThreadActivity.current.delete(id);
+      setThreads((current) =>
+        current.flatMap((thread) => {
+          if (thread.id !== id) return [thread];
+          const updated = { ...thread, ...changes };
+          return Boolean(updated.archived) ===
+            (listScopeRef.current.sidebarView === "archived")
+            ? [updated]
+            : [];
+        }),
+      );
+      setDetail((current) =>
+        current?.thread.id === id
+          ? { ...current, thread: { ...current.thread, ...changes } }
+          : current,
+      );
+      scheduleRefresh(true);
       return;
     }
     const current = event.thread_id === selectedRef.current;
@@ -956,6 +1057,41 @@ function Workspace({
       throw reason;
     }
   };
+  const saveThreadPreferences = async (
+    thread: Thread,
+    changes: {
+      display_title?: string | null;
+      pinned?: boolean;
+      archived?: boolean;
+    },
+  ) => {
+    const result = await api<{ thread: Thread }>(
+      `/threads/${encodeURIComponent(thread.id)}/preferences`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(changes),
+      },
+    );
+    ++listFetchRef.current;
+    if (thread.id === selectedRef.current) ++threadFetchRef.current;
+    localThreadActivity.current.delete(thread.id);
+    setThreads((current) =>
+      current.flatMap((entry) =>
+        entry.id !== thread.id
+          ? [entry]
+          : Boolean(result.thread.archived) !==
+              (listScopeRef.current.sidebarView === "archived")
+            ? []
+            : [{ ...entry, ...result.thread }],
+      ),
+    );
+    setDetail((current) =>
+      current?.thread.id === thread.id
+        ? { ...current, thread: { ...current.thread, ...result.thread } }
+        : current,
+    );
+    void refreshList();
+  };
   const interrupt = async () => {
     const result = await post<{ command: Command }>(
       `/threads/${route.id}/interrupt`,
@@ -1031,28 +1167,19 @@ function Workspace({
         <div className="sidebar-toolbar">
           <button
             className="new-conversation-button"
-            onClick={() => setDialog("new")}
+            onClick={() => openNewConversation()}
             aria-label="新对话"
           >
             <Plus size={17} />
             新对话
           </button>
           <button
-            className="icon-button"
-            onClick={() => setDialog("project")}
-            aria-label="新建项目"
-            title="新建项目"
+            className="icon-button sidebar-close"
+            onClick={() => setSidebarOpen(false)}
+            aria-label="关闭导航"
           >
-            <Folder size={16} />
+            <X size={19} />
           </button>
-          <SidebarMenu
-            hosts={hosts}
-            onPair={() => setDialog("pair")}
-            onHistory={() => setDialog("import")}
-            onSettings={navigateSettings}
-            onAbout={() => setDialog("about")}
-            onLogout={() => void logout()}
-          />
         </div>
         <div className="search-box">
           <Search size={15} />
@@ -1076,6 +1203,10 @@ function Workspace({
           hosts={hosts}
           projects={projects}
           threads={threads}
+          view={sidebarView}
+          onViewChange={setSidebarView}
+          onNewConversation={openNewConversation}
+          onThreadUpdate={saveThreadPreferences}
           selectedProjectId={projectFilter}
           currentThreadId={route.id}
           loading={loading}
@@ -1108,6 +1239,14 @@ function Workspace({
             setListPages((value) => value + 1);
           }}
         />
+        <SidebarMenu
+          hosts={hosts}
+          onPair={() => setDialog("pair")}
+          onHistory={() => setDialog("import")}
+          onSettings={navigateSettings}
+          onAbout={() => setDialog("about")}
+          onLogout={() => void logout()}
+        />
       </aside>
       <main className="main-panel">
         <header className="topbar">
@@ -1119,15 +1258,50 @@ function Workspace({
             >
               <Menu size={20} />
             </button>
-            <span className="breadcrumb">
-              {route.settings ? "工作台" : "会话"}
-            </span>
-            <span className="breadcrumb-divider">/</span>
-            <h1 className="topbar-title">
-              {route.settings
-                ? "设置"
-                : detail?.thread.title || (route.id ? "加载会话" : "全部会话")}
-            </h1>
+            <div className="conversation-title-block">
+              <h1 className="topbar-title">
+                {route.settings
+                  ? "设置"
+                  : route.id
+                    ? detail?.thread.display_title ||
+                      detail?.thread.title ||
+                      "加载会话"
+                    : "新对话"}
+              </h1>
+              {!route.settings &&
+                route.id &&
+                detail?.thread.id === route.id && (
+                  <div className="conversation-context">
+                    <span
+                      className={`status-pill status-${detail.thread.status}`}
+                    >
+                      <span />
+                      {statusLabels[detail.thread.status] ||
+                        detail.thread.status}
+                    </span>
+                    {detail.thread.archived && (
+                      <span className="archived-context">已归档</span>
+                    )}
+                    <span title={detail.thread.cwd}>
+                      <Folder size={13} />
+                      {projects.find(
+                        (project) => project.id === detail.thread.project_id,
+                      )?.name || detail.thread.cwd}
+                    </span>
+                    <span
+                      className={
+                        selectedHost?.online
+                          ? "context-host"
+                          : "context-host host-offline"
+                      }
+                    >
+                      <Monitor size={13} />
+                      {selectedHost?.name || "工作设备"}
+                      {selectedHost?.online ? "" : " · 离线"}
+                    </span>
+                  </div>
+                )}
+            </div>
           </div>
           <div className="topbar-right">
             {!route.settings &&
@@ -1150,20 +1324,21 @@ function Workspace({
               )}
             <span
               className={`connection-status ${connection === "connected" && online ? "live" : ""}`}
+              title="浏览器与管理中心的连接状态；运行设备状态显示在项目旁"
             >
               <span />
               {!online
                 ? "网络离线"
                 : connection === "connected"
-                  ? "实时连接"
+                  ? "已连接"
                   : "正在重连"}
             </span>
             <button
               className="icon-button"
-              aria-label="更多信息"
+              aria-label="使用说明"
               onClick={() => setDialog("about")}
             >
-              <MoreHorizontal size={19} />
+              <CircleHelp size={19} />
             </button>
           </div>
         </header>
@@ -1204,43 +1379,6 @@ function Workspace({
           />
         ) : route.id ? (
           <>
-            {detail && (
-              <div className="task-header">
-                <div className="task-heading">
-                  <span
-                    className={`status-pill status-${detail.thread.status}`}
-                  >
-                    <span />
-                    {statusLabels[detail.thread.status] || detail.thread.status}
-                  </span>
-                </div>
-                <div className="task-metadata">
-                  <span>
-                    <Monitor size={13} />
-                    {selectedHost?.name || "工作设备"}
-                    <i
-                      className={`mini-status ${selectedHost?.online ? "online" : ""}`}
-                    />
-                  </span>
-                  <span title={detail.thread.cwd}>
-                    <Folder size={13} />
-                    {detail.thread.cwd}
-                  </span>
-                  <span className="permission-label">
-                    <ShieldCheck size={13} />
-                    {detail.thread.effective_settings?.sandbox_mode ||
-                    detail.thread.execution_settings?.sandbox_mode ||
-                    detail.thread.effective_settings?.approval_policy ||
-                    detail.thread.execution_settings?.approval_policy
-                      ? permissionLabel(
-                          detail.thread.effective_settings ||
-                            detail.thread.execution_settings,
-                        )
-                      : "保留原会话设置"}
-                  </span>
-                </div>
-              </div>
-            )}
             {detail?.thread.last_error && (
               <div className="thread-error">
                 <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
@@ -1308,6 +1446,7 @@ function Workspace({
                 />
                 <Composer
                   key={detail.thread.id}
+                  draftScope={session.username || "admin"}
                   thread={
                     historyBusy
                       ? { ...detail.thread, history_loaded: false }
@@ -1328,24 +1467,27 @@ function Workspace({
             )}
           </>
         ) : (
-          <div className="conversation-empty-state">
-            <Bot size={30} />
-            <h1>选择一个会话继续</h1>
-            <p>
-              连接设备后，最近的 Codex 会话与项目会自动出现在左侧。
-              <br />
-              打开会话时再加载历史，随时继续工作。
-            </p>
-            <div>
-              <button
-                className="button button-primary"
-                onClick={() => setDialog(hosts.length ? "new" : "pair")}
-              >
-                <Plus size={15} />
-                {hosts.length ? "新对话" : "连接设备"}
-              </button>
-            </div>
-          </div>
+          <NewConversation
+            key={`new:${route.projectId}`}
+            hosts={hosts}
+            projects={projects}
+            loading={loading}
+            draftScope={session.username || "admin"}
+            initialProjectId={route.projectId}
+            onNewProject={() => setDialog("project")}
+            onPair={() => setDialog("pair")}
+            onNavigate={navigate}
+            onCreated={(thread, command) => {
+              if (removedHosts.current.has(thread.host_id)) return;
+              setSidebarView("all");
+              setProjectFilter((current) =>
+                current && current !== thread.project_id ? null : current,
+              );
+              markConversationActivity(thread);
+              navigate(thread.id);
+              watchCommand(command, thread.id);
+            }}
+          />
         )}
       </main>
       {dialog === "pair" && (
@@ -1371,22 +1513,6 @@ function Workspace({
           }
         />
       )}
-      {dialog === "new" && (
-        <NewTaskDialog
-          hosts={hosts}
-          projects={projects}
-          initialProjectId={projectFilter}
-          onNewProject={() => setDialog("project")}
-          onClose={() => setDialog(null)}
-          onCreated={(thread, command) => {
-            if (removedHosts.current.has(thread.host_id)) return;
-            markConversationActivity(thread);
-            setProjectFilter(thread.project_id || null);
-            navigate(thread.id);
-            watchCommand(command, thread.id);
-          }}
-        />
-      )}
       {dialog === "project" && (
         <ProjectDialog
           hosts={hosts}
@@ -1398,7 +1524,7 @@ function Workspace({
               ...current.filter((value) => value.id !== project.id),
             ]);
             setProjectFilter(project.id);
-            setDialog("new");
+            openNewConversation(project);
             void refreshList();
           }}
         />

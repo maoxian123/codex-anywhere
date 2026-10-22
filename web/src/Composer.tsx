@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import {
   ArrowUp,
   AtSign,
@@ -18,7 +18,7 @@ import { api, errorText } from "./api";
 import { ErrorMessage, Modal, References, Spinner } from "./components";
 import { messageText } from "./Timeline";
 import { ThreadExecutionControls } from "./ExecutionControls";
-import { settingsLabel } from "./execution-settings";
+import { permissionLabel, settingsLabel } from "./execution-settings";
 import type {
   Asset,
   Host,
@@ -31,6 +31,16 @@ import type {
 } from "./types";
 import { fileName, safeLink } from "./utils";
 import { RemoteCommandError } from "./commands";
+import {
+  clearComposerDraft,
+  emptyComposerDraft,
+  readComposerDraft,
+  subscribeComposerDraft,
+  taskMentionAtCaret,
+  writeComposerDraft,
+  type ComposerDraft,
+  type TaskMention,
+} from "./composer-drafts";
 
 function TaskPicker({
   currentId,
@@ -76,7 +86,7 @@ function TaskPicker({
     onSelect({
       kind: "task",
       thread_id: thread.id,
-      title: thread.title,
+      title: thread.display_title || thread.title,
       ...(itemId ? { item_id: itemId } : {}),
     });
     onClose();
@@ -114,7 +124,9 @@ function TaskPicker({
           </button>
           <div className="picker-thread-heading">
             <FileCode2 size={17} />
-            <strong>{detail.thread.title}</strong>
+            <strong>
+              {detail.thread.display_title || detail.thread.title}
+            </strong>
             <button
               className="button button-small"
               onClick={() => select(detail.thread)}
@@ -179,7 +191,9 @@ function TaskPicker({
                   >
                     <FileCode2 size={17} />
                     <span>
-                      <strong>{thread.title || "未命名任务"}</strong>
+                      <strong>
+                        {thread.display_title || thread.title || "未命名任务"}
+                      </strong>
                       <small>{fileName(thread.cwd)}</small>
                     </span>
                   </button>
@@ -293,17 +307,7 @@ function WebPicker({
   );
 }
 
-export default function Composer({
-  thread,
-  hostOnline,
-  onSend,
-  onInterrupt,
-  onNavigate,
-  host,
-  project,
-  onSettingsChange,
-  onProjectSettings,
-}: {
+type ComposerProps = {
   thread: Thread;
   hostOnline: boolean;
   onSend: (payload: MessagePayload, steer: boolean) => Promise<void>;
@@ -313,10 +317,66 @@ export default function Composer({
   project?: Project;
   onSettingsChange?: (settings: ExecutionSettings) => Promise<void>;
   onProjectSettings?: (project: Project) => void;
-}) {
-  const [text, setText] = useState("");
-  const [assets, setAssets] = useState<Asset[]>([]);
-  const [references, setReferences] = useState<Reference[]>([]);
+  draftScope?: string;
+  hideSettings?: boolean;
+  autoFocus?: boolean;
+};
+
+export default function Composer(props: ComposerProps) {
+  return (
+    <ComposerInput
+      key={JSON.stringify([props.draftScope || "", props.thread.id])}
+      {...props}
+    />
+  );
+}
+
+function ComposerInput({
+  thread,
+  hostOnline,
+  onSend,
+  onInterrupt,
+  onNavigate,
+  host,
+  project,
+  onSettingsChange,
+  onProjectSettings,
+  draftScope = "",
+  hideSettings = false,
+  autoFocus = false,
+}: ComposerProps) {
+  const [draft, setDraft] = useState(() =>
+    readComposerDraft(thread.id, draftScope),
+  );
+  const draftRef = useRef(draft);
+  const mountedRef = useRef(true);
+  const sendingRef = useRef(false);
+  const { text, assets, references, retryRequestId } = draft;
+  const updateDraft = (change: (current: ComposerDraft) => ComposerDraft) => {
+    const next = change(
+      mountedRef.current
+        ? draftRef.current
+        : readComposerDraft(thread.id, draftScope),
+    );
+    draftRef.current = next;
+    writeComposerDraft(thread.id, next, draftScope);
+    if (mountedRef.current) setDraft(next);
+  };
+  useEffect(() => {
+    mountedRef.current = true;
+    const unsubscribe = subscribeComposerDraft(
+      thread.id,
+      (next) => {
+        draftRef.current = next;
+        setDraft(next);
+      },
+      draftScope,
+    );
+    return () => {
+      mountedRef.current = false;
+      unsubscribe();
+    };
+  }, [thread.id, draftScope]);
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -324,15 +384,62 @@ export default function Composer({
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [picker, setPicker] = useState<"task" | "web" | null>(null);
-  const [retryRequestId, setRetryRequestId] = useState<string | null>(null);
+  const [mention, setMention] = useState<TaskMention | null>(null);
+  const [mentionResults, setMentionResults] = useState<Thread[]>([]);
+  const [mentionLoading, setMentionLoading] = useState(false);
+  const [mentionError, setMentionError] = useState("");
+  const [activeMention, setActiveMention] = useState(0);
+  const dismissedMention = useRef("");
+  const composingRef = useRef(false);
+  const suggestionsId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (autoFocus && window.innerWidth > 680) textRef.current?.focus();
+  }, [autoFocus]);
   const busy = ["active", "waiting"].includes(thread.status);
   const historyReady =
     thread.history_loaded !== false &&
     thread.status !== "importing" &&
     !(thread.status === "idle" && thread.history_stale);
   const ready = hostOnline && thread.status !== "starting" && historyReady;
+  const pendingSettings =
+    (thread.settings_revision ?? 0) > (thread.effective_settings_revision ?? 0);
+  const nextSettings = {
+    ...thread.effective_settings,
+    ...thread.execution_settings,
+  };
+  useEffect(() => {
+    if (!mention) return;
+    let cancelled = false;
+    setMentionResults([]);
+    setMentionLoading(true);
+    setMentionError("");
+    setActiveMention(0);
+    const timer = setTimeout(() => {
+      void api<{ threads: Thread[] }>(
+        `/threads?q=${encodeURIComponent(mention.query)}`,
+      )
+        .then((value) => {
+          if (!cancelled)
+            setMentionResults(
+              value.threads
+                .filter((value) => value.id !== thread.id)
+                .slice(0, 6),
+            );
+        })
+        .catch((reason) => {
+          if (!cancelled) setMentionError(errorText(reason));
+        })
+        .finally(() => {
+          if (!cancelled) setMentionLoading(false);
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [mention?.query, thread.id]);
   useEffect(() => {
     const input = textRef.current;
     if (input) {
@@ -340,7 +447,12 @@ export default function Composer({
       input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
     }
   }, [text]);
-  const edited = () => setRetryRequestId(null);
+  const updateMention = (value: string, caret: number) => {
+    const next = composingRef.current ? null : taskMentionAtCaret(value, caret);
+    setMention(
+      next && JSON.stringify(next) !== dismissedMention.current ? next : null,
+    );
+  };
   const uploadFiles = async (files: FileList | File[]) => {
     if (uploading || sending) return;
     setUploading(true);
@@ -357,8 +469,11 @@ export default function Composer({
           method: "POST",
           body: form,
         });
-        setAssets((current) => [...current, result.asset]);
-        edited();
+        updateDraft((current) => ({
+          ...current,
+          assets: [...current.assets, result.asset],
+          retryRequestId: null,
+        }));
       }
     } catch (reason) {
       setError(errorText(reason));
@@ -370,16 +485,19 @@ export default function Composer({
   const send = async () => {
     if (
       (!text.trim() && !assets.length && !references.length) ||
-      sending ||
+      sendingRef.current ||
       uploading ||
       settingsSaving ||
       !ready
     )
       return;
+    sendingRef.current = true;
     setSending(true);
+    setMention(null);
     setError("");
     const requestId = retryRequestId || crypto.randomUUID();
-    setRetryRequestId(requestId);
+    updateDraft((current) => ({ ...current, retryRequestId: requestId }));
+    const sentDraft = JSON.stringify(draftRef.current);
     try {
       await onSend(
         {
@@ -403,25 +521,41 @@ export default function Composer({
         },
         busy,
       );
-      setText("");
-      setAssets([]);
-      setReferences([]);
-      setRetryRequestId(null);
+      // A send can finish after navigating away. Never erase a newer draft,
+      // and never persist an unmounted component's old state during cleanup.
+      if (
+        JSON.stringify(readComposerDraft(thread.id, draftScope)) === sentDraft
+      ) {
+        clearComposerDraft(thread.id, draftScope);
+        if (mountedRef.current) {
+          draftRef.current = emptyComposerDraft();
+          setDraft(draftRef.current);
+        }
+      }
     } catch (reason) {
       if (
         reason instanceof RemoteCommandError &&
         ["failed", "error"].includes(reason.command.status)
-      )
-        setRetryRequestId(null);
+      ) {
+        if (
+          JSON.stringify(readComposerDraft(thread.id, draftScope)) === sentDraft
+        )
+          updateDraft((current) => ({ ...current, retryRequestId: null }));
+      }
       setError(errorText(reason));
     } finally {
-      setSending(false);
-      textRef.current?.focus();
+      sendingRef.current = false;
+      if (mountedRef.current) {
+        setSending(false);
+        textRef.current?.focus();
+      }
     }
   };
   const addReference = (reference: Reference) => {
-    setReferences((current) =>
-      current.some(
+    updateDraft((current) => ({
+      ...current,
+      retryRequestId: null,
+      references: current.references.some(
         (existing) =>
           existing.kind === reference.kind &&
           (reference.kind === "task"
@@ -429,10 +563,29 @@ export default function Composer({
               existing.item_id === reference.item_id
             : existing.url === reference.url),
       )
-        ? current
-        : [...current, reference],
-    );
-    edited();
+        ? current.references
+        : [...current.references, reference],
+    }));
+  };
+  const selectMention = (selected: Thread) => {
+    if (!mention) return;
+    addReference({
+      kind: "task",
+      thread_id: selected.id,
+      title: selected.display_title || selected.title,
+    });
+    updateDraft((current) => ({
+      ...current,
+      text:
+        current.text.slice(0, mention.start) + current.text.slice(mention.end),
+      retryRequestId: null,
+    }));
+    const caret = mention.start;
+    setMention(null);
+    setTimeout(() => {
+      textRef.current?.focus();
+      textRef.current?.setSelectionRange(caret, caret);
+    }, 0);
   };
   return (
     <div className="composer-area">
@@ -478,10 +631,14 @@ export default function Composer({
               references={references}
               onNavigate={onNavigate}
               removable={(index) => {
-                setReferences((current) =>
-                  current.filter((_, itemIndex) => itemIndex !== index),
-                );
-                edited();
+                if (sendingRef.current) return;
+                updateDraft((current) => ({
+                  ...current,
+                  references: current.references.filter(
+                    (_, itemIndex) => itemIndex !== index,
+                  ),
+                  retryRequestId: null,
+                }));
               }}
             />
             {assets.length > 0 && (
@@ -491,11 +648,15 @@ export default function Composer({
                     <img src={asset.url} alt={asset.name} />
                     <button
                       aria-label={`移除图片 ${asset.name}`}
+                      disabled={sending}
                       onClick={() => {
-                        setAssets((current) =>
-                          current.filter((value) => value.id !== asset.id),
-                        );
-                        edited();
+                        updateDraft((current) => ({
+                          ...current,
+                          assets: current.assets.filter(
+                            (value) => value.id !== asset.id,
+                          ),
+                          retryRequestId: null,
+                        }));
                       }}
                     >
                       <X size={12} />
@@ -507,12 +668,79 @@ export default function Composer({
             )}
           </div>
         )}
+        {mention && (
+          <div className="composer-mention-panel">
+            <div className="composer-mention-heading">
+              <span>引用任务</span>
+              <span>↑ ↓ 选择 · Enter 引用 · Esc 关闭</span>
+            </div>
+            <div id={suggestionsId} role="listbox" aria-label="引用任务候选">
+              {mentionLoading ? (
+                <p className="empty-small">搜索中…</p>
+              ) : mentionError ? (
+                <p className="empty-small">
+                  暂时无法搜索，请使用引用按钮重试。
+                </p>
+              ) : mentionResults.length ? (
+                mentionResults.map((value, index) => (
+                  <button
+                    type="button"
+                    role="option"
+                    tabIndex={-1}
+                    id={`${suggestionsId}-${index}`}
+                    aria-selected={index === activeMention}
+                    key={value.id}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setActiveMention(index)}
+                    onClick={() => selectMention(value)}
+                  >
+                    <FileCode2 size={16} />
+                    <span>
+                      <strong>
+                        {value.display_title || value.title || "未命名任务"}
+                      </strong>
+                      <small>{fileName(value.cwd)}</small>
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <p className="empty-small">
+                  没有匹配任务，继续输入也可保留普通 @ 文本。
+                </p>
+              )}
+            </div>
+          </div>
+        )}
         <textarea
           ref={textRef}
           value={text}
           onChange={(event) => {
-            setText(event.target.value);
-            edited();
+            const value = event.target.value;
+            updateDraft((current) => ({
+              ...current,
+              text: value,
+              retryRequestId: null,
+            }));
+            dismissedMention.current = "";
+            updateMention(value, event.target.selectionStart);
+          }}
+          onSelect={(event) =>
+            updateMention(
+              event.currentTarget.value,
+              event.currentTarget.selectionStart,
+            )
+          }
+          onBlur={() => setMention(null)}
+          onCompositionStart={() => {
+            composingRef.current = true;
+            setMention(null);
+          }}
+          onCompositionEnd={(event) => {
+            composingRef.current = false;
+            updateMention(
+              event.currentTarget.value,
+              event.currentTarget.selectionStart,
+            );
           }}
           placeholder={
             !historyReady
@@ -522,10 +750,51 @@ export default function Composer({
                 : "描述你想完成的工作…"
           }
           aria-label={busy ? "补充任务要求" : "发送消息给 Codex"}
+          aria-autocomplete="list"
+          aria-expanded={!!mention}
+          aria-controls={mention ? suggestionsId : undefined}
+          aria-activedescendant={
+            mention && mentionResults[activeMention]
+              ? `${suggestionsId}-${activeMention}`
+              : undefined
+          }
           rows={1}
           title="Enter 发送 · Shift+Enter 换行"
           disabled={sending}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (mention && event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              dismissedMention.current = JSON.stringify(mention);
+              setMention(null);
+              return;
+            }
+            if (
+              mention &&
+              mentionResults.length &&
+              ["ArrowDown", "ArrowUp"].includes(event.key)
+            ) {
+              event.preventDefault();
+              setActiveMention(
+                (current) =>
+                  (current +
+                    (event.key === "ArrowDown" ? 1 : -1) +
+                    mentionResults.length) %
+                  mentionResults.length,
+              );
+              return;
+            }
+            if (
+              mention &&
+              mentionResults[activeMention] &&
+              event.key === "Enter" &&
+              !event.shiftKey
+            ) {
+              event.preventDefault();
+              selectMention(mentionResults[activeMention]);
+              return;
+            }
             if (
               event.key === "Enter" &&
               !event.shiftKey &&
@@ -533,15 +802,6 @@ export default function Composer({
             ) {
               event.preventDefault();
               void send();
-            }
-            if (
-              event.key === "@" &&
-              !event.nativeEvent.isComposing &&
-              !event.ctrlKey &&
-              !event.metaKey
-            ) {
-              event.preventDefault();
-              setPicker("task");
             }
           }}
           onPaste={(event) => {
@@ -579,9 +839,12 @@ export default function Composer({
             </button>
             <button
               className="icon-button"
-              onClick={() => setPicker("task")}
+              onClick={() => {
+                setMention(null);
+                setPicker("task");
+              }}
               disabled={sending}
-              title="引用任务（@）"
+              title="引用任务，也可在空白后输入 @ 搜索"
               aria-label="引用任务"
             >
               <AtSign size={18} />
@@ -597,37 +860,47 @@ export default function Composer({
             </button>
             {busy && <span className="composer-mode">补充当前任务</span>}
           </div>
-          <details className="composer-settings">
-            <summary
-              aria-label="运行设置"
-              title={settingsLabel({
-                ...thread.effective_settings,
-                ...thread.execution_settings,
-              })}
-            >
-              <Settings2 size={14} />
-              <span>
-                {thread.execution_settings?.model ||
-                  thread.effective_settings?.model ||
-                  "运行设置"}
-              </span>
-              {(settingsSaving ||
-                (thread.settings_revision ?? 0) >
-                  (thread.effective_settings_revision ?? 0)) && (
-                <i title={settingsSaving ? "保存设置中" : "下次执行生效"} />
-              )}
-            </summary>
-            <div className="composer-settings-panel">
-              <ThreadExecutionControls
-                thread={thread}
-                host={host}
-                project={project}
-                onSave={onSettingsChange}
-                onProjectSettings={onProjectSettings}
-                onBusyChange={setSettingsSaving}
-              />
-            </div>
-          </details>
+          {!hideSettings && (
+            <details className="composer-settings">
+              <summary
+                aria-label="运行设置"
+                title={settingsLabel({
+                  ...thread.effective_settings,
+                  ...thread.execution_settings,
+                })}
+              >
+                <Settings2 size={14} />
+                <span>
+                  {pendingSettings ? "下次：" : ""}
+                  {nextSettings.model || "默认模型"}
+                </span>
+                <span className="composer-effort">
+                  {nextSettings.effort || "默认强度"}
+                </span>
+                {(settingsSaving ||
+                  (thread.settings_revision ?? 0) >
+                    (thread.effective_settings_revision ?? 0)) && (
+                  <i title={settingsSaving ? "保存设置中" : "下次执行生效"} />
+                )}
+              </summary>
+              <div className="composer-settings-panel">
+                <ThreadExecutionControls
+                  thread={thread}
+                  host={host}
+                  project={project}
+                  onSave={onSettingsChange}
+                  onProjectSettings={onProjectSettings}
+                  onBusyChange={setSettingsSaving}
+                />
+              </div>
+            </details>
+          )}
+          {hideSettings && (
+            <span className="composer-model-label">
+              {nextSettings.model || "默认模型"} ·{" "}
+              {nextSettings.effort || "默认强度"}
+            </span>
+          )}
           <div className="composer-actions">
             {busy && (
               <button
@@ -671,6 +944,27 @@ export default function Composer({
             </button>
           </div>
         </div>
+      </div>
+      <div className="composer-context-line">
+        <span title={settingsLabel(thread.effective_settings)}>
+          {thread.id.startsWith("new:") ? "发送权限：" : "当前权限："}
+          {permissionLabel(
+            thread.id.startsWith("new:")
+              ? nextSettings
+              : thread.effective_settings,
+          )}
+        </span>
+        {pendingSettings && (
+          <span
+            className="composer-pending-settings"
+            title={settingsLabel(nextSettings)}
+          >
+            下次执行：{settingsLabel(nextSettings)}
+          </span>
+        )}
+        <span className="composer-keyboard-hint">
+          Enter 发送 · Shift+Enter 换行
+        </span>
       </div>
       {!ready && (
         <div className="composer-footnote">

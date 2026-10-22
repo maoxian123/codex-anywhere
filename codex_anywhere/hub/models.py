@@ -76,14 +76,14 @@ class Project(db.Model):
 
     def as_dict(self, thread_count=None, last_activity_at=None):
         if thread_count is None:
-            thread_count = Thread.query.filter_by(project_id=self.id).count()
+            thread_count = Thread.query.filter_by(project_id=self.id, archived=False).count()
         if last_activity_at is None:
             inputs = latest_thread_inputs()
             last_activity_at = (
                 db.session.query(func.max(thread_activity_at(inputs.c.created_at)))
                 .select_from(Thread)
                 .outerjoin(inputs, inputs.c.thread_id == Thread.id)
-                .filter(Thread.project_id == self.id)
+                .filter(Thread.project_id == self.id, Thread.archived.is_(False))
                 .scalar()
             ) or self.created_at
         return dict(
@@ -106,6 +106,9 @@ class Thread(db.Model):
     project_id = db.Column(db.String(32), db.ForeignKey("project.id"), nullable=True, index=True)
     native_id = db.Column(db.String(200), nullable=True)
     title = db.Column(db.String(240), nullable=False)
+    display_title = db.Column(db.String(240), nullable=True)
+    pinned = db.Column(db.Boolean, default=False, nullable=False)
+    archived = db.Column(db.Boolean, default=False, nullable=False)
     cwd = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(24), default="starting", nullable=False)
     active_turn_id = db.Column(db.String(200), nullable=True)
@@ -135,6 +138,9 @@ class Thread(db.Model):
             project_id=self.project_id,
             native_id=self.native_id,
             title=self.title,
+            display_title=self.display_title,
+            pinned=self.pinned,
+            archived=self.archived,
             cwd=self.cwd,
             status=self.status,
             active_turn_id=self.active_turn_id,

@@ -6,6 +6,9 @@ import "./SettingsPage.css";
 import "./HostSettings.css";
 import "./OwnershipPanel.css";
 import "./Timeline.css";
+import "./Workspace.css";
+import "./SidebarNavigation.css";
+import "./Composer.css";
 import "highlight.js/styles/github-dark-dimmed.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

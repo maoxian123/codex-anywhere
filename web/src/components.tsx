@@ -48,7 +48,28 @@ export function Modal({
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = ref.current;
+    if (!dialog) return;
+    // showModal() can override React autoFocus by focusing the header's close
+    // button. Prefer the dialog's editable controls after its native focus step.
+    const active = document.activeElement;
+    const enabled = (element: Element): element is HTMLElement =>
+      element instanceof HTMLElement &&
+      !element.matches(":disabled, [readonly], [type='hidden']") &&
+      !element.closest("[hidden], [inert]");
+    const autofocus = Array.from(dialog.querySelectorAll("[autofocus]")).find(
+      enabled,
+    );
+    const editable = Array.from(
+      dialog.querySelectorAll("input, textarea, select"),
+    ).find(enabled);
+    const button = Array.from(dialog.querySelectorAll("button")).find(enabled);
+    const target =
+      autofocus ||
+      (active && dialog.contains(active) && enabled(active) ? active : null) ||
+      editable ||
+      button;
     dialog?.showModal();
+    target?.focus();
     return () => dialog?.close();
   }, []);
   return (
