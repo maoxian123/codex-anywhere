@@ -949,7 +949,8 @@ def create_app(test_config=None):
             if not is_absolute_directory(cwd):
                 raise ValueError("工作目录必须是绝对路径")
             project = ensure_project(host, cwd)
-        title = str(data.get("title", "新任务")).strip()[:240] or "新任务"
+        supplied_title = data.get("title")
+        title = supplied_title.strip()[:240] if isinstance(supplied_title, str) else ""
         settings = dict(project.execution_settings or {})
         if "execution_settings" in data:
             settings.update(execution_settings(data["execution_settings"]))
@@ -957,14 +958,16 @@ def create_app(test_config=None):
         thread = Thread(
             host_id=host.id,
             project_id=project.id,
-            title=title,
+            title=title or "新对话",
             cwd=cwd,
             execution_settings=settings,
             history_complete=True,
         )
         db.session.add(thread)
         db.session.flush()
-        payload = dict(cwd=cwd, title=title)
+        payload = dict(cwd=cwd)
+        if title:
+            payload["title"] = title
         if signature is not None:
             payload["_signature"] = signature
         if data.get("model"):
@@ -1138,6 +1141,21 @@ def create_app(test_config=None):
                         history_command.error = "会话已开始新轮次，此历史页未应用；请刷新历史"
             if kind == "turn.steer":
                 payload["expected_turn_id"] = thread.active_turn_id
+            if (
+                kind == "turn.start"
+                and thread.title == "新对话"
+                and not Command.query.filter_by(thread_id=thread.id, kind="turn.start").first()
+            ):
+                creation = Command.query.filter_by(
+                    thread_id=thread.id, kind="thread.start"
+                ).first()
+                if creation and not creation.payload.get("title"):
+                    # Use original user text, not quoted reference contents.
+                    # Explicit and imported names can also equal the placeholder.
+                    first_line = next((line for line in text.splitlines() if line.strip()), "")
+                    thread.title = " ".join(first_line.split())[:80] or (
+                        "图片对话" if assets else "引用对话"
+                    )
             thread.status = "active"
             thread.last_error = None
             command = _issue_command(host, thread, kind, payload, key)

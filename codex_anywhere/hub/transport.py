@@ -278,7 +278,11 @@ def _project(thread, method, params, live=True):
     if live:
         thread.updated_at = time.time()
     turn_id = params.get("turnId")
-    if method in {"item/started", "item/completed"}:
+    if method == "thread/name/updated" and live:
+        name = params.get("threadName")
+        if isinstance(name, str) and name.strip():
+            thread.title = name.strip()[:240]
+    elif method in {"item/started", "item/completed"}:
         item = params.get("item", {})
         if isinstance(item, dict):
             _put_item(thread, item, turn_id)

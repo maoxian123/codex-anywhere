@@ -13,7 +13,7 @@ type PendingStart = {
   request: {
     project_id: string;
     client_request_id: string;
-    title: string;
+    title?: string;
     execution_settings: ExecutionSettings;
   };
   thread?: Thread;
@@ -77,12 +77,6 @@ export async function startConversation(
     request: {
       project_id: project.id,
       client_request_id: payload.client_request_id,
-      title:
-        payload.text
-          .split(/\r?\n/)
-          .find((line) => line.trim())
-          ?.trim()
-          .slice(0, 80) || (payload.asset_ids.length ? "图片任务" : "新对话"),
       execution_settings: settings,
     },
   };

@@ -305,7 +305,7 @@ test("changing nodes ignores a late directory response from the previous filesys
   );
 });
 
-test("new tasks use the chosen project ID and never send a directory allowlist", async () => {
+test("new tasks need no name and use the chosen project without sending a title or directory allowlist", async () => {
   let body: Record<string, unknown> | undefined;
   globalThis.fetch = async (_input, init) => {
     body = JSON.parse(String(init?.body));
@@ -327,15 +327,12 @@ test("new tasks use the chosen project ID and never send a directory allowlist",
       onNewProject={() => {}}
     />,
   );
-  fireEvent.change(screen.getByRole("textbox", { name: "任务名称" }), {
-    target: { value: "project task" },
-  });
+  assert.equal(screen.queryByRole("textbox", { name: "任务名称" }), null);
   fireEvent.click(screen.getByRole("button", { name: "创建任务" }));
   await waitFor(() => assert.ok(body));
   assert.deepEqual(body, {
     host_id: "h1",
     project_id: "p1",
-    title: "project task",
   });
 });
 

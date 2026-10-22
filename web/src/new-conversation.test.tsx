@@ -112,7 +112,7 @@ test("new conversation opens an editor in the selected project and creates nothi
     ],
   );
   assert.equal(calls[0].body.project_id, "p2");
-  assert.equal(calls[0].body.title, "修复问题");
+  assert.equal(Object.hasOwn(calls[0].body, "title"), false);
   assert.equal(calls[2].body.text, "修复问题\n保留详细说明");
   assert.equal(readComposerDraft("new:p2", "new-flow").text, "");
 });
@@ -221,6 +221,50 @@ test("an unknown creation is never repeated or followed by a message", async () 
     );
   assert.equal(creations, 1);
   assert.equal(messages, 0);
+});
+
+test("a saved creation request retains its legacy title and exact idempotency body", async () => {
+  const legacyRequest = {
+    project_id: "legacy-title",
+    client_request_id: "original-creation-request",
+    title: "旧版已记录的会话标题",
+    execution_settings: { model: "original-model", effort: "medium" },
+  };
+  sessionStorage.setItem(
+    "anywhere:new-start:legacy-scope:legacy-title",
+    JSON.stringify({ request: legacyRequest }),
+  );
+  const creations: unknown[] = [];
+  const messages: unknown[] = [];
+  globalThis.fetch = async (input, init) => {
+    const path = String(input);
+    if (path === "/api/threads") {
+      creations.push(JSON.parse(String(init?.body)));
+      return json({ thread, command: command() });
+    }
+    if (path.includes("?item_limit=1"))
+      return json({ thread, items: [], interactions: [] });
+    if (path.endsWith("/messages")) {
+      messages.push(JSON.parse(String(init?.body)));
+      return json({ command: command("message") });
+    }
+    throw new Error(path);
+  };
+  const message = {
+    ...payload,
+    text: "当前完整需求\n第二行",
+    client_request_id: "current-message-request",
+  };
+  await startConversation(
+    project("legacy-title"),
+    { model: "changed-model", effort: "high" },
+    message,
+    "legacy-scope",
+    () => {},
+  );
+  assert.deepEqual(creations, [legacyRequest]);
+  assert.deepEqual(messages, [message]);
+  assert.equal(pendingConversation("legacy-title", "legacy-scope"), null);
 });
 
 test("a completed send from an unmounted new page does not erase a newer draft", async () => {

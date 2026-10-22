@@ -266,7 +266,6 @@ export function NewTaskDialog({
     (value) => value.id === projectId && value.host_id === hostId,
   );
   const host = hosts.find((value) => value.id === hostId);
-  const [title, setTitle] = useState("");
   const [settings, setSettings] = useState<ExecutionSettings>(
     project?.execution_settings || {},
   );
@@ -296,7 +295,6 @@ export function NewTaskDialog({
         {
           host_id: hostId,
           project_id: projectId,
-          title: title.trim() || "新任务",
           ...(Object.keys(settings).length
             ? { execution_settings: settings }
             : {}),
@@ -317,17 +315,6 @@ export function NewTaskDialog({
       onClose={onClose}
     >
       <form className="form-stack" onSubmit={(event) => void submit(event)}>
-        <label>
-          任务名称
-          <input
-            autoFocus
-            placeholder="例如：实现登录页面"
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            maxLength={200}
-            disabled={busy}
-          />
-        </label>
         <label>
           <span className="label-with-icon">
             <Monitor size={14} />
