@@ -1,6 +1,4 @@
-import { useEffect, useState } from "react";
 import {
-  ChevronDown,
   Folder,
   Layers,
   Monitor,
@@ -9,8 +7,59 @@ import {
   Settings2,
 } from "lucide-react";
 import { Spinner } from "./components";
-import { groupThreadsByDate, threadActivityLabel } from "./sidebar-activity";
 import type { Host, Project, Thread } from "./types";
+
+type NavigationGroup = {
+  id: string;
+  name: string;
+  cwd: string;
+  project?: Project;
+  threads: Thread[];
+};
+
+function directoryKey(cwd: string, host?: Host) {
+  const normalized =
+    cwd.replace(/\\/g, "/").replace(/\/+$/, "") || (cwd ? "/" : "");
+  return /^(win|windows)/i.test(host?.platform || "") || /^[a-z]:/i.test(cwd)
+    ? normalized.toLowerCase()
+    : normalized;
+}
+function directoryName(cwd: string) {
+  return cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd || "未归属项目";
+}
+function projectGroups(projects: Project[], threads: Thread[], host?: Host) {
+  const groups: NavigationGroup[] = projects.map((project) => ({
+    id: `project:${project.id}`,
+    name: project.name,
+    cwd: project.cwd,
+    project,
+    threads: [],
+  }));
+  const byProject = new Map(groups.map((group) => [group.project!.id, group]));
+  const byDirectory = new Map<string, NavigationGroup>();
+  for (const group of groups) {
+    const key = directoryKey(group.cwd, host);
+    if (key && !byDirectory.has(key)) byDirectory.set(key, group);
+  }
+  for (const thread of threads) {
+    const key = directoryKey(thread.cwd || "", host);
+    let group =
+      (thread.project_id && byProject.get(thread.project_id)) ||
+      byDirectory.get(key);
+    if (!group) {
+      group = {
+        id: `directory:${key}`,
+        name: directoryName(thread.cwd || ""),
+        cwd: thread.cwd || "",
+        threads: [],
+      };
+      groups.push(group);
+      byDirectory.set(key, group);
+    }
+    group.threads.push(thread);
+  }
+  return groups;
+}
 
 export default function ProjectNavigation({
   hosts,
@@ -47,74 +96,6 @@ export default function ProjectNavigation({
   hostPages?: Record<string, { hasMore: boolean; loading: boolean }>;
   onHostMore?: (hostId: string) => void;
 }) {
-  const [treeOpen, setTreeOpen] = useState(Boolean(selectedProjectId));
-  useEffect(() => {
-    if (selectedProjectId) setTreeOpen(true);
-  }, [selectedProjectId]);
-  const threadList = (
-    groupThreads: Thread[],
-    page: { hasMore: boolean; loading: boolean },
-    hostName: string,
-    onLoadMore: () => void,
-    hostPagination: boolean,
-  ) => (
-    <>
-      <div className="project-thread-list">
-        {(loading || page.loading) && !groupThreads.length ? (
-          <div className="sidebar-empty">
-            <Spinner label="加载会话" />
-          </div>
-        ) : groupThreads.length ? (
-          groupThreadsByDate(groupThreads, undefined, true).map((group) => (
-            <section className="thread-date-group" key={group.threads[0].id}>
-              <h3 className="thread-date-label">{group.label}</h3>
-              {group.threads.map((thread) => (
-                <a
-                  key={thread.id}
-                  href={`/tasks/${thread.id}`}
-                  className={`thread-row ${thread.id === currentThreadId ? "selected" : ""}`}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    onNavigate(thread.id);
-                  }}
-                >
-                  <span className={`thread-dot status-${thread.status}`} />
-                  <span className="thread-text">
-                    <strong>{thread.title || "未命名会话"}</strong>
-                    <small>
-                      {thread.imported ? "本机会话" : "Codex"}
-                      <span>{threadActivityLabel(thread)}</span>
-                    </small>
-                  </span>
-                  {thread.status === "waiting" && (
-                    <span className="attention-dot" title="等待处理" />
-                  )}
-                </a>
-              ))}
-            </section>
-          ))
-        ) : (
-          <div className="sidebar-empty">
-            <Folder size={22} />
-            <p>这里还没有会话</p>
-          </div>
-        )}
-      </div>
-      {page.hasMore && (
-        <button
-          className="sidebar-load-more"
-          aria-label={
-            hostPagination ? `加载 ${hostName} 的更多会话` : undefined
-          }
-          disabled={page.loading}
-          onClick={onLoadMore}
-        >
-          {page.loading ? <Spinner label="加载中" /> : "加载更多会话"}
-        </button>
-      )}
-    </>
-  );
-  const hostIds = [...new Set(projects.map((project) => project.host_id))];
   const selectedProject = projects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -126,8 +107,10 @@ export default function ProjectNavigation({
         ...new Set([
           ...hosts.map((host) => host.id),
           ...threads.map((thread) => thread.host_id),
+          ...projects.map((project) => project.host_id),
         ]),
       ];
+
   return (
     <nav
       className="project-navigation grouped-navigation"
@@ -136,14 +119,19 @@ export default function ProjectNavigation({
       <div className="navigation-scope">
         <button
           className={`all-threads-button ${selectedProjectId === null ? "selected" : ""}`}
-          onClick={() => {
-            setTreeOpen(false);
-            onFilter(null);
-          }}
+          onClick={() => onFilter(null)}
         >
           <Layers size={15} />
           全部会话
           <span>{selectedProjectId === null ? threads.length : ""}</span>
+        </button>
+        <button
+          className="icon-button"
+          onClick={onNewProject}
+          aria-label="添加项目"
+          title="新建项目并选择设备目录"
+        >
+          <Plus size={14} />
         </button>
         <button
           className="icon-button"
@@ -153,91 +141,21 @@ export default function ProjectNavigation({
           <RefreshCw size={13} />
         </button>
       </div>
-      <details
-        className="project-filter-tree"
-        open={treeOpen}
-        onToggle={(event) => setTreeOpen(event.currentTarget.open)}
-      >
-        <summary>
-          <ChevronDown size={13} />
-          项目<span>{projects.length}</span>
-        </summary>
-        <div className="sidebar-section-label">
-          <span>按设备与目录</span>
-          <button
-            className="icon-button"
-            onClick={onNewProject}
-            aria-label="添加项目"
-          >
-            <Plus size={14} />
-          </button>
-        </div>
-        {hostIds.map((hostId) => {
-          const host = hosts.find((value) => value.id === hostId);
-          const group = projects.filter(
-            (project) => project.host_id === hostId,
-          );
-          if (!group.length) return null;
-          return (
-            <section className="project-host-group" key={hostId}>
-              <h3>
-                <Monitor size={12} />
-                <span>{host?.name || hostId}</span>
-                <i className={`mini-status ${host?.online ? "online" : ""}`} />
-              </h3>
-              {group.map((project) => (
-                <div className="project-group" key={project.id}>
-                  <div className="project-row-with-settings">
-                    <button
-                      title={project.cwd}
-                      className={`project-row ${selectedProjectId === project.id ? "expanded" : ""}`}
-                      aria-expanded={selectedProjectId === project.id}
-                      onClick={() =>
-                        onFilter(
-                          selectedProjectId === project.id ? null : project.id,
-                        )
-                      }
-                    >
-                      <ChevronDown size={13} />
-                      <Folder size={14} />
-                      <span>
-                        <strong>{project.name}</strong>
-                        <small>{project.cwd}</small>
-                      </span>
-                      <em>{project.thread_count}</em>
-                    </button>
-                    {onSettings && (
-                      <button
-                        className="icon-button project-settings-button"
-                        aria-label={`${project.name} 项目默认设置`}
-                        title="项目默认设置"
-                        onClick={() => onSettings(project)}
-                      >
-                        <Settings2 size={13} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </section>
-          );
-        })}
-        {!projects.length && (
-          <button className="connect-device" onClick={onNewProject}>
-            <Folder size={15} />
-            新建项目并选择设备目录
-          </button>
-        )}
-      </details>
       <div
         className={`host-thread-groups ${threadHostIds.length === 1 ? "single-host" : ""}`}
       >
         {threadHostIds.map((hostId) => {
           const host = hosts.find((value) => value.id === hostId);
           const hostName = host?.name || hostId;
-          const groupThreads = threads.filter(
+          const hostThreads = threads.filter(
             (thread) => thread.host_id === hostId,
           );
+          const hostProjects = projects.filter(
+            (project) =>
+              project.host_id === hostId &&
+              (!selectedProjectId || project.id === selectedProjectId),
+          );
+          const groups = projectGroups(hostProjects, hostThreads, host);
           const perHost = selectedProjectId === null && !!hostPages;
           const page = perHost
             ? hostPages[hostId] || { hasMore: false, loading: false }
@@ -246,10 +164,10 @@ export default function ProjectNavigation({
             !loading &&
             !page.loading &&
             !page.hasMore &&
-            groupThreads.length <= 3;
+            hostThreads.length + groups.length <= 4;
           return (
             <section
-              className={`host-thread-group ${compact ? "compact-thread-host" : ""} ${!groupThreads.length ? "empty-host" : ""}`}
+              className={`host-thread-group ${compact ? "compact-thread-host" : ""} ${!hostThreads.length && !groups.length ? "empty-host" : ""}`}
               key={hostId}
               aria-label={`${hostName} 会话`}
               aria-busy={loading || page.loading}
@@ -266,9 +184,9 @@ export default function ProjectNavigation({
                 />
                 <span
                   className="host-thread-count"
-                  title={`当前已加载 ${groupThreads.length} 个会话`}
+                  title={`当前已加载 ${hostThreads.length} 个会话`}
                 >
-                  {groupThreads.length}
+                  {hostThreads.length}
                 </span>
               </header>
               <div
@@ -277,12 +195,128 @@ export default function ProjectNavigation({
                 aria-label={`${hostName} 会话列表`}
                 tabIndex={0}
               >
-                {threadList(
-                  groupThreads,
-                  page,
-                  hostName,
-                  perHost && onHostMore ? () => onHostMore(hostId) : onMore,
-                  perHost,
+                {groups.map((group) => (
+                  <section
+                    className={`machine-project-group ${group.project?.id === selectedProjectId ? "selected-project-group" : ""}`}
+                    key={group.id}
+                    aria-label={`${group.name} 项目会话`}
+                  >
+                    <div className="project-row-with-settings">
+                      {group.project ? (
+                        <button
+                          title={group.cwd}
+                          className={`project-row ${group.project.id === selectedProjectId ? "expanded" : ""}`}
+                          aria-pressed={group.project.id === selectedProjectId}
+                          onClick={() =>
+                            onFilter(
+                              selectedProjectId === group.project!.id
+                                ? null
+                                : group.project!.id,
+                            )
+                          }
+                        >
+                          <Folder size={13} />
+                          <span>
+                            <strong>{group.name}</strong>
+                            <small>{group.cwd}</small>
+                          </span>
+                          <em
+                            title={`已加载 ${group.threads.length} 个会话，项目共 ${Math.max(group.project.thread_count, group.threads.length)} 个`}
+                          >
+                            {Math.max(
+                              group.project.thread_count,
+                              group.threads.length,
+                            )}
+                          </em>
+                        </button>
+                      ) : (
+                        <div
+                          className="directory-group-heading"
+                          title={group.cwd || "未归属项目"}
+                        >
+                          <Folder size={13} />
+                          <span>
+                            <strong>{group.name}</strong>
+                            {group.cwd && <small>{group.cwd}</small>}
+                          </span>
+                          <em>{group.threads.length}</em>
+                        </div>
+                      )}
+                      {group.project && onSettings && (
+                        <button
+                          className="icon-button project-settings-button"
+                          aria-label={`${group.name} 项目默认设置`}
+                          title="项目默认设置"
+                          onClick={() => onSettings(group.project!)}
+                        >
+                          <Settings2 size={13} />
+                        </button>
+                      )}
+                    </div>
+                    <div className="project-thread-list">
+                      {group.threads.map((thread) => (
+                        <a
+                          key={thread.id}
+                          href={`/tasks/${thread.id}`}
+                          className={`thread-row ${thread.id === currentThreadId ? "selected" : ""}`}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            onNavigate(thread.id);
+                          }}
+                        >
+                          <span
+                            className={`thread-dot status-${thread.status}`}
+                          />
+                          <span className="thread-text">
+                            <strong>{thread.title || "未命名会话"}</strong>
+                            <small>
+                              {thread.imported ? "本机会话" : "Codex"}
+                            </small>
+                          </span>
+                          {thread.status === "waiting" && (
+                            <span className="attention-dot" title="等待处理" />
+                          )}
+                        </a>
+                      ))}
+                      {!group.threads.length && (
+                        <p className="project-conversation-empty">
+                          {loading || page.loading ? (
+                            <Spinner label="加载会话" />
+                          ) : group.project?.thread_count ? (
+                            "选择项目以加载会话"
+                          ) : (
+                            "此项目还没有会话"
+                          )}
+                        </p>
+                      )}
+                    </div>
+                  </section>
+                ))}
+                {!groups.length && (
+                  <div className="sidebar-empty">
+                    {loading || page.loading ? (
+                      <Spinner label="加载会话" />
+                    ) : (
+                      <>
+                        <Folder size={22} />
+                        <p>这里还没有会话</p>
+                      </>
+                    )}
+                  </div>
+                )}
+                {page.hasMore && (
+                  <button
+                    className="sidebar-load-more"
+                    aria-label={
+                      perHost ? `加载 ${hostName} 的更多会话` : undefined
+                    }
+                    disabled={page.loading}
+                    onClick={
+                      perHost && onHostMore ? () => onHostMore(hostId) : onMore
+                    }
+                  >
+                    {page.loading ? <Spinner label="加载中" /> : "加载更多会话"}
+                  </button>
                 )}
               </div>
             </section>
@@ -296,6 +330,9 @@ export default function ProjectNavigation({
               <>
                 <Folder size={22} />
                 <p>这里还没有会话</p>
+                <button className="text-button" onClick={onNewProject}>
+                  新建项目并选择设备目录
+                </button>
               </>
             )}
           </div>

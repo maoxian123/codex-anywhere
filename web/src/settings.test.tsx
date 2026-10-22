@@ -51,6 +51,7 @@ afterEach(() => {
 test("settings load shows the account section without reading a saved password", async () => {
   let resolveLoad!: (value: Response) => void;
   globalThis.fetch = async (path, init) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     assert.equal(String(path), "/api/settings");
     assert.equal(new Headers(init?.headers).get("X-CSRF-Token"), null);
     return new Promise<Response>((resolve) => {
@@ -80,7 +81,8 @@ test("settings load shows the account section without reading a saved password",
 
 test("a failed settings load can be retried", async () => {
   let reads = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (path) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     reads += 1;
     return reads === 1
       ? json({ error: "配置暂时不可用" }, 503)
@@ -98,7 +100,8 @@ test("a failed settings load can be retried", async () => {
 
 test("leaving settings cancels its pending read", () => {
   let signal: AbortSignal | null | undefined;
-  globalThis.fetch = async (_path, init) => {
+  globalThis.fetch = async (path, init) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     signal = init?.signal;
     return new Promise<Response>(() => {});
   };
@@ -112,6 +115,7 @@ test("username-only saves omit the new password and rotate CSRF before updating 
   const requests: { path: string; init?: RequestInit }[] = [];
   const sessions: Session[] = [];
   globalThis.fetch = async (path, init) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     requests.push({ path: String(path), init });
     if (String(path) === "/api/settings") return json(initialSettings);
     if (String(path) === "/api/follow-up") return json({ ok: true });
@@ -157,6 +161,7 @@ test("username-only saves omit the new password and rotate CSRF before updating 
 test("password updates preserve whitespace and clear all password fields after saving", async () => {
   let payload: unknown;
   globalThis.fetch = async (path, init) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     if (String(path) === "/api/settings") return json(initialSettings);
     payload = JSON.parse(String(init?.body));
     return json({ settings: initialSettings, session: updatedSession });
@@ -179,7 +184,8 @@ test("password updates preserve whitespace and clear all password fields after s
 
 test("mismatched passwords are rejected locally and preserve the entered values", async () => {
   let requests = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (path) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     requests += 1;
     return json(initialSettings);
   };
@@ -200,6 +206,7 @@ test("an incorrect current password keeps the draft available for retry", async 
   let updates = 0;
   const sessions: Session[] = [];
   globalThis.fetch = async (path) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     if (String(path) === "/api/settings") return json(initialSettings);
     updates += 1;
     return updates === 1
@@ -231,6 +238,7 @@ test("a pending save disables fields and prevents duplicate submissions", async 
   let updates = 0;
   let resolveUpdate!: (value: Response) => void;
   globalThis.fetch = async (path) => {
+    if (String(path) === "/api/settings/hosts") return json({ hosts: [] });
     if (String(path) === "/api/settings") return json(initialSettings);
     updates += 1;
     return new Promise<Response>((resolve) => {

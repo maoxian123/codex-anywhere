@@ -385,7 +385,11 @@ def handle_node_message(app, host_id, message, flush_outgoing=None, outgoing_soc
         # Keep HTTP producers offline until welcome and older commands have
         # reached this owner; otherwise a new command can precede hello replay.
         if broker.mark_ready(host_id, outgoing_socket):
-            with app.app_context():
+            with app.app_context(), broker.command_lock:
+                if not broker.is_attached(host_id, outgoing_socket):
+                    return
+                if db.session.get(Host, host_id) is None:
+                    return
                 emit("anywhere/host_online", {"host_id": host_id}, host_id=host_id)
                 db.session.commit()
 

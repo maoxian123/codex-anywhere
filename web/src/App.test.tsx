@@ -111,6 +111,7 @@ function setup(
       );
     else if (path === "/api/settings")
       result = { administrator: { username: authentication.username } };
+    else if (path === "/api/settings/hosts") result = { hosts: [] };
     else if (path === "/api/projects") result = { projects };
     else if (path === "/api/hosts") result = { hosts };
     else if (path.startsWith("/api/threads?")) {
@@ -689,6 +690,109 @@ function recentCatalog() {
   ];
   return { older, latest, projects, threads: [latest, older] };
 }
+
+test("deleting a host clears its active conversation and rejects late snapshots without hiding other hosts", async () => {
+  const first = catalogThread(
+    "t1",
+    "待删除机器会话",
+    "p1",
+    "2026-10-21T10:00:00Z",
+  );
+  const second = catalogThread(
+    "t2",
+    "保留机器会话",
+    "p2",
+    "2026-10-21T09:00:00Z",
+    "h2",
+  );
+  const server = setup(first, "/tasks/t1", [], {
+    threads: [first, second],
+    hosts: [
+      { id: "h1", name: "删除机器", platform: "windows", online: true },
+      { id: "h2", name: "保留机器", platform: "linux", online: true },
+    ],
+    projects: [
+      catalogProject("p1", "删除项目", first.created_at),
+      catalogProject("p2", "保留项目", second.created_at, "h2"),
+    ],
+  });
+  await screen.findByRole("textbox", { name: "发送消息给 Codex" });
+  await screen.findByRole("link", { name: /保留机器会话/ });
+  const stale = deferred<Response>();
+  let requested = false;
+  server.intercept((path) => {
+    if (
+      path.startsWith("/api/threads?") &&
+      new URLSearchParams(path.split("?")[1]).get("host_id") === "h1"
+    ) {
+      requested = true;
+      return stale.promise;
+    }
+    return undefined;
+  });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await waitFor(() => assert.equal(requested, true));
+  server.event("anywhere/host_deleted", { host_id: "h1" }, "");
+  await screen.findByRole("heading", { name: "选择一个会话继续" });
+  assert.equal(window.location.pathname, "/");
+  assert.equal(
+    screen.queryByRole("textbox", { name: "发送消息给 Codex" }),
+    null,
+  );
+  await act(async () => {
+    stale.resolve(
+      response({ threads: [first], has_more: false, next_offset: null }),
+    );
+    await stale.promise;
+  });
+  await screen.findByRole("link", { name: /保留机器会话/ });
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await waitFor(() => assert.deepEqual(conversationIds(), ["t2"]));
+  assert.equal(screen.queryByRole("region", { name: "删除机器 会话" }), null);
+  assert.ok(screen.getByRole("region", { name: "保留机器 会话" }));
+});
+
+test("deleting a machine in settings removes its sidebar rows without leaving the settings page", async () => {
+  const server = setup({}, "/settings");
+  server.intercept((path, init) => {
+    if (path === "/api/settings/hosts")
+      return response({
+        hosts: [
+          {
+            ...server.hosts[0],
+            data: {
+              projects: 1,
+              threads: 1,
+              messages: 0,
+              attachments: 0,
+              attachment_bytes: 0,
+            },
+          },
+        ],
+      });
+    if (path === "/api/hosts/h1" && init?.method === "DELETE") {
+      assert.deepEqual(JSON.parse(String(init.body)), {
+        confirm_name: "测试设备",
+      });
+      return response({ deleted: true, host_id: "h1" });
+    }
+    return undefined;
+  });
+  await screen.findByRole("link", { name: /集成测试任务/ });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "删除 测试设备 的机器与数据" }),
+  );
+  fireEvent.change(screen.getByLabelText("输入机器名称以确认删除"), {
+    target: { value: "测试设备" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "确认删除机器与数据" }));
+  await screen.findByText("已删除“测试设备”在管理中心保存的机器记录与数据。");
+  await waitFor(() =>
+    assert.equal(screen.queryByRole("link", { name: /集成测试任务/ }), null),
+  );
+  assert.equal(window.location.pathname, "/settings");
+  assert.ok(screen.getByRole("heading", { name: "机器与数据" }));
+});
 
 test("initial navigation follows recent activity without promoting the selected older conversation", async () => {
   const catalog = recentCatalog();

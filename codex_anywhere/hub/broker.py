@@ -103,6 +103,11 @@ class Broker:
             if current and current.socket is socket:
                 del self._nodes[host_id]
 
+    def revoke(self, host_id):
+        """Detach a deleted identity; its connection owner closes its socket."""
+        with self._lock:
+            return self._nodes.pop(host_id, None) is not None
+
     def is_attached(self, host_id, socket):
         with self._lock:
             current = self._nodes.get(host_id)

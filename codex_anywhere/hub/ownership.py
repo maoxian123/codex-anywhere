@@ -104,6 +104,16 @@ class WriterSessions:
         for nonce in nonces:
             self.release_session(nonce)
 
+    def forget(self, thread_ids):
+        """Discard deleted conversations without issuing commands to their node."""
+        removed = set(thread_ids)
+        with self.lock:
+            for nonce, pages in list(self.clients.items()):
+                for key in [key for key in pages if key[0] in removed]:
+                    del pages[key]
+                if not pages:
+                    del self.clients[nonce]
+
     def register_routes(self, json_body, get_thread, online_host):
         app = self.app
 

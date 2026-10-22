@@ -111,6 +111,11 @@ function Workspace({
   const [hosts, setHosts] = useState<Host[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+  const removedHosts = useRef(new Set<string>());
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
   const [listPages, setListPages] = useState(1);
@@ -271,11 +276,13 @@ function Workspace({
               pages: scope.listPages,
             },
           ]
-        : hostData.hosts.map((host) => ({
-            key: host.id,
-            hostId: host.id,
-            pages: scope.hostPageCounts[host.id] || 1,
-          }));
+        : hostData.hosts
+            .filter((host) => !removedHosts.current.has(host.id))
+            .map((host) => ({
+              key: host.id,
+              hostId: host.id,
+              pages: scope.hostPageCounts[host.id] || 1,
+            }));
       const pages = await Promise.all(
         targets.map(async (target) => {
           const offsets = Array.from({ length: target.pages }, (_, index) =>
@@ -304,7 +311,9 @@ function Workspace({
       ) {
         setHosts((current) => {
           const remaining = new Map(
-            hostData.hosts.map((host) => [host.id, host]),
+            hostData.hosts
+              .filter((host) => !removedHosts.current.has(host.id))
+              .map((host) => [host.id, host]),
           );
           const known = current.flatMap((host) => {
             const value = remaining.get(host.id);
@@ -314,17 +323,24 @@ function Workspace({
           return [...known, ...remaining.values()];
         });
         setProjects((current) =>
-          mergeSidebarProjects(current, projectData.projects),
+          mergeSidebarProjects(
+            current,
+            projectData.projects.filter(
+              (project) => !removedHosts.current.has(project.host_id),
+            ),
+          ),
         );
         const incoming = new Map(
           pages.flatMap((page) =>
             page.results
               .flatMap((result) => result.threads)
+              .filter((thread) => !removedHosts.current.has(thread.host_id))
               .map((thread) => [thread.id, thread] as const),
           ),
         );
         for (const [id, local] of localThreadActivity.current) {
           if (
+            removedHosts.current.has(local.host_id) ||
             (scope.projectFilter && local.project_id !== scope.projectFilter) ||
             (query &&
               !local.title
@@ -397,6 +413,61 @@ function Workspace({
       }
     }
   }, []);
+  const handleHostDeleted = useCallback(
+    (hostId: string) => {
+      if (removedHosts.current.has(hostId)) return;
+      removedHosts.current.add(hostId);
+      ++listFetchRef.current;
+      const deletedProjects = new Set(
+        projectsRef.current
+          .filter((project) => project.host_id === hostId)
+          .map((project) => project.id),
+      );
+      const currentThread =
+        detailRef.current?.thread ||
+        threadsRef.current.find((thread) => thread.id === selectedRef.current);
+      setHosts((current) => current.filter((host) => host.id !== hostId));
+      setProjects((current) =>
+        current.filter((project) => project.host_id !== hostId),
+      );
+      setThreads((current) =>
+        current.filter((thread) => thread.host_id !== hostId),
+      );
+      setProjectFilter((current) =>
+        current && deletedProjects.has(current) ? null : current,
+      );
+      setSettingsProject((current) =>
+        current?.host_id === hostId ? null : current,
+      );
+      for (const [id, thread] of localThreadActivity.current) {
+        if (thread.host_id === hostId) localThreadActivity.current.delete(id);
+      }
+      setHostPages((current) =>
+        Object.fromEntries(
+          Object.entries(current)
+            .filter(([id]) => id !== hostId)
+            .map(([id, page]) => [id, { ...page, loading: false }]),
+        ),
+      );
+      setHostPageCounts((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([id]) => id !== hostId),
+        ),
+      );
+      setLoading(false);
+      setLoadingMore(false);
+      if (currentThread?.host_id === hostId) {
+        selectedRef.current = "";
+        ++threadFetchRef.current;
+        olderRequest.current?.abort();
+        historyCache.current = null;
+        setDetail(null);
+        setStreams({});
+        navigate("");
+      }
+    },
+    [navigate],
+  );
   const refreshThread = useCallback(async (id = selectedRef.current) => {
     if (!id) return;
     const existing = threadRequests.current.get(id);
@@ -417,6 +488,7 @@ function Workspace({
           if (
             liveRef.current &&
             id === selectedRef.current &&
+            !removedHosts.current.has(value.thread.host_id) &&
             request === threadFetchRef.current
           ) {
             const cache = latestHistory(historyCache.current, value);
@@ -620,6 +692,11 @@ function Workspace({
 
   eventRef.current = (event) => {
     const method = event.method;
+    if (method === "anywhere/host_deleted") {
+      const hostId = string(event.params.host_id);
+      if (hostId) handleHostDeleted(hostId);
+      return;
+    }
     const current = event.thread_id === selectedRef.current;
     if (
       method === "anywhere/catalog_sync" &&
@@ -790,6 +867,7 @@ function Workspace({
   );
 
   const markConversationActivity = (thread: Thread) => {
+    if (removedHosts.current.has(thread.host_id)) return;
     const touched = { ...thread, last_activity_at: new Date().toISOString() };
     localThreadActivity.current.set(thread.id, touched);
     const filter = listScopeRef.current.projectFilter;
@@ -1102,7 +1180,10 @@ function Workspace({
           </div>
         )}
         {route.settings ? (
-          <SettingsPage onSession={onSession} />
+          <SettingsPage
+            onSession={onSession}
+            onHostDeleted={handleHostDeleted}
+          />
         ) : route.id ? (
           <>
             {detail && (
@@ -1287,6 +1368,7 @@ function Workspace({
           onNewProject={() => setDialog("project")}
           onClose={() => setDialog(null)}
           onCreated={(thread, command) => {
+            if (removedHosts.current.has(thread.host_id)) return;
             markConversationActivity(thread);
             setProjectFilter(thread.project_id || null);
             navigate(thread.id);
@@ -1299,6 +1381,7 @@ function Workspace({
           hosts={hosts}
           onClose={() => setDialog(null)}
           onCreated={(project) => {
+            if (removedHosts.current.has(project.host_id)) return;
             setProjects((current) => [
               project,
               ...current.filter((value) => value.id !== project.id),
@@ -1317,6 +1400,7 @@ function Workspace({
             void refreshList();
           }}
           onImported={(thread) => {
+            if (removedHosts.current.has(thread.host_id)) return;
             setThreads((current) =>
               current.some((value) => value.id === thread.id)
                 ? current

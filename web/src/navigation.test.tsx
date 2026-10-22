@@ -166,7 +166,6 @@ test("background activity updates preserve row order, project order and each nod
   const { rerender, container } = render(
     <ProjectNavigation {...defaults} projects={projects} threads={threads} />,
   );
-  fireEvent.click(screen.getByText("项目", { selector: "summary" }));
   const linuxList = screen.getByRole("region", { name: "Linux 节点 会话列表" });
   const windowsList = screen.getByRole("region", {
     name: "Windows 节点 会话列表",
@@ -259,4 +258,120 @@ test("a single legacy node keeps its existing load-more button working", () => {
   assert.equal(screen.getAllByRole("region", { name: / 会话列表$/ }).length, 1);
   fireEvent.click(screen.getByRole("button", { name: "加载更多会话" }));
   assert.equal(more, 1);
+});
+
+test("node lists contain project groups in supplied order, keep empty projects selectable and have no date sections", () => {
+  const filtered: (string | null)[] = [];
+  const projects = [
+    project("第二项目"),
+    project("第一项目"),
+    project("空项目", "linux", { cwd: "/empty", thread_count: 0 }),
+  ];
+  const { container } = render(
+    <ProjectNavigation
+      {...defaults}
+      hosts={[hosts[0]]}
+      projects={projects}
+      threads={[
+        thread("第一项目会话", "linux", { project_id: "第一项目" }),
+        thread("第二项目原会话", "linux", { project_id: "第二项目" }),
+        thread("第二项目新会话", "linux", {
+          project_id: "第二项目",
+          updated_at: new Date().toISOString(),
+        }),
+      ]}
+      onFilter={(id) => filtered.push(id)}
+    />,
+  );
+  assert.deepEqual(
+    Array.from(
+      container.querySelectorAll(".machine-project-group .project-row strong"),
+    ).map((node) => node.textContent),
+    ["第二项目", "第一项目", "空项目"],
+  );
+  const second = screen.getByRole("region", { name: "第二项目 项目会话" });
+  assert.deepEqual(
+    within(second)
+      .getAllByRole("link")
+      .map((link) => link.querySelector("strong")?.textContent),
+    ["第二项目原会话", "第二项目新会话"],
+  );
+  assert.equal(
+    container.querySelectorAll(
+      ".thread-date-label, .thread-date-group, .project-filter-tree",
+    ).length,
+    0,
+  );
+  assert.equal(within(second).queryByText("今天"), null);
+  fireEvent.click(screen.getByRole("button", { name: /空项目/ }));
+  assert.deepEqual(filtered, ["空项目"]);
+  assert.ok(screen.getByText("此项目还没有会话"));
+});
+
+test("threads without project IDs match their node's directory or retain separate directory and unassigned groups", () => {
+  render(
+    <ProjectNavigation
+      {...defaults}
+      projects={[
+        project("Windows 项目", "windows", { cwd: "C:\\Work\\" }),
+        project("Linux 项目", "linux", { cwd: "/work" }),
+      ]}
+      threads={[
+        thread("Windows 未映射会话", "windows", { cwd: "c:/work" }),
+        thread("Linux 已有目录会话", "linux", { cwd: "/work/" }),
+        thread("Linux 独立目录会话", "linux", { cwd: "/Work" }),
+        thread("没有目录会话", "linux", { cwd: "" }),
+      ]}
+    />,
+  );
+  assert.ok(
+    within(
+      screen.getByRole("region", { name: "Windows 项目 项目会话" }),
+    ).getByRole("link", { name: /Windows 未映射会话/ }),
+  );
+  assert.ok(
+    within(
+      screen.getByRole("region", { name: "Linux 项目 项目会话" }),
+    ).getByRole("link", { name: /Linux 已有目录会话/ }),
+  );
+  assert.ok(
+    within(screen.getByRole("region", { name: "Work 项目会话" })).getByRole(
+      "link",
+      { name: /Linux 独立目录会话/ },
+    ),
+  );
+  assert.ok(
+    within(
+      screen.getByRole("region", { name: "未归属项目 项目会话" }),
+    ).getByRole("link", { name: /没有目录会话/ }),
+  );
+  assert.equal(screen.getAllByRole("link").length, 4);
+});
+
+test("empty projects on orphan nodes remain reachable and global navigation actions are retained", () => {
+  const filters: (string | null)[] = [];
+  let created = 0;
+  let refreshed = 0;
+  render(
+    <ProjectNavigation
+      {...defaults}
+      hosts={[]}
+      projects={[project("离线空项目", "orphan", { thread_count: 0 })]}
+      onFilter={(id) => filters.push(id)}
+      onNewProject={() => {
+        created += 1;
+      }}
+      onRefresh={() => {
+        refreshed += 1;
+      }}
+    />,
+  );
+  assert.ok(screen.getByRole("region", { name: "orphan 会话" }));
+  fireEvent.click(screen.getByRole("button", { name: /离线空项目/ }));
+  fireEvent.click(screen.getByRole("button", { name: /全部会话/ }));
+  fireEvent.click(screen.getByRole("button", { name: "添加项目" }));
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  assert.deepEqual(filters, ["离线空项目", null]);
+  assert.equal(created, 1);
+  assert.equal(refreshed, 1);
 });

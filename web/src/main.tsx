@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles.css";
 import "./SettingsPage.css";
+import "./HostSettings.css";
 import "highlight.js/styles/github-dark-dimmed.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

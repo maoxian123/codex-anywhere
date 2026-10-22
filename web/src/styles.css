@@ -4022,11 +4022,6 @@ svg {
 .grouped-navigation > .navigation-scope {
   flex-shrink: 0;
 }
-.grouped-navigation > .project-filter-tree {
-  flex: 0 0 auto;
-  max-height: 38%;
-  overflow-y: auto;
-}
 .host-thread-groups {
   display: flex;
   flex-direction: column;
@@ -4108,6 +4103,65 @@ svg {
   outline: 1px solid #53786d;
   outline-offset: -1px;
   border-radius: 6px;
+}
+.machine-project-group {
+  margin: 3px 0 10px;
+}
+.machine-project-group .project-row {
+  padding: 7px 8px;
+  gap: 7px;
+}
+.machine-project-group .project-row > svg:first-child {
+  flex-shrink: 0;
+  transform: none;
+}
+.machine-project-group .project-thread-list {
+  margin-left: 14px;
+  border-left: 1px solid #314b4155;
+  padding-left: 4px;
+}
+.directory-group-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  color: #91abae;
+}
+.directory-group-heading > svg {
+  flex-shrink: 0;
+  color: #607e87;
+}
+.directory-group-heading > span {
+  flex: 1;
+  min-width: 0;
+}
+.directory-group-heading strong,
+.directory-group-heading small {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+.directory-group-heading strong {
+  font-size: 11px;
+}
+.directory-group-heading small {
+  font-size: 8px;
+  color: #5d7f8c;
+}
+.directory-group-heading em {
+  font-size: 8px;
+  font-style: normal;
+  color: #6e8b81;
+}
+.project-conversation-empty {
+  margin: 0;
+  padding: 7px 10px 7px 12px;
+  color: #66818c;
+  font-size: 9px;
 }
 .runtime-settings-editor {
   position: relative;

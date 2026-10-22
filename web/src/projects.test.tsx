@@ -162,7 +162,7 @@ test("sidebar preserves server project ranking across partial pages and promotes
   );
 });
 
-test("sidebar preserves supplied device and project order and keeps dated conversations navigable", () => {
+test("sidebar groups conversations by machine and project while preserving supplied ordering", () => {
   const now = new Date();
   const earlier = new Date(
     now.getFullYear(),
@@ -198,27 +198,21 @@ test("sidebar preserves supplied device and project order and keeps dated conver
       onMore={() => {}}
     />,
   );
-  fireEvent.click(screen.getByText("项目", { selector: "summary" }));
   assert.deepEqual(
-    Array.from(container.querySelectorAll(".project-host-group > h3 span")).map(
-      (value) => value.textContent,
-    ),
-    ["Linux 工作电脑", "Windows 工作电脑"],
+    Array.from(
+      container.querySelectorAll(".host-thread-heading > h3 span"),
+    ).map((value) => value.textContent),
+    ["Windows 工作电脑", "Linux 工作电脑"],
   );
   assert.deepEqual(
-    Array.from(container.querySelectorAll(".project-host-group")).map((group) =>
+    Array.from(container.querySelectorAll(".host-thread-group")).map((group) =>
       Array.from(group.querySelectorAll(".project-row strong")).map(
         (value) => value.textContent,
       ),
     ),
-    [["最近项目", "更早项目"], ["较早项目"]],
+    [["较早项目"], ["最近项目", "更早项目"]],
   );
-  assert.deepEqual(
-    Array.from(container.querySelectorAll(".thread-date-label")).map(
-      (value) => value.textContent,
-    ),
-    ["更早", "今天"],
-  );
+  assert.equal(container.querySelectorAll(".thread-date-label").length, 0);
   const links = screen.getAllByRole("link");
   assert.deepEqual(
     links.map((link) => link.getAttribute("href")),

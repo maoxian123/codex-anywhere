@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { Check, RefreshCw, UserRound } from "lucide-react";
+import { Check, HardDrive, RefreshCw, UserRound } from "lucide-react";
 import { api, errorText, setSession } from "./api";
 import { ErrorMessage, Spinner } from "./components";
+import HostSettings from "./HostSettings";
 import type { Session } from "./types";
 
 type Settings = { administrator: { username: string } };
@@ -9,8 +10,10 @@ type AdministratorUpdate = { settings: Settings; session: Session };
 
 export default function SettingsPage({
   onSession,
+  onHostDeleted,
 }: {
   onSession: (session: Session) => void;
+  onHostDeleted?: (hostId: string) => void;
 }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -104,132 +107,139 @@ export default function SettingsPage({
             <UserRound size={16} aria-hidden="true" />
             账户
           </a>
+          <a href="#host-settings">
+            <HardDrive size={16} aria-hidden="true" />
+            机器与数据
+          </a>
         </nav>
-        <section
-          className="settings-section"
-          id="administrator-settings"
-          aria-labelledby="administrator-settings-title"
-        >
-          <header className="settings-section-header">
-            <h2 id="administrator-settings-title">管理员账号</h2>
-            <p>更新用于登录管理中心的用户名和密码。</p>
-          </header>
-          {!settings ? (
-            <div className="settings-load-state">
-              {loadError ? (
-                <>
-                  <ErrorMessage>{loadError}</ErrorMessage>
-                  <button
-                    className="button button-small"
-                    onClick={() => setLoadAttempt((attempt) => attempt + 1)}
-                  >
-                    <RefreshCw size={14} aria-hidden="true" />
-                    重新加载
-                  </button>
-                </>
-              ) : (
-                <Spinner label="正在加载配置" />
-              )}
-            </div>
-          ) : (
-            <form className="settings-account-form" onSubmit={save}>
-              <fieldset disabled={pending}>
-                <label htmlFor="settings-username">管理员用户名</label>
-                <input
-                  id="settings-username"
-                  name="username"
-                  autoComplete="username"
-                  maxLength={120}
-                  required
-                  value={username}
-                  onChange={(event) => {
-                    setUsername(event.target.value);
-                    setSaved(false);
-                  }}
-                />
-                <label htmlFor="settings-current-password">当前密码</label>
-                <input
-                  id="settings-current-password"
-                  name="current_password"
-                  type="password"
-                  autoComplete="current-password"
-                  maxLength={1024}
-                  required
-                  aria-describedby="settings-current-password-hint"
-                  value={currentPassword}
-                  onChange={(event) => {
-                    setCurrentPassword(event.target.value);
-                    setSaved(false);
-                  }}
-                />
-                <p
-                  className="settings-field-hint"
-                  id="settings-current-password-hint"
-                >
-                  修改账号配置前，需要验证当前密码。
-                </p>
-                <div className="settings-password-fields">
-                  <div>
-                    <label htmlFor="settings-new-password">新密码</label>
-                    <input
-                      id="settings-new-password"
-                      name="new_password"
-                      type="password"
-                      autoComplete="new-password"
-                      minLength={8}
-                      maxLength={1024}
-                      placeholder="留空保留当前密码"
-                      aria-describedby="settings-new-password-hint"
-                      value={newPassword}
-                      onChange={(event) => {
-                        setNewPassword(event.target.value);
-                        setSaved(false);
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor="settings-confirm-password">
-                      确认新密码
-                    </label>
-                    <input
-                      id="settings-confirm-password"
-                      name="confirm_new_password"
-                      type="password"
-                      autoComplete="new-password"
-                      maxLength={1024}
-                      required={Boolean(newPassword)}
-                      placeholder="再次输入新密码"
-                      value={confirmation}
-                      onChange={(event) => {
-                        setConfirmation(event.target.value);
-                        setSaved(false);
-                      }}
-                    />
-                  </div>
-                </div>
-                <p
-                  className="settings-field-hint"
-                  id="settings-new-password-hint"
-                >
-                  新密码至少 8 个字符，留空则仅更新用户名。
-                </p>
-                {saveError && <ErrorMessage>{saveError}</ErrorMessage>}
-                {saved && (
-                  <div className="settings-save-status" role="status">
-                    <Check size={16} aria-hidden="true" />
-                    <span>管理员账号已更新</span>
-                  </div>
+        <div className="settings-sections">
+          <section
+            className="settings-section"
+            id="administrator-settings"
+            aria-labelledby="administrator-settings-title"
+          >
+            <header className="settings-section-header">
+              <h2 id="administrator-settings-title">管理员账号</h2>
+              <p>更新用于登录管理中心的用户名和密码。</p>
+            </header>
+            {!settings ? (
+              <div className="settings-load-state">
+                {loadError ? (
+                  <>
+                    <ErrorMessage>{loadError}</ErrorMessage>
+                    <button
+                      className="button button-small"
+                      onClick={() => setLoadAttempt((attempt) => attempt + 1)}
+                    >
+                      <RefreshCw size={14} aria-hidden="true" />
+                      重新加载
+                    </button>
+                  </>
+                ) : (
+                  <Spinner label="正在加载配置" />
                 )}
-                <footer className="settings-form-footer">
-                  <p>其他登录会话将失效，当前浏览器保持登录。</p>
-                  <button className="button button-primary" type="submit">
-                    {pending ? "正在保存…" : "保存更改"}
-                  </button>
-                </footer>
-              </fieldset>
-            </form>
-          )}
-        </section>
+              </div>
+            ) : (
+              <form className="settings-account-form" onSubmit={save}>
+                <fieldset disabled={pending}>
+                  <label htmlFor="settings-username">管理员用户名</label>
+                  <input
+                    id="settings-username"
+                    name="username"
+                    autoComplete="username"
+                    maxLength={120}
+                    required
+                    value={username}
+                    onChange={(event) => {
+                      setUsername(event.target.value);
+                      setSaved(false);
+                    }}
+                  />
+                  <label htmlFor="settings-current-password">当前密码</label>
+                  <input
+                    id="settings-current-password"
+                    name="current_password"
+                    type="password"
+                    autoComplete="current-password"
+                    maxLength={1024}
+                    required
+                    aria-describedby="settings-current-password-hint"
+                    value={currentPassword}
+                    onChange={(event) => {
+                      setCurrentPassword(event.target.value);
+                      setSaved(false);
+                    }}
+                  />
+                  <p
+                    className="settings-field-hint"
+                    id="settings-current-password-hint"
+                  >
+                    修改账号配置前，需要验证当前密码。
+                  </p>
+                  <div className="settings-password-fields">
+                    <div>
+                      <label htmlFor="settings-new-password">新密码</label>
+                      <input
+                        id="settings-new-password"
+                        name="new_password"
+                        type="password"
+                        autoComplete="new-password"
+                        minLength={8}
+                        maxLength={1024}
+                        placeholder="留空保留当前密码"
+                        aria-describedby="settings-new-password-hint"
+                        value={newPassword}
+                        onChange={(event) => {
+                          setNewPassword(event.target.value);
+                          setSaved(false);
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="settings-confirm-password">
+                        确认新密码
+                      </label>
+                      <input
+                        id="settings-confirm-password"
+                        name="confirm_new_password"
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={1024}
+                        required={Boolean(newPassword)}
+                        placeholder="再次输入新密码"
+                        value={confirmation}
+                        onChange={(event) => {
+                          setConfirmation(event.target.value);
+                          setSaved(false);
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <p
+                    className="settings-field-hint"
+                    id="settings-new-password-hint"
+                  >
+                    新密码至少 8 个字符，留空则仅更新用户名。
+                  </p>
+                  {saveError && <ErrorMessage>{saveError}</ErrorMessage>}
+                  {saved && (
+                    <div className="settings-save-status" role="status">
+                      <Check size={16} aria-hidden="true" />
+                      <span>管理员账号已更新</span>
+                    </div>
+                  )}
+                  <footer className="settings-form-footer">
+                    <p>其他登录会话将失效，当前浏览器保持登录。</p>
+                    <button className="button button-primary" type="submit">
+                      {pending ? "正在保存…" : "保存更改"}
+                    </button>
+                  </footer>
+                </fieldset>
+              </form>
+            )}
+          </section>
+          <HostSettings onHostDeleted={onHostDeleted} />
+        </div>
       </div>
     </div>
   );

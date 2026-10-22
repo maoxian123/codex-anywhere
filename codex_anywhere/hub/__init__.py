@@ -13,6 +13,7 @@ import posixpath
 import secrets
 import threading
 import time
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -31,6 +32,7 @@ from werkzeug.utils import secure_filename
 from .broker import Broker, install_full_writes
 from .execution import execution_settings, require_runtime_settings
 from .history import history_command_applied
+from .hosts import register_host_routes
 from .models import (
     Asset,
     Command,
@@ -132,6 +134,18 @@ def _identifier(value, name):
     return value
 
 
+def _command_locked(handler):
+    @wraps(handler)
+    def locked(*args, **kwargs):
+        # Finish reading/validating JSON before taking the node control lock.
+        _json()
+        with current_app.extensions["broker"].command_lock:
+            db.session.remove()
+            return handler(*args, **kwargs)
+
+    return locked
+
+
 def _reference_shapes(references):
     if not isinstance(references, list) or len(references) > 8:
         raise ValueError("最多引用 8 个任务或网页")
@@ -219,6 +233,7 @@ def _start_history_import(host, thread):
 
 
 def _save_image(host=None):
+    owner_id = host.id if host else None
     file = request.files.get("file")
     if not file:
         raise ValueError("请选择图片")
@@ -265,9 +280,24 @@ def _save_image(host=None):
     )
     target.write_bytes(raw)
     try:
-        db.session.add(asset)
-        db.session.commit()
+        with current_app.extensions["broker"].command_lock:
+            if owner_id:
+                # Image validation and disk writes happen outside the control
+                # lock. Recheck authentication after that work so deletion
+                # cannot be followed by an orphaned late node upload.
+                db.session.remove()
+                owner = node_host()
+                if owner is None or owner.id != owner_id:
+                    from flask import abort
+
+                    abort(401, "节点认证已失效")
+                attached_thread = db.session.get(Thread, thread_id)
+                if attached_thread is None or attached_thread.host_id != owner_id:
+                    raise ValueError("图片所属的任务已不存在")
+            db.session.add(asset)
+            db.session.commit()
     except Exception:
+        db.session.rollback()
         target.unlink(missing_ok=True)
         raise
     return asset
@@ -313,6 +343,7 @@ def create_app(test_config=None):
     writers = WriterSessions(app, _issue_command)
     app.extensions["writer_sessions"] = writers
     writers.register_routes(_json, _get_thread, _online_host)
+    register_host_routes(app, _json, _identifier)
     with app.app_context():
         if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
 
@@ -673,6 +704,7 @@ def create_app(test_config=None):
             return jsonify(thread=thread.as_dict())
 
     @app.post("/api/projects")
+    @_command_locked
     def open_project():
         data = _json()
         host = _online_host(data.get("host_id"))
@@ -690,6 +722,7 @@ def create_app(test_config=None):
         return jsonify(command=_issue_command(host, None, "project.open", payload)), 202
 
     @app.post("/api/hosts/<host_id>/directories")
+    @_command_locked
     def directories(host_id):
         data = _json()
         host = _online_host(host_id)
@@ -701,6 +734,7 @@ def create_app(test_config=None):
         return jsonify(command=_issue_command(host, None, "directory.list", payload)), 202
 
     @app.post("/api/hosts/<host_id>/catalog")
+    @_command_locked
     def catalog(host_id):
         data = _json()
         host = _online_host(host_id)
@@ -720,6 +754,7 @@ def create_app(test_config=None):
         return jsonify(command=_issue_command(host, None, "thread.list", payload)), 202
 
     @app.post("/api/hosts/<host_id>/imports")
+    @_command_locked
     def import_thread(host_id):
         data = _json()
         host = _online_host(host_id)
@@ -842,6 +877,7 @@ def create_app(test_config=None):
             return jsonify(thread=thread.as_dict(), command=command), 202
 
     @app.post("/api/threads")
+    @_command_locked
     def create_thread():
         data = _json()
         project = None
@@ -1139,7 +1175,11 @@ def create_app(test_config=None):
 
     @app.post("/api/node/assets")
     def node_upload():
-        return jsonify(asset=_save_image(node_host()).as_dict())
+        db.session.remove()
+        host = node_host()
+        if host is None:
+            return jsonify(error="节点认证已失效"), 401
+        return jsonify(asset=_save_image(host).as_dict())
 
     @app.get("/api/assets/<asset_id>")
     def download(asset_id):
@@ -1158,6 +1198,7 @@ def create_app(test_config=None):
             return jsonify(error="附件不存在"), 404
 
     @app.post("/api/references/resolve")
+    @_command_locked
     def resolve():
         references = resolve_references(_reference_shapes(_json().get("references", [])))
         db.session.commit()
@@ -1213,6 +1254,9 @@ def create_app(test_config=None):
                     ws.close(reason=1008, message="Session expired")
                     return
                 event = db.session.get(Event, event_id)
+                if event is None:
+                    cursor = event_id
+                    continue
                 ws.send(json.dumps(browser_event(event), ensure_ascii=False))
                 cursor = event_id
                 db.session.expunge(event)
@@ -1220,11 +1264,17 @@ def create_app(test_config=None):
     @sock.route("/ws/node")
     def node_socket(ws):
         install_full_writes(ws)
-        host = node_host()
-        host_id = host.id
-        db.session.remove()
         broker = app.extensions["broker"]
-        if not broker.attach(host_id, ws):
+        with broker.command_lock:
+            db.session.remove()
+            host = node_host()
+            host_id = host.id if host else None
+            attached = bool(host_id and broker.attach(host_id, ws))
+            db.session.remove()
+        if host_id is None:
+            ws.close(reason=1008, message="节点认证已失效")
+            return
+        if not attached:
             ws.send(json.dumps({"type": "error", "error": "该节点已有活动连接"}))
             ws.close()
             return
@@ -1259,8 +1309,9 @@ def create_app(test_config=None):
             app.logger.warning("Node connection ended (%s): %s", host_id, type(exc).__name__)
         finally:
             broker.detach(host_id, ws)
-            with app.app_context():
-                if not broker.is_online(host_id):
+            with app.app_context(), broker.command_lock:
+                db.session.remove()
+                if db.session.get(Host, host_id) is not None and not broker.is_online(host_id):
                     emit("anywhere/host_offline", {"host_id": host_id}, host_id=host_id)
                     db.session.commit()
             try:

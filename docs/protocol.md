@@ -249,6 +249,36 @@ page through the same login-gated application shell as conversation routes.
 
 ### Workspace endpoints
 
+The browser sidebar groups conversations only by machine and project/directory.
+It has no date buckets. Each machine retains independent scrolling and pagination;
+initial activity ranking and explicit local conversation promotion are preserved.
+
+`GET /api/settings/hosts` requires browser authentication and returns `{hosts}`.
+Each entry extends the public host DTO with `data:{projects,threads,messages,
+attachments,attachment_bytes}` for the management center's stored projection.
+Tokens, file paths, command payloads and native configuration are never returned.
+
+`DELETE /api/hosts/<id>` requires browser authentication, CSRF and the JSON body
+`{confirm_name:CURRENT_HOST_NAME}`. Confirmation must match the machine's current
+name exactly. It removes that host and its hub-side projects, conversations,
+items, commands, interactions, events, reference snapshots and exclusive
+attachments in one database transaction. Shared attachments used by other
+machines remain available; unassociated uploads are removed only when exclusively
+referenced by the deleted machine. File cleanup runs only on ordinary files
+inside the configured asset directory, after the database commit. Missing files
+are tolerated; cleanup failures are reported through the successful response's
+`cleanup:{deleted,missing,retained,failed}` and optional `warning`.
+
+Success returns `{deleted:true,host_id,cleanup,warning?}`. Deleting a machine
+revokes its bearer token and detaches its live connection; reconnecting requires
+pairing again. This operation does not access the node filesystem, delete native
+Codex history/project files, terminate the Codex runtime or retry commands.
+An `anywhere/host_deleted` global event with `{host_id}` tells every browser to
+remove the machine and its cached rows, including an open affected conversation.
+The marker is allocated before old events are purged so replay cursors remain
+monotonic. Late node frames, uploads, history replies and browser list responses
+cannot recreate the removed machine's projection.
+
 - GET `/api/hosts` -> `{hosts:[{id,name,platform,online,version,runtime_id,last_seen_at,last_sync_at,sync_error,capabilities}]}`. Sync timestamps are ISO/null; errors are string/null and do not remove cached conversations. Capabilities is the node's advertised feature-name list, separate from the runtime catalog endpoint.
 - POST `/api/pairings` -> `{code,expires_at}`. Node pairing is separate below.
 - GET `/api/threads?q=...&project_id=...&host_id=...&limit=...&offset=...` -> `{threads:[Thread],has_more,next_offset}`. Thread = `{id,host_id,project_id,native_id,title,cwd,status,active_turn_id,last_error,imported,history_loaded,native_updated_at,history_native_updated_at,history_synced_at,history_stale,history_cursor,history_complete,history_generation,execution_settings,effective_settings,settings_revision,effective_settings_revision,created_at,updated_at}`. `status` = idle|active|waiting|error|interrupted|starting|importing. Nullable `last_error` preserves native error details across reloads and clears when a new turn starts. Native version fields are Unix seconds/null, `history_synced_at` is ISO/null, and `history_stale` is boolean.
