@@ -191,6 +191,12 @@ Browser history reads use `GET /api/threads/<id>?item_limit=100[&before_position
 
 The sidebar prioritizes project/conversation lists. Automatic synchronization and opening a conversation are the default flow. Searching, filtering and manually adding more local or archived history remain secondary actions; workspace banners and manual-import calls to action are not required to use automatically discovered conversations.
 
+On the sidebar's initial load, projects with cached conversations appear before
+directories discovered only by inventory, preserving the server's activity order
+within each group. A newly discovered historical directory's hub creation time
+must not bury projects with conversations. Background snapshots retain the
+established order, and an explicitly added project can still be placed first.
+
 ## Projects and explicit history import (v2 compatible)
 
 Project directory allowlists are removed entirely. Pairing and hello no longer carry `roots`; node configuration has no project or artifact root options. Any absolute directory accessible to the node's operating-system account can be used. Native Codex approvals and sandbox settings remain unchanged. Hub-owned asset storage containment and image size limits are independent of project directory access and remain enforced.

@@ -233,3 +233,57 @@ test("project snapshots keep server initial ranking then retain rank and remove 
   assert.deepEqual(mergeSidebarProjects(current, []), []);
   assert.deepEqual(current, before);
 });
+
+test("initial projects show conversations before a large recent inventory of empty directories", () => {
+  const emptyProjects = Array.from({ length: 81 }, (_, index) =>
+    project(`inventory-${index}`, {
+      thread_count: 0,
+      created_at: latest,
+      updated_at: latest,
+    }),
+  );
+  const incoming = [
+    ...emptyProjects.slice(0, 40),
+    project("active-project", { updated_at: recent }),
+    ...emptyProjects.slice(40),
+    project("ODDFLIP", {
+      cwd: "F:\\ODDFLIP",
+      thread_count: 5,
+      updated_at: older,
+    }),
+    project("older-project", { updated_at: "2026-10-10T12:00:00Z" }),
+  ];
+  const before = structuredClone(incoming);
+  const merged = mergeSidebarProjects([], incoming);
+
+  assert.deepEqual(
+    merged.slice(0, 3).map((value) => value.id),
+    ["active-project", "ODDFLIP", "older-project"],
+  );
+  assert.equal(merged[1].thread_count, 5);
+  assert.deepEqual(merged.slice(3), emptyProjects);
+  assert.equal(merged.length, incoming.length);
+  assert.deepEqual(incoming, before);
+});
+
+test("background project snapshots retain selected and explicitly created empty projects at the top", () => {
+  for (const emptyId of ["selected-empty", "newly-created-empty"]) {
+    const empty = project(emptyId, { thread_count: 0 });
+    const current = [empty, project("ODDFLIP", { thread_count: 5 })];
+    const before = structuredClone(current);
+    const incoming = [
+      project("ODDFLIP", { thread_count: 6, updated_at: latest }),
+      project(emptyId, { name: "Renamed empty project", thread_count: 0 }),
+      project("another-active-project"),
+    ];
+    const merged = mergeSidebarProjects(current, incoming);
+
+    assert.deepEqual(
+      merged.map((value) => value.id),
+      [emptyId, "ODDFLIP", "another-active-project"],
+    );
+    assert.equal(merged[0].name, "Renamed empty project");
+    assert.equal(merged[1].thread_count, 6);
+    assert.deepEqual(current, before);
+  }
+});

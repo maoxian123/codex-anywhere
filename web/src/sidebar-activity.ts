@@ -107,11 +107,21 @@ export function promoteSidebarThread(
   return [promoted, ...current.filter((value) => value.id !== thread.id)];
 }
 
-/** Project snapshots are complete: retain rank, refresh rows, remove deleted IDs. */
+/** Rank projects with conversations first, then retain rank across snapshots. */
 export function mergeSidebarProjects(
   current: Project[],
   incoming: Project[],
 ): Project[] {
+  // Inventory-only directories use their hub creation time as activity. An old
+  // directory discovered today must not bury projects with recent conversations.
+  // Apply this partition only on first load so background sync does not move
+  // rows, and an explicitly added empty project can still stay at the top.
+  if (current.length === 0) {
+    incoming = [
+      ...incoming.filter((project) => project.thread_count > 0),
+      ...incoming.filter((project) => !(project.thread_count > 0)),
+    ];
+  }
   const updates = new Map(incoming.map((project) => [project.id, project]));
   const seen = new Set<string>();
   const result: Project[] = [];
