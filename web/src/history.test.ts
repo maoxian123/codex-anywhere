@@ -58,6 +58,18 @@ test("a different imported snapshot discards old page caches and rejects late ol
   assert.equal(olderHistory(next, page([item("stale", 1)])), null);
 });
 
+test("older pages replace overlapping cached items with reconciled native positions", () => {
+  const cache = latestHistory(
+    null,
+    page([item("b", 1), item("a", 2), item("latest", 3)]),
+  );
+  const reconciled = olderHistory(cache, page([item("a", 1), item("b", 2)]))!;
+  assert.deepEqual(
+    reconciled.items.map((entry) => entry.id),
+    ["a", "b", "latest"],
+  );
+});
+
 test("native older-page projection advances sync time without discarding the same generation's pages", () => {
   const firstPage = page([item("recent", 101)]);
   firstPage.thread.history_generation = "generation-1";

@@ -123,7 +123,7 @@ def _validate_next_cursor(token, thread, generation, version, fingerprint, ancho
 
 
 def _positions(thread, entries, cursor):
-    """Keep known positions; allocate only gaps verified by contiguous native pages."""
+    """Reconcile covered slots to native order; leave uncovered positions intact."""
     ids = [entry["item"]["id"] for entry in entries]
     known = {
         item.native_id: item.position
@@ -131,12 +131,17 @@ def _positions(thread, entries, cursor):
     }
     upper = _anchor_position(thread, cursor) if cursor else None
     sequence = [known[ident] for ident in ids if ident in known]
-    if sequence != sorted(set(sequence)) or (
+    if len(sequence) != len(set(sequence)) or (
         upper is not None and any(p >= upper for p in sequence)
     ):
         raise ValueError("Cached history order changed; use explicit full import to reconcile it")
     if any(not 1 <= position <= MAX_POSITION for position in sequence):
         raise ValueError("Cached history positions exceed the supported range")
+    # Live notifications assign slots in arrival order. Parallel tools can finish
+    # in a different order from the persisted native history. A validated page is
+    # authoritative for its covered items: reuse their slots in native order,
+    # without moving uncovered items or changing stable hub/native identities.
+    known = dict(zip((ident for ident in ids if ident in known), sorted(sequence), strict=True))
     result = [known.get(ident) for ident in ids]
     index = 0
     while index < len(result):

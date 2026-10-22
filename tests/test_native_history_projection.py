@@ -220,6 +220,47 @@ def test_conflicting_native_order_fails_and_keeps_raw_staging(page):
     assert Event.query.filter_by(method="anywhere/history_item").count() == 5
 
 
+@pytest.mark.parametrize("older_page", [False, True])
+def test_native_page_reconciles_parallel_live_items_without_changing_identity(page, older_page):
+    # Arrival order differs from persisted history when tools run concurrently.
+    for ident in ["outside", "tool-b", "tool-a", "latest"]:
+        _put_item(page.thread, {"id": ident, "type": "commandExecution"}, "turn")
+    db.session.commit()
+    original = {item.native_id: (item.id, item.position) for item in page.items()}
+    if older_page:
+        token = page.cursor("latest")
+        page.thread.history_cursor = token
+        page.thread.history_generation = page.generation
+        db.session.commit()
+        page.start(token)
+    page.stage(["tool-b", "tool-a"] if older_page else ["latest", "tool-b", "tool-a"])
+    page.complete(2 if older_page else 3)
+    assert page.command.status == "completed"
+    assert [item.native_id for item in page.items()] == ["outside", "tool-a", "tool-b", "latest"]
+    assert {item.native_id: item.id for item in page.items()} == {
+        ident: value[0] for ident, value in original.items()
+    }
+    assert page.items()[0].position == original["outside"][1]
+    assert page.items()[-1].position == original["latest"][1]
+    assert page.thread.history_loaded and page.thread.history_complete
+
+
+def test_reordered_page_callback_failure_restores_original_positions(page):
+    for ident in ["tool-b", "tool-a"]:
+        _put_item(page.thread, {"id": ident, "type": "commandExecution"}, "turn")
+    db.session.commit()
+    original = [(item.id, item.position) for item in page.items()]
+    page.stage(["tool-b", "tool-a"])
+
+    def reject(*args, **kwargs):
+        _put_item(*args, **kwargs)
+        raise ValueError("reject reordered page")
+
+    page.complete(2, put_item=reject)
+    assert page.command.status == "failed"
+    assert [(item.id, item.position) for item in page.items()] == original
+
+
 def test_callback_failure_rolls_back_all_items_in_page(page):
     page.stage(["latest", "older"])
     calls = 0

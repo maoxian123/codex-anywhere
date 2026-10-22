@@ -52,7 +52,7 @@ export function olderHistory(
     return null;
   return {
     ...cache,
-    items: mergeItems(page.items, cache.items),
+    items: mergeItems(cache.items, page.items),
     expanded: true,
     hasMore: Boolean(page.has_more_items),
     before: page.next_before_position ?? null,

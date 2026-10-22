@@ -103,10 +103,13 @@ def test_native_page_retry_is_explicit(app, api, paired_host, status):
     with app.app_context():
         command = db.session.get(Command, first["id"])
         command.status = status
+        command.error = "native history failure details"
         db.session.get(Thread, ident).status = "error"
         db.session.commit()
     for _ in range(2):
-        assert api("POST", endpoint, json={}).status_code == 409
+        response = api("POST", endpoint, json={})
+        assert response.status_code == 409
+        assert "native history failure details" in response.get_json()["error"]
     retry = api("POST", endpoint, json={"retry": True})
     assert retry.status_code == 202
     assert retry.get_json()["command"]["id"] != first["id"]

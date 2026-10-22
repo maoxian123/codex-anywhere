@@ -841,7 +841,10 @@ def create_app(test_config=None):
                     ), 409
                 if latest and latest.status in {"unknown", "failed"} and not retry:
                     return jsonify(
-                        error="上次历史读取失败或结果未知，请显式手动重试",
+                        error=(
+                            "上次历史读取失败或结果未知，请显式手动重试"
+                            + (f"：{latest.error}" if latest.error else "")
+                        ),
                         thread=thread.as_dict(),
                         command=latest.as_dict(),
                     ), 409
