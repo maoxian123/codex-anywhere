@@ -32,12 +32,13 @@ export type ExecutionSettings = {
   sandbox_mode?: string;
   approvals_reviewer?: string;
   network_access?: boolean;
+  service_tier?: "default" | "fast" | null;
 };
 export type NativeExecutionSettings = Omit<
   {
     [Key in keyof ExecutionSettings]?: ExecutionSettings[Key] | null;
   },
-  "approval_policy"
+  "approval_policy" | "service_tier"
 > & {
   approval_policy?: string | JsonObject | null;
   readonly service_tier?: string | null;
@@ -55,6 +56,8 @@ export type RuntimeModel = {
     description?: string;
   }[];
   inputModalities?: string[];
+  serviceTiers?: { id: string; name: string; description?: string }[];
+  additionalSpeedTiers?: string[];
 };
 export type RuntimeCapabilities = {
   models: RuntimeModel[];
@@ -65,6 +68,7 @@ export type RuntimeCapabilities = {
     approvals_reviewers?: string[];
   };
   supported?: Record<string, unknown>;
+  service_tiers?: string[];
   cwd?: string;
   runtime_id?: string;
   fetched_at?: string;

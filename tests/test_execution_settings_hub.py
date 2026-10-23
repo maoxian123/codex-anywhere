@@ -13,7 +13,7 @@ def upgrade_host(app, host):
         {
             "type": "hello",
             "runtime_id": host["runtime_id"],
-            "capabilities": ["catalogSync", "runtimeSettings"],
+            "capabilities": ["catalogSync", "runtimeSettings", "serviceTierWrite"],
         },
     )
     return host
@@ -198,6 +198,10 @@ def test_late_readback_cannot_replace_newer_applied_settings(app, api, paired_ho
         {"network_access": "yes"},
         {"approval_policy": "on-failure"},
         {"model": ""},
+        {"service_tier": "priority"},
+        {"service_tier": "ultrafast"},
+        {"service_tier": True},
+        {"service_tier": " fast"},
     ],
 )
 def test_invalid_settings_do_not_create_commands(app, api, paired_host, create_thread, settings):
@@ -265,3 +269,75 @@ def test_downgraded_node_cannot_ignore_saved_thread_permissions(
         "POST", path + "/messages", json={"text": "continue", "client_request_id": "downgraded"}
     )
     assert result.status_code == 409
+
+
+@pytest.mark.parametrize("tier", ["fast", "default"])
+def test_speed_patch_is_saved_for_next_turn_without_starting_a_command(
+    app, api, paired_host, create_thread, tier
+):
+    host = upgrade_host(app, paired_host())
+    thread = create_thread(host)
+    path = f"/api/threads/{thread['id']}"
+    with app.app_context():
+        count = Command.query.count()
+        stored = db.session.get(Thread, thread["id"])
+        stored.effective_settings = {"service_tier": "priority"}
+        db.session.commit()
+    response = api("PATCH", path + "/settings", json={"execution_settings": {"service_tier": tier}})
+    assert response.status_code == 200
+    result = response.get_json()["thread"]
+    assert result["execution_settings"] == {"service_tier": tier}
+    assert result["effective_settings"] == {"service_tier": "priority"}
+    with app.app_context():
+        assert Command.query.count() == count
+    message = api(
+        "POST", path + "/messages", json={"text": "continue", "client_request_id": "speed"}
+    )
+    assert message.status_code == 202
+    assert command_payload(app, message.get_json()["command"])["execution_settings"] == {
+        "service_tier": tier
+    }
+
+
+def test_null_speed_patch_restores_native_inheritance(app, api, paired_host, create_thread):
+    host = upgrade_host(app, paired_host())
+    thread = create_thread(host)
+    path = f"/api/threads/{thread['id']}"
+    assert (
+        api(
+            "PATCH", path + "/settings", json={"execution_settings": {"service_tier": "fast"}}
+        ).status_code
+        == 200
+    )
+    response = api(
+        "PATCH",
+        path + "/settings",
+        json={"execution_settings": {"service_tier": None, "effort": "high"}},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["thread"]["execution_settings"] == {"effort": "high"}
+
+
+def test_speed_writes_require_dedicated_node_capability(app, api, paired_host, create_thread):
+    host = paired_host()
+    handle_node_message(
+        app,
+        host["host"]["id"],
+        {"type": "hello", "runtime_id": host["runtime_id"], "capabilities": ["runtimeSettings"]},
+    )
+    thread = create_thread(host)
+    response = api(
+        "PATCH",
+        f"/api/threads/{thread['id']}/settings",
+        json={"execution_settings": {"service_tier": "fast"}},
+    )
+    assert response.status_code == 409
+    assert "速度模式" in response.get_json()["error"]
+    assert (
+        api(
+            "PATCH",
+            f"/api/threads/{thread['id']}/settings",
+            json={"execution_settings": {"effort": "high"}},
+        ).status_code
+        == 200
+    )

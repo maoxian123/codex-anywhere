@@ -88,7 +88,7 @@ export function permissionLabel(settings?: NativeExecutionSettings) {
 export function serviceTierLabel(serviceTier?: string | null): string {
   if (serviceTier === null) return "正常模式（默认）";
   const tier = serviceTier?.trim();
-  if (!tier) return "模式未知";
+  if (!tier) return "尚未读取模式";
   switch (tier.toLowerCase()) {
     case "fast":
     case "priority":
@@ -100,6 +100,66 @@ export function serviceTierLabel(serviceTier?: string | null): string {
     default:
       return `其他模式（${tier}）`;
   }
+}
+export function serviceTierMode(tier?: string | null) {
+  if (tier === null) return "default";
+  const value = tier?.trim().toLowerCase();
+  if (value === "priority" || value === "fast") return "fast";
+  return value || undefined;
+}
+/** A missing historical readback is separate from the mode of the next turn. */
+export function serviceTierSummary(
+  desired?: ExecutionSettings,
+  actual?: NativeExecutionSettings,
+  defaults?: NativeExecutionSettings,
+  newConversation = false,
+) {
+  const current = actual?.service_tier;
+  const currentKnown = serviceTierMode(current) !== undefined;
+  const override = desired?.service_tier;
+  const hasOverride = override !== undefined && override !== null;
+  const next = hasOverride
+    ? override
+    : newConversation
+      ? defaults?.service_tier
+      : currentKnown
+        ? current
+        : undefined;
+  const source = hasOverride
+    ? "会话设置"
+    : newConversation
+      ? "节点默认"
+      : "沿用当前会话";
+  const nextKnown = serviceTierMode(next) !== undefined;
+  const nextLabel = nextKnown ? serviceTierLabel(next) : "模式待读取";
+  const pending =
+    hasOverride && serviceTierMode(next) !== serviceTierMode(current);
+  const nextText = `${nextLabel}（${source}）`;
+  const text = newConversation
+    ? `新对话模式：${nextText}`
+    : !currentKnown
+      ? hasOverride
+        ? `当前模式未读取 · 下次：${nextText}`
+        : `当前模式未读取${serviceTierMode(defaults?.service_tier) !== undefined ? ` · 节点默认：${serviceTierLabel(defaults?.service_tier)}（参考）` : ""}`
+      : `当前：${serviceTierLabel(current)}${pending ? ` · 下次：${nextLabel}` : ""}`;
+  return { currentKnown, nextKnown, next, source, nextLabel, pending, text };
+}
+export function availableServiceTiers(
+  capabilities: RuntimeCapabilities,
+  settings: NativeExecutionSettings,
+) {
+  const allowed = capabilities.service_tiers || ["default", "fast"];
+  const model = selectedModel(capabilities, settings);
+  const native = model?.serviceTiers
+    ? model.serviceTiers.map((tier) => tier.id)
+    : model?.additionalSpeedTiers;
+  return (["default", "fast"] as const).filter(
+    (tier) =>
+      allowed.includes(tier) &&
+      (tier === "default" ||
+        !native ||
+        native.some((value) => serviceTierMode(value) === tier)),
+  );
 }
 export function settingsLabel(settings?: NativeExecutionSettings) {
   if (!settings || !Object.keys(settings).length) return "节点默认设置";
@@ -121,13 +181,12 @@ export function changedOverrides(
   after: NativeExecutionSettings,
   edited?: (keyof ExecutionSettings)[],
 ): ExecutionSettings {
-  const result = Object.fromEntries(
-    Object.entries(desired).filter(([key]) => key !== "service_tier"),
-  ) as ExecutionSettings;
+  const result = { ...desired };
   for (const key of new Set(
-    (edited || [...Object.keys(before), ...Object.keys(after)]).filter(
-      (key) => key !== "service_tier",
-    ),
+    edited ||
+      [...Object.keys(before), ...Object.keys(after)].filter(
+        (key) => key !== "service_tier",
+      ),
   ) as Set<keyof ExecutionSettings>) {
     if (!edited && JSON.stringify(before[key]) === JSON.stringify(after[key]))
       continue;

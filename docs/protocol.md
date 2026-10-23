@@ -150,7 +150,7 @@ Hello capabilities are independent feature flags: `catalogSync`, `lazyHistory`, 
 
 ### Execution settings and readback
 
-`ExecutionSettings` is an object with optional keys `model`, `effort`, `approval_policy`, `sandbox_mode`, `approvals_reviewer` and boolean `network_access`. Unknown keys are rejected. `model` and `effort` come from that node's native model catalog, not a fixed global list. Browser presets use policies `on-request|never`, sandbox modes `read-only|workspace-write|danger-full-access`, and reviewers `user|auto_review`. For native compatibility the API also accepts `untrusted` and `guardian_subagent`; these are not new browser presets. These are separate controls: `never` does not itself grant filesystem or network access. Nodes validate model/effort compatibility and managed constraints before applying overrides. Native legacy effective payloads remain preserved.
+`ExecutionSettings` is an object with optional keys `model`, `effort`, `service_tier`, `approval_policy`, `sandbox_mode`, `approvals_reviewer` and boolean `network_access`. Unknown keys are rejected. Desired `service_tier` accepts `default` (normal) or `fast`; null removes its override. `model` and `effort` come from that node's native model catalog, not a fixed global list. Browser presets use policies `on-request|never`, sandbox modes `read-only|workspace-write|danger-full-access`, and reviewers `user|auto_review`. For native compatibility the API also accepts `untrusted` and `guardian_subagent`; these are not new browser presets. These are separate controls: `never` does not itself grant filesystem or network access. Nodes validate model/effort compatibility and managed constraints before applying overrides. Native legacy effective payloads remain preserved.
 
 - `GET /api/hosts/<id>/capabilities[?cwd=ABSOLUTE_PATH]` -> `{capabilities,updated_at}`. Capabilities is null when unavailable, older than 60 seconds, from another runtime epoch, or cached for a different requested cwd. This GET reads the hub cache only; browsers key their cache by host, runtime epoch and cwd.
 - `POST /api/hosts/<id>/capabilities` `{cwd?,refresh?:false}` -> 202 `{command}` (`runtime.capabilities`). Identical pending requests are reused. Result: `{models,defaults,constraints,supported,cwd,runtime_id,fetched_at}`; models preserve native catalog fields, defaults use ExecutionSettings keys, and `fetched_at` is Unix seconds. Constraints may include `approval_policies`, `sandbox_modes`, `approvals_reviewers` and `auto_review_required_models`. Supported has boolean keys `model`, `effort`, `approval_policy`, `sandbox_mode`, `approvals_reviewer`, `network_access`, `auto_review`.
@@ -162,12 +162,18 @@ Project objects add `execution_settings`. Thread objects add desired `execution_
 
 The node maps model/effort overrides to native `model` and `turn/start.effort`, and start/resume effort configuration to `config.model_reasoning_effort`. Approval and reviewer overrides use `approvalPolicy` and `approvalsReviewer`; start/resume sandbox uses hyphenated `sandbox`, whereas turn/start uses structured `sandboxPolicy`. New threads default to `on-request` and `workspace-write` when no explicit approval/sandbox override is selected. Resuming an existing native thread preserves its settings unless explicitly overridden. Model and effort are not hardcoded. Native approval requests and sandbox enforcement remain authoritative.
 
-### Read-only Codex speed mode
+### Codex speed mode
 
-Native settings readbacks additionally expose `service_tier?:string|null`. This is
-read-only metadata, never an accepted `ExecutionSettings` override. Browser and
-node validators reject writes to it; changing model, effort or permissions never
-sends a service-tier override or writes Codex configuration.
+Native settings readbacks expose `service_tier?:string|null`, preserving native
+values beyond the two selectable browser modes. Nodes advertising `serviceTierWrite`
+also accept desired `service_tier:default|fast`. The browser saves this alongside
+the other desired execution settings; it applies on the next new turn, never to
+an active turn being steered. `default` explicitly selects normal speed. Public
+`fast` maps to native app-server `serviceTier:priority`. Null removes the desired
+override and preserves native inheritance. Nodes validate Fast availability against
+the selected model's `serviceTiers` (or legacy `additionalSpeedTiers` when absent).
+Changing unrelated controls never pins a mode, and no speed setting writes global
+Codex configuration or starts inference by itself.
 
 The node preserves native `serviceTier` from thread start/resume and forwards
 `thread/settings/updated.threadSettings.serviceTier` unchanged. Resume also emits
@@ -183,16 +189,23 @@ For new-conversation defaults, `runtime.capabilities.defaults.service_tier` read
 the node's native `config.service_tier`, falling back to the configured model's
 `defaultServiceTier` when no explicit nonnull configuration tier is set. If neither
 source reports the field, omit it rather than fabricate a default. The additional
-`supported.service_tier` flag indicates metadata availability, not write access.
+`supported.service_tier` flag indicates metadata availability.
+`supported.service_tier_write` and `service_tiers:[default,fast]` describe the new
+node adapter's write support; the hub additionally checks `serviceTierWrite` before
+accepting a nonnull mode override, so older nodes cannot silently ignore it.
 
-The browser always shows the mode beside the composer model: `fast`/`priority`
-are quick mode, `default` is normal, and `ultrafast` is ultrafast. Explicit native
-null means no accelerated tier is selected and is labelled normal/default;
-missing or empty metadata is labelled unknown. Other tier IDs remain visible.
-Existing conversations use their own effective readback, never the node's new
-conversation default. Offline values are visibly marked as cached. New-node
-readback support requires updating/restarting that node; missing fields from old
-peers remain unknown. These are Codex mode settings, not claims about per-request
+The browser shows mode and a next-turn selector beside the composer model:
+`fast`/`priority` are quick mode, `default` is normal, and `ultrafast` is ultrafast.
+Explicit native null means no accelerated tier is selected and is labelled
+normal/default. Other native tier IDs remain visible. For an existing conversation,
+absent native metadata is labelled not yet read; the node's default is never
+presented as that conversation's actual or guaranteed next-turn mode. Native
+`thread/read` and catalog Thread metadata do not contain `serviceTier`, while
+start/resume responses and settings events do. Opening history does not resume or
+acquire its writer to discover mode. Users can explicitly choose normal/fast before
+sending; that choice appears as pending until accepted by a new turn. New
+conversations can display the node's known default. Offline values are visibly
+marked as cached. These are Codex mode settings, not claims about per-request
 server-side delivery speed or billing. See the official
 [speed documentation](https://learn.chatgpt.com/docs/agent-configuration/speed).
 

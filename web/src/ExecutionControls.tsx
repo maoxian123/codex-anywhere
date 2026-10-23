@@ -4,12 +4,15 @@ import { api, errorText } from "./api";
 import { ErrorMessage, Modal, Spinner } from "./components";
 import {
   availablePresets,
+  availableServiceTiers,
   changeModel,
   changedOverrides,
   modelId,
   permissionLabel,
   selectedModel,
   serviceTierLabel,
+  serviceTierMode,
+  serviceTierSummary,
   settingsLabel,
 } from "./execution-settings";
 import { useRuntimeCapabilities } from "./useRuntimeCapabilities";
@@ -21,6 +24,173 @@ import type {
   RuntimeCapabilities,
   Thread,
 } from "./types";
+
+function ServiceTierField({
+  host,
+  capabilities,
+  settings,
+  actual,
+  disabled,
+  loading,
+  unavailable,
+  existing = false,
+  compact = false,
+  onChange,
+}: {
+  host?: Host;
+  capabilities?: RuntimeCapabilities | null;
+  settings: ExecutionSettings;
+  actual?: NativeExecutionSettings;
+  disabled?: boolean;
+  loading?: boolean;
+  unavailable?: boolean;
+  existing?: boolean;
+  compact?: boolean;
+  onChange: (settings: ExecutionSettings) => void;
+}) {
+  const mode = serviceTierSummary(
+    settings,
+    actual,
+    capabilities?.defaults,
+    !existing,
+  );
+  const tiers = capabilities
+    ? availableServiceTiers(capabilities, { ...actual, ...settings })
+    : [];
+  const canWrite = host?.capabilities?.includes("serviceTierWrite");
+  const reason = !host?.online
+    ? "设备离线，连接后可切换模式"
+    : !canWrite
+      ? "更新节点后可切换模式"
+      : loading
+        ? "正在读取可用模式"
+        : unavailable || !capabilities
+          ? "模式设置暂不可用，请刷新后重试"
+          : capabilities.supported?.service_tier_write !== true
+            ? "此 Codex 版本不支持切换模式"
+            : "";
+  const selected = serviceTierMode(mode.next) || "";
+  const blocked = disabled || Boolean(reason) || !tiers.length;
+  const title = [
+    existing && !mode.currentKnown
+      ? "尚未读取此会话的实际模式；下次模式与历史实际模式分别显示。"
+      : "来自会话最近同步的实际设置。",
+    actual?.service_tier === null
+      ? "Codex 未选择加速档位，使用默认正常模式。"
+      : "",
+    "切换只保存此会话设置，从下一轮消息生效。",
+    reason,
+    !host?.online && mode.currentKnown ? "离线缓存" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <div
+      className={
+        compact ? "composer-service-tier-control" : "execution-service-tier"
+      }
+    >
+      <span
+        className={`composer-service-tier ${mode.currentKnown || !existing ? "is-known" : "is-unknown"}${selected === "fast" ? " is-accelerated" : ""}`}
+        role="status"
+        aria-label={
+          compact
+            ? existing
+              ? "当前 Codex 模式"
+              : "新对话 Codex 模式"
+            : "运行模式"
+        }
+        title={title}
+      >
+        {mode.text}
+        {!host?.online && mode.currentKnown && <small> · 离线缓存</small>}
+      </span>
+      <label
+        className={
+          compact ? "composer-service-tier-select" : "service-tier-select"
+        }
+        title={reason || "从下一轮消息生效"}
+      >
+        <span>{compact ? "切换模式" : "下次运行模式"}</span>
+        <select
+          aria-label={compact ? "切换 Codex 模式" : "下次运行模式"}
+          value={selected}
+          disabled={blocked}
+          onChange={(event) => {
+            if (
+              !blocked &&
+              (event.target.value === "default" ||
+                event.target.value === "fast")
+            )
+              onChange({ ...settings, service_tier: event.target.value });
+          }}
+        >
+          {!tiers.includes(selected as "default" | "fast") && (
+            <option value={selected} disabled>
+              {mode.nextKnown
+                ? serviceTierLabel(mode.next)
+                : existing
+                  ? "沿用会话模式"
+                  : "模式待读取"}
+            </option>
+          )}
+          {tiers.map((tier) => (
+            <option key={tier} value={tier}>
+              {serviceTierLabel(tier)}
+            </option>
+          ))}
+        </select>
+      </label>
+      {!compact && reason && <small>{reason}</small>}
+    </div>
+  );
+}
+
+export function ThreadServiceTierControl({
+  thread,
+  host,
+  disabled,
+  onSave,
+  onBusyChange,
+}: {
+  thread: Thread;
+  host?: Host;
+  disabled?: boolean;
+  onSave?: (settings: ExecutionSettings) => Promise<void>;
+  onBusyChange?: (busy: boolean) => void;
+}) {
+  const runtime = useRuntimeCapabilities(host, thread.cwd);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  return (
+    <div className="thread-service-tier-control">
+      <ServiceTierField
+        host={host}
+        capabilities={runtime.value}
+        settings={thread.execution_settings || {}}
+        actual={thread.effective_settings}
+        existing={!thread.id.startsWith("new:")}
+        compact
+        disabled={disabled || saving || !onSave}
+        loading={runtime.loading}
+        unavailable={Boolean(runtime.reason || runtime.error)}
+        onChange={(settings) => {
+          if (!onSave || saving) return;
+          setSaving(true);
+          onBusyChange?.(true);
+          setError("");
+          void onSave(settings)
+            .catch((reason) => setError(errorText(reason)))
+            .finally(() => {
+              setSaving(false);
+              onBusyChange?.(false);
+            });
+        }}
+      />
+      {error && <ErrorMessage>{error}</ErrorMessage>}
+    </div>
+  );
+}
 
 export function ExecutionFields({
   capabilities,
@@ -281,6 +451,7 @@ export function RuntimeSettingsEditor({
   disabled,
   onChange,
   permissionsMode = "new",
+  showServiceTier = true,
 }: {
   host?: Host;
   cwd: string;
@@ -289,6 +460,7 @@ export function RuntimeSettingsEditor({
   onChange: (settings: ExecutionSettings) => void;
   permissionsMode?: "new" | "existing";
   displaySettings?: NativeExecutionSettings;
+  showServiceTier?: boolean;
 }) {
   const runtime = useRuntimeCapabilities(host, cwd);
   // Capability defaults describe this Codex installation, which may itself run
@@ -310,47 +482,21 @@ export function RuntimeSettingsEditor({
       }
     : null;
   const displayed = { ...displaySettings, ...settings };
-  const serviceTier =
-    permissionsMode === "existing"
-      ? displaySettings?.service_tier
-      : runtime.value?.defaults.service_tier;
-  const knownMode =
-    serviceTier === null ||
-    (typeof serviceTier === "string" && Boolean(serviceTier.trim()));
-  const cachedMode = !host?.online || Boolean(runtime.reason || runtime.error);
   return (
     <div className="runtime-settings-editor">
-      <div
-        className="execution-service-tier"
-        role="status"
-        aria-label="运行模式"
-      >
-        <span>
-          {permissionsMode === "existing" ? "当前模式" : "新对话模式"}
-        </span>
-        <strong
-          title={
-            serviceTier === null
-              ? "Codex 未选择加速档位，使用默认正常模式。"
-              : "Codex 原生模式，只读显示。"
-          }
-        >
-          {serviceTierLabel(serviceTier)}
-        </strong>
-        <small>
-          {!knownMode
-            ? runtime.loading
-              ? "读取中"
-              : "节点未返回模式，连接或更新节点后确认"
-            : cachedMode
-              ? !host?.online
-                ? "设备离线 · 缓存"
-                : "读取不可用 · 缓存"
-              : permissionsMode === "existing"
-                ? "来自会话最近同步"
-                : "来自节点默认配置"}
-        </small>
-      </div>
+      {showServiceTier && (
+        <ServiceTierField
+          host={host}
+          capabilities={runtime.value}
+          settings={settings}
+          actual={displaySettings}
+          existing={permissionsMode === "existing"}
+          disabled={disabled}
+          loading={runtime.loading}
+          unavailable={Boolean(runtime.reason || runtime.error)}
+          onChange={onChange}
+        />
+      )}
       {capabilities ? (
         <ExecutionFields
           capabilities={capabilities}
@@ -427,6 +573,8 @@ export function ThreadExecutionControls({
   onSave,
   onProjectSettings,
   onBusyChange,
+  hideServiceTier = false,
+  disabled,
 }: {
   thread: Thread;
   host?: Host;
@@ -434,6 +582,8 @@ export function ThreadExecutionControls({
   onSave?: (settings: ExecutionSettings) => Promise<void>;
   onProjectSettings?: (project: Project) => void;
   onBusyChange?: (busy: boolean) => void;
+  hideServiceTier?: boolean;
+  disabled?: boolean;
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -461,7 +611,8 @@ export function ThreadExecutionControls({
         settings={thread.execution_settings || {}}
         displaySettings={thread.effective_settings}
         permissionsMode="existing"
-        disabled={saving || !onSave}
+        disabled={disabled || saving || !onSave}
+        showServiceTier={!hideServiceTier}
         onChange={(settings) => void save(settings)}
       />
       <div className="execution-status">

@@ -302,7 +302,7 @@ test("the composer keeps actual Codex mode outside folded settings even on a sma
     view.rerender(
       <Composer {...props} thread={{ ...thread(), effective_settings: {} }} />,
     );
-    assert.match(badge.textContent || "", /模式未知/);
+    assert.match(badge.textContent || "", /当前模式未读取/);
     assert.doesNotMatch(badge.textContent || "", /正常模式/);
   } finally {
     Object.defineProperty(window, "innerWidth", {

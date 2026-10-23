@@ -15,14 +15,17 @@ import {
   ProjectSettingsDialog,
   RuntimeSettingsEditor,
   ThreadExecutionControls,
+  ThreadServiceTierControl,
 } from "./ExecutionControls";
 import { NewTaskDialog } from "./Dialogs";
 import {
   availablePresets,
+  availableServiceTiers,
   changeModel,
   changedOverrides,
   preserveNewerSettings,
   serviceTierLabel,
+  serviceTierSummary,
 } from "./execution-settings";
 import { fetchRuntimeCapabilities } from "./useRuntimeCapabilities";
 import type {
@@ -154,22 +157,31 @@ test("native service tiers distinguish fast, normal, ultrafast, missing and futu
     ["default", "正常模式"],
     ["ultrafast", "超快模式"],
     ["flex", "其他模式（flex）"],
-    [undefined, "模式未知"],
+    [undefined, "尚未读取模式"],
     [null, "正常模式（默认）"],
-    ["", "模式未知"],
+    ["", "尚未读取模式"],
   ] as const)
     assert.equal(serviceTierLabel(tier), label);
 });
 
-test("changing editable overrides never copies read-only service tier values into a request", () => {
-  const desired = { model: "model-a", service_tier: "fast" };
+test("unrelated edits preserve an explicit mode override without copying native readback", () => {
+  const desired: ExecutionSettings = { model: "model-a", service_tier: "fast" };
   assert.deepEqual(
     changedOverrides(
       desired,
       { model: "model-a", effort: "medium", service_tier: "default" },
       { model: "model-a", effort: "high", service_tier: "priority" },
     ),
-    { model: "model-a", effort: "high" },
+    { model: "model-a", effort: "high", service_tier: "fast" },
+  );
+  assert.deepEqual(
+    changedOverrides(
+      {},
+      { service_tier: "priority" },
+      { service_tier: "priority", effort: "high" },
+      ["effort"],
+    ),
+    { effort: "high" },
   );
 });
 
@@ -194,7 +206,7 @@ test("existing settings show their native mode rather than the new-conversation 
   );
   await screen.findByRole("option", { name: /Model A/ });
   const mode = screen.getByRole("status", { name: "运行模式" });
-  assert.match(mode.textContent || "", /当前模式正常模式/);
+  assert.match(mode.textContent || "", /当前：正常模式/);
   assert.doesNotMatch(mode.textContent || "", /快速模式/);
   view.rerender(
     <RuntimeSettingsEditor
@@ -205,8 +217,9 @@ test("existing settings show their native mode rather than the new-conversation 
       onChange={() => {}}
     />,
   );
-  assert.match(mode.textContent || "", /模式未知/);
-  assert.doesNotMatch(mode.textContent || "", /快速模式/);
+  assert.match(mode.textContent || "", /当前模式未读取/);
+  assert.match(mode.textContent || "", /节点默认：快速模式（参考）/);
+  assert.doesNotMatch(mode.textContent || "", /当前：快速模式|下次：快速模式/);
 });
 
 test("settings display cached native modes offline and unknown defaults when a read fails", async () => {
@@ -223,7 +236,7 @@ test("settings display cached native modes offline and unknown defaults when a r
   );
   assert.match(
     screen.getByRole("status", { name: "运行模式" }).textContent || "",
-    /快速模式设备离线 · 缓存/,
+    /快速模式.*离线缓存/,
   );
   view.unmount();
   globalThis.fetch = async () => {
@@ -239,7 +252,7 @@ test("settings display cached native modes offline and unknown defaults when a r
   );
   await screen.findByText("无法连接管理中心，请检查网络后重试。");
   const mode = screen.getByRole("status", { name: "运行模式" });
-  assert.match(mode.textContent || "", /新对话模式模式未知/);
+  assert.match(mode.textContent || "", /新对话模式：模式待读取/);
   assert.doesNotMatch(mode.textContent || "", /正常模式/);
 });
 
@@ -778,4 +791,210 @@ test("a snapshot begun before a settings patch cannot roll its revision backward
   assert.equal(merged.execution_settings?.model, "model-b");
   assert.equal(merged.effective_settings?.model, "model-b");
   assert.equal(merged.settings_revision, 2);
+});
+
+test("historical missing modes stay unknown and node defaults only predict new conversations", () => {
+  const historical = serviceTierSummary({}, {}, { service_tier: "default" });
+  assert.equal(historical.currentKnown, false);
+  assert.equal(historical.next, undefined);
+  assert.match(historical.text, /当前模式未读取.*节点默认：正常模式（参考）/);
+  assert.doesNotMatch(historical.text, /下次：正常模式|当前：正常模式/);
+  assert.match(
+    serviceTierSummary({}, {}, { service_tier: "priority" }, true).text,
+    /新对话模式：快速模式（节点默认）/,
+  );
+  assert.match(
+    serviceTierSummary(
+      { service_tier: "default" },
+      {},
+      { service_tier: "fast" },
+    ).text,
+    /当前模式未读取 · 下次：正常模式（会话设置）/,
+  );
+  assert.equal(
+    serviceTierSummary(
+      { service_tier: null },
+      { service_tier: "priority" },
+      { service_tier: "default" },
+    ).next,
+    "priority",
+  );
+});
+
+test("native priority enables fast while an explicit empty model tier catalog disables it", () => {
+  const withTiers: RuntimeCapabilities = {
+    ...capabilities,
+    service_tiers: ["default", "fast"],
+    models: [
+      {
+        ...capabilities.models[0],
+        serviceTiers: [{ id: "priority", name: "Fast" }],
+      },
+    ],
+  };
+  assert.deepEqual(availableServiceTiers(withTiers, {}), ["default", "fast"]);
+  assert.deepEqual(
+    availableServiceTiers(
+      {
+        ...withTiers,
+        models: [
+          {
+            ...withTiers.models[0],
+            serviceTiers: [],
+            additionalSpeedTiers: ["fast"],
+          },
+        ],
+      },
+      {},
+    ),
+    ["default"],
+  );
+  assert.deepEqual(
+    availableServiceTiers(
+      {
+        ...withTiers,
+        models: [{ ...capabilities.models[0], additionalSpeedTiers: ["fast"] }],
+      },
+      {},
+    ),
+    ["default", "fast"],
+  );
+});
+
+const writableModes: RuntimeCapabilities = {
+  ...capabilities,
+  defaults: { ...capabilities.defaults, service_tier: "default" },
+  service_tiers: ["default", "fast"],
+  supported: { ...capabilities.supported, service_tier_write: true },
+};
+const modeHost = (id: string): Host => ({
+  ...host(id),
+  capabilities: ["runtimeSettings", "serviceTierWrite"],
+});
+
+test("compact mode changes save next-turn overrides while the actual mode remains visible", async () => {
+  const requests: string[] = [];
+  const saves: ExecutionSettings[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    return response({ capabilities: writableModes });
+  };
+  function Editor() {
+    const [current, setCurrent] = useState<Thread>({
+      ...thread,
+      effective_settings: { model: "model-a", service_tier: "default" },
+      execution_settings: { effort: "high" },
+    });
+    return (
+      <ThreadServiceTierControl
+        thread={current}
+        host={modeHost("compact-write")}
+        onSave={async (settings) => {
+          saves.push(settings);
+          setCurrent((value) => ({ ...value, execution_settings: settings }));
+        }}
+      />
+    );
+  }
+  render(<Editor />);
+  const picker = await screen.findByRole("combobox", {
+    name: "切换 Codex 模式",
+  });
+  await waitFor(() =>
+    assert.equal((picker as HTMLSelectElement).disabled, false),
+  );
+  fireEvent.change(picker, { target: { value: "fast" } });
+  await waitFor(() =>
+    assert.deepEqual(saves[0], { effort: "high", service_tier: "fast" }),
+  );
+  const mode = screen.getByRole("status", { name: "当前 Codex 模式" });
+  assert.match(mode.textContent || "", /当前：正常模式 · 下次：快速模式/);
+  await waitFor(() =>
+    assert.equal((picker as HTMLSelectElement).disabled, false),
+  );
+  fireEvent.change(picker, { target: { value: "default" } });
+  await waitFor(() =>
+    assert.deepEqual(saves[1], { effort: "high", service_tier: "default" }),
+  );
+  assert.match(mode.textContent || "", /当前：正常模式/);
+  assert.doesNotMatch(mode.textContent || "", /下次：快速模式/);
+  assert.ok(requests.every((path) => path.includes("/capabilities")));
+});
+
+test("failed mode saves retain the native mode and do not claim a pending selection", async () => {
+  globalThis.fetch = async () => response({ capabilities: writableModes });
+  render(
+    <ThreadServiceTierControl
+      thread={{ ...thread, effective_settings: { service_tier: "priority" } }}
+      host={modeHost("mode-save-failure")}
+      onSave={async () => {
+        throw new Error("cannot save mode");
+      }}
+    />,
+  );
+  const picker = screen.getByRole("combobox", {
+    name: "切换 Codex 模式",
+  }) as HTMLSelectElement;
+  await waitFor(() => assert.equal(picker.disabled, false));
+  fireEvent.change(picker, { target: { value: "default" } });
+  await screen.findByText("cannot save mode");
+  assert.equal(picker.value, "fast");
+  const mode = screen.getByRole("status", { name: "当前 Codex 模式" });
+  assert.match(mode.textContent || "", /当前：快速模式/);
+  assert.doesNotMatch(mode.textContent || "", /下次：正常模式/);
+});
+
+test("a historical unknown mode starts with preserve-mode placeholder until explicitly chosen", async () => {
+  let saved: ExecutionSettings | undefined;
+  globalThis.fetch = async () => response({ capabilities: writableModes });
+  render(
+    <ThreadServiceTierControl
+      thread={thread}
+      host={modeHost("mode-unknown-pick")}
+      onSave={async (settings) => {
+        saved = settings;
+      }}
+    />,
+  );
+  const picker = screen.getByRole("combobox", {
+    name: "切换 Codex 模式",
+  }) as HTMLSelectElement;
+  await waitFor(() => assert.equal(picker.disabled, false));
+  assert.equal(picker.value, "");
+  assert.equal(picker.selectedOptions[0].textContent, "沿用会话模式");
+  assert.equal(saved, undefined);
+  fireEvent.change(picker, { target: { value: "default" } });
+  await waitFor(() => assert.deepEqual(saved, { service_tier: "default" }));
+});
+
+test("mode editing is disabled offline and on nodes without the write capability", async () => {
+  let saves = 0;
+  globalThis.fetch = async () => response({ capabilities: writableModes });
+  const h = modeHost("mode-compatibility");
+  const view = render(
+    <ThreadServiceTierControl
+      thread={{ ...thread, effective_settings: { service_tier: "fast" } }}
+      host={{ ...h, online: false }}
+      onSave={async () => {
+        saves += 1;
+      }}
+    />,
+  );
+  const picker = screen.getByRole("combobox", {
+    name: "切换 Codex 模式",
+  }) as HTMLSelectElement;
+  assert.equal(picker.disabled, true);
+  assert.match(picker.parentElement?.title || "", /设备离线/);
+  view.rerender(
+    <ThreadServiceTierControl
+      thread={thread}
+      host={{ ...h, capabilities: ["runtimeSettings"] }}
+      onSave={async () => {
+        saves += 1;
+      }}
+    />,
+  );
+  await waitFor(() => assert.equal(picker.disabled, true));
+  assert.match(picker.parentElement?.title || "", /更新节点后可切换模式/);
+  assert.equal(saves, 0);
 });

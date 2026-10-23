@@ -54,9 +54,9 @@
 .composer-service-tier {
   display: inline-flex;
   flex-wrap: wrap;
-  flex-shrink: 0;
+  flex-shrink: 1;
   align-items: center;
-  max-width: 60%;
+  max-width: 100%;
   padding: 5px 8px;
   border: 1px solid #46645a;
   border-radius: 8px;
@@ -65,6 +65,56 @@
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+.thread-service-tier-control {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer-service-tier-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.composer-service-tier-select > span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.composer-service-tier-select select,
+.service-tier-select select {
+  min-height: 32px;
+  max-width: 100%;
+  border: 1px solid #46645a;
+  border-radius: 7px;
+  padding: 5px 22px 5px 8px;
+  background: #20352d;
+  color: #c5e3d2;
+  font-size: 12px;
+}
+
+.composer-service-tier-select select:disabled,
+.service-tier-select select:disabled {
+  opacity: 0.6;
+}
+
+.service-tier-select {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.execution-service-tier .composer-service-tier {
+  border: 0;
+  padding: 0;
+  background: none;
 }
 
 .composer-service-tier.is-unknown {
@@ -246,6 +296,10 @@
   }
 
   .composer-settings > summary {
+    min-height: 44px;
+  }
+
+  .composer-service-tier-select select {
     min-height: 44px;
   }
 

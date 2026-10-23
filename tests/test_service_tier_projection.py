@@ -223,8 +223,8 @@ def test_runtime_restart_clears_only_that_hosts_tier_and_same_epoch_reconnect_pr
     assert read(api, thread)["effective_settings"]["service_tier"] is None
 
 
-@pytest.mark.parametrize("tier", ["fast", None])
-def test_browser_cannot_set_service_tier_on_any_execution_settings_endpoint(
+@pytest.mark.parametrize("tier", ["priority", "ultrafast", True])
+def test_browser_cannot_set_unsupported_service_tier_on_any_execution_settings_endpoint(
     app, api, paired_host, create_thread, tier
 ):
     host = paired_host()

@@ -454,17 +454,33 @@ def test_capabilities_repeated_cursor_and_unexpected_native_failures_are_bounded
 
 
 @pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
-def test_native_service_tier_is_readback_only_and_preserves_nullable_unknown_values(tier):
+def test_native_service_tier_preserves_nullable_unknown_readback_values(tier):
     baseline = {"model": "inherited-model", "service_tier": "baseline-tier"}
     original = copy.deepcopy(baseline)
     settings = effective_settings({"serviceTier": tier}, baseline)
     assert settings["service_tier"] == tier
     assert settings["model"] == "inherited-model"
     assert baseline == original
-    assert thread_overrides({"service_tier": tier}) == {}
-    assert turn_overrides({"service_tier": tier}, baseline, None) == {}
-    with pytest.raises(ValueError, match="Unsupported execution_settings"):
-        requested_settings({"execution_settings": {"service_tier": tier}})
+
+
+@pytest.mark.parametrize("tier,native", [("fast", "priority"), ("default", "default")])
+def test_service_tier_overrides_use_native_rpc_ids_and_explicit_normal(tier, native):
+    settings, revision = requested_settings(
+        {"execution_settings": {"service_tier": tier}, "settings_revision": 4}
+    )
+    assert settings == {"service_tier": tier} and revision == 4
+    assert thread_overrides(settings) == {"serviceTier": native}
+    assert thread_overrides(settings, new=True)["serviceTier"] == native
+    assert turn_overrides(settings, {"service_tier": "priority"}, None) == {"serviceTier": native}
+
+
+def test_null_service_tier_inherits_and_unrelated_overrides_do_not_pin_baseline_tier():
+    settings, _ = requested_settings(
+        {"execution_settings": {"service_tier": None, "model": "other-model"}}
+    )
+    assert settings == {"model": "other-model"}
+    assert thread_overrides(settings) == {"model": "other-model"}
+    assert turn_overrides(settings, {"service_tier": "priority"}, None) == {"model": "other-model"}
 
 
 @pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
@@ -570,13 +586,79 @@ def test_service_tier_config_changes_invalidate_capabilities_cache():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("tier", ["fast", "default", "priority", None, "future-custom-tier"])
-def test_service_tier_cannot_be_submitted_to_runtime_settings_validation(tier):
+@pytest.mark.parametrize("tier", ["priority", "future-custom-tier", " fast", "normal", 1, {}, []])
+def test_unsupported_service_tier_cannot_be_requested(tier):
+    with pytest.raises(ValueError):
+        requested_settings({"execution_settings": {"service_tier": tier}})
+
+
+@pytest.mark.parametrize("tier", ["fast", "default"])
+def test_service_tier_can_be_submitted_to_runtime_settings_validation(tier):
     async def scenario():
         peer = Peer()
-        with pytest.raises(ValueError, match="Unsupported execution_settings"):
-            await RuntimeCapabilities().validate(peer, "cwd", {"service_tier": tier})
-        assert peer.calls == []
+        settings = {"service_tier": tier}
+        assert await RuntimeCapabilities().validate(peer, "cwd", settings) == settings
+        assert not any(method in {"thread/start", "turn/start"} for method, _ in peer.calls)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "metadata,fast_allowed",
+    [
+        ({"serviceTiers": [{"id": "priority", "name": "Fast"}]}, True),
+        ({"serviceTiers": [{"id": "fast", "name": "Fast"}]}, True),
+        ({"serviceTiers": []}, False),
+        ({"serviceTiers": [], "additionalSpeedTiers": ["fast"]}, False),
+        ({"serviceTiers": [{"id": "future-tier", "name": "Future"}]}, False),
+        ({"additionalSpeedTiers": ["fast"]}, True),
+        ({"additionalSpeedTiers": []}, False),
+        ({}, True),
+    ],
+)
+def test_speed_selection_honors_native_model_tiers(metadata, fast_allowed):
+    async def scenario():
+        peer, reader = Peer(), RuntimeCapabilities()
+        peer.models[0].update(metadata)
+        result = await reader.read(peer)
+        assert result["supported"]["service_tier_write"] is True
+        assert result["service_tiers"] == ["default", "fast"]
+        assert result["models"][0] == peer.models[0]
+        assert await reader.validate(peer, "cwd", {"service_tier": "default"}) == {
+            "service_tier": "default"
+        }
+        if fast_allowed:
+            assert await reader.validate(peer, "cwd", {"service_tier": "fast"}) == {
+                "service_tier": "fast"
+            }
+        else:
+            with pytest.raises(ValueError, match="service tier"):
+                await reader.validate(peer, "cwd", {"service_tier": "fast"})
+
+    asyncio.run(scenario())
+
+
+def test_fast_validation_uses_selected_model_instead_of_default_model():
+    async def scenario():
+        peer, reader = Peer(), RuntimeCapabilities()
+        peer.models[0]["serviceTiers"] = [{"id": "priority", "name": "Fast"}]
+        peer.models[1]["serviceTiers"] = []
+        with pytest.raises(ValueError, match="service tier"):
+            await reader.validate(peer, "cwd", {"model": "other-model", "service_tier": "fast"})
+        with pytest.raises(ValueError, match="service tier"):
+            await reader.validate(peer, "cwd", {"service_tier": "fast"}, {"model": "other-model"})
+        await reader.validate(peer, "cwd", {"model": "other-model", "service_tier": "default"})
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("metadata", [{"serviceTiers": None}, {"serviceTiers": ["fast"]}])
+def test_malformed_native_model_tiers_cannot_silently_enable_fast(metadata):
+    async def scenario():
+        peer = Peer()
+        peer.models[0].update(metadata)
+        with pytest.raises(ValueError, match="service tiers are invalid"):
+            await RuntimeCapabilities().validate(peer, "cwd", {"service_tier": "fast"})
 
     asyncio.run(scenario())
 

@@ -118,6 +118,7 @@ class NodeService:
         self.capabilities = RuntimeCapabilities()
         self.execution_epoch: str | None = None
         self.thread_execution: dict[str, dict] = {}
+        self.service_tier_events: dict[str, int] = {}
         self.ownership = WriterOwnership()
         self.writer_request_versions: dict[tuple[str, str], tuple[float, bool]] = {}
         self.completion_idle_since: dict[str, float] = {}
@@ -154,6 +155,9 @@ class NodeService:
                     if tier is None or isinstance(tier, str):
                         known = self.thread_execution.setdefault(thread_id, {})
                         known["settings"] = dict(known.get("settings", {}), service_tier=tier)
+                        self.service_tier_events[thread_id] = (
+                            self.service_tier_events.get(thread_id, 0) + 1
+                        )
             turn = params.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
             if method == "turn/started" and isinstance(turn_id, str):
@@ -171,6 +175,7 @@ class NodeService:
             if method == "thread/closed" or (method == "thread/status/changed" and not_loaded):
                 self.runtime.loaded_threads.discard(thread_id)
                 self.thread_execution.pop(thread_id, None)
+                self.service_tier_events.pop(thread_id, None)
                 self.active_turns.pop(thread_id, None)
                 self.completion_idle_since.pop(thread_id, None)
                 self.latest_turns.pop(thread_id, None)
@@ -354,6 +359,7 @@ class NodeService:
         self.latest_turns.clear()
         self.completed_turns.clear()
         self.thread_execution.clear()
+        self.service_tier_events.clear()
         self.release_errors.clear()
         self.unstarted_threads.clear()
 
@@ -476,6 +482,7 @@ class NodeService:
                             "projectInventory",
                             "threadOwnership",
                             "completionIdleRelease",
+                            "serviceTierWrite",
                         ],
                     }
                 )
@@ -731,6 +738,7 @@ class NodeService:
         if self.execution_epoch != runtime.runtime_id:
             self.execution_epoch = runtime.runtime_id
             self.thread_execution.clear()
+            self.service_tier_events.clear()
             self.capabilities.invalidate()
         if kind == "runtime.capabilities":
             cwd = payload.get("cwd")
@@ -825,6 +833,8 @@ class NodeService:
                 "sandbox_mode": params["sandbox"],
                 **settings,
             }
+            if "serviceTier" in params:
+                fallback["service_tier"] = params["serviceTier"]
             return self._execution_result(runtime, command, native_id, result, revision, fallback)
         if kind == "thread.list":
             return await list_threads(runtime, payload)
@@ -873,6 +883,7 @@ class NodeService:
         overrides = turn_overrides(settings, baseline, known.get("sandbox"))
         marker = "pending:" + command["id"]
         self.active_turns.setdefault(thread_id, marker)
+        mode_event_version = self.service_tier_events.get(thread_id, 0)
         result = await runtime.request("turn/start", {**params, **overrides})
         turn = result.get("turn", {})
         turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -894,6 +905,8 @@ class NodeService:
                 self.completion_idle_since.pop(thread_id, None)
         # A successful turn RPC accepts overrides for this and subsequent turns.
         applied = {**baseline, **settings}
+        if "serviceTier" in overrides:
+            applied["service_tier"] = overrides["serviceTier"]
         if "sandboxPolicy" in overrides:
             result_for_settings = {"sandbox": overrides["sandboxPolicy"], **result}
         else:
@@ -906,6 +919,7 @@ class NodeService:
             revision,
             applied,
             raw_result=result,
+            mode_event_version=mode_event_version,
         )
 
     async def _resume_thread(self, runtime: CodexRuntime, thread_id: str) -> dict:
@@ -949,10 +963,17 @@ class NodeService:
         baseline: dict | None = None,
         *,
         raw_result: dict | None = None,
+        mode_event_version: int | None = None,
     ) -> dict:
         old = self.thread_execution.get(thread_id, {})
         baseline = dict(baseline or {})
-        if "service_tier" in old.get("settings", {}):
+        # A native event during this RPC is newer than its baseline. Otherwise
+        # an accepted explicit speed change must replace the old cached tier.
+        if "service_tier" in old.get("settings", {}) and (
+            mode_event_version is None
+            or self.service_tier_events.get(thread_id, 0) != mode_event_version
+            or "service_tier" not in baseline
+        ):
             baseline["service_tier"] = old["settings"]["service_tier"]
         settings = effective_settings(result, baseline)
         self.thread_execution[thread_id] = {

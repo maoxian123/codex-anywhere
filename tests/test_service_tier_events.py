@@ -1,4 +1,4 @@
-"""Fake-native tests for dynamic read-only service-tier events and races."""
+"""Fake-native tests for dynamic service-tier readbacks and races."""
 
 import asyncio
 import copy
@@ -192,13 +192,13 @@ def test_native_runtime_change_discards_previous_epoch_mode_before_new_command(t
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("tier", ["fast", None])
-def test_requested_service_tier_is_rejected_before_any_native_request(tmp_path, tier):
+@pytest.mark.parametrize("tier", ["ultrafast", "priority", True])
+def test_invalid_requested_service_tier_is_rejected_before_any_native_request(tmp_path, tier):
     async def scenario():
         service, peer = node(tmp_path)
         try:
             result = await service.handle_command(turn_command({"service_tier": tier}))
-            assert "Unsupported execution_settings" in result["error"]
+            assert "service_tier" in result["error"]
             assert not result.get("unknown")
             assert peer.calls == []
             assert service.store.pending_events() == []

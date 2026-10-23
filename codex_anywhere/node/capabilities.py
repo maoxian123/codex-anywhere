@@ -17,7 +17,9 @@ SETTINGS = (
     "sandbox_mode",
     "approvals_reviewer",
     "network_access",
+    "service_tier",
 )
+SERVICE_TIERS = ("default", "fast")
 POLICIES = ("untrusted", "on-request", "never")
 MODES = ("read-only", "workspace-write", "danger-full-access")
 REVIEWERS = ("user", "auto_review", "guardian_subagent")
@@ -26,6 +28,32 @@ MODE_TYPES = {
     "workspace-write": "workspaceWrite",
     "danger-full-access": "dangerFullAccess",
 }
+
+
+def model_service_tiers(model: dict | None) -> tuple[str, ...]:
+    """Public speed selections, constrained by explicit native model metadata."""
+    if model is None:
+        return SERVICE_TIERS
+    if "serviceTiers" in model:
+        tiers = model["serviceTiers"]
+        if not isinstance(tiers, list) or any(
+            not isinstance(tier, dict) or not isinstance(tier.get("id"), str) for tier in tiers
+        ):
+            raise ValueError("Native model service tiers are invalid")
+        identifiers = [tier["id"] for tier in tiers]
+    elif "additionalSpeedTiers" in model:
+        identifiers = model["additionalSpeedTiers"]
+        if not isinstance(identifiers, list) or any(
+            not isinstance(tier, str) for tier in identifiers
+        ):
+            raise ValueError("Native model service tiers are invalid")
+    else:
+        # The supported app-server schema accepts these overrides even before
+        # the catalog gained per-model tier metadata.
+        return SERVICE_TIERS
+    return (
+        SERVICE_TIERS if any(tier in {"priority", "fast"} for tier in identifiers) else ("default",)
+    )
 
 
 def requested_settings(payload: dict) -> tuple[dict, int]:
@@ -51,15 +79,17 @@ def requested_settings(payload: dict) -> tuple[dict, int]:
             or len(setting) > 200
         ):
             raise ValueError(f"{key} must be a non-empty string or null")
+        if key == "service_tier" and setting not in SERVICE_TIERS:
+            raise ValueError("Unsupported service_tier")
         result[key] = setting
     return result, revision
 
 
 def effective_settings(result: dict, baseline: dict | None = None) -> dict:
     """Read only actual native fields; keep unknown inherited values nullable."""
-    settings = {key: (baseline or {}).get(key) for key in SETTINGS}
-    # Service tier is native readback only. Preserve an explicit native null,
-    # but omit an absent field so older peers do not appear to report a tier.
+    settings = {key: (baseline or {}).get(key) for key in SETTINGS if key != "service_tier"}
+    # Preserve explicit native null, but omit an absent field so older peers
+    # do not appear to report a tier.
     if "service_tier" in (baseline or {}):
         tier = baseline["service_tier"]
         if tier is None or isinstance(tier, str):
@@ -99,9 +129,15 @@ def thread_overrides(settings: dict, *, new: bool = False) -> dict:
         ("approval_policy", "approvalPolicy"),
         ("sandbox_mode", "sandbox"),
         ("approvals_reviewer", "approvalsReviewer"),
+        ("service_tier", "serviceTier"),
     ):
         if public in settings:
-            params[native] = settings[public]
+            # Native RPC uses the catalog tier id; "fast" is the UI/config alias.
+            params[native] = (
+                "priority"
+                if public == "service_tier" and settings[public] == "fast"
+                else settings[public]
+            )
     config = {}
     if "effort" in settings:
         config["model_reasoning_effort"] = settings["effort"]
@@ -128,9 +164,14 @@ def turn_overrides(settings: dict, baseline: dict, sandbox: dict | None) -> dict
         ("effort", "effort"),
         ("approval_policy", "approvalPolicy"),
         ("approvals_reviewer", "approvalsReviewer"),
+        ("service_tier", "serviceTier"),
     ):
         if public in settings:
-            params[native] = settings[public]
+            params[native] = (
+                "priority"
+                if public == "service_tier" and settings[public] == "fast"
+                else settings[public]
+            )
     if "sandbox_mode" not in settings and "network_access" not in settings:
         return params
     mode = settings.get("sandbox_mode", baseline.get("sandbox_mode"))
@@ -296,12 +337,14 @@ class RuntimeCapabilities:
                     "model": model_supported,
                     "effort": model_supported,
                     "service_tier": "service_tier" in config or "defaultServiceTier" in selected,
+                    "service_tier_write": True,
                     "approval_policy": "approval_policy" in config,
                     "sandbox_mode": "sandbox_mode" in config,
                     "approvals_reviewer": reviewer_known,
                     "network_access": "sandbox_mode" in config,
                     "auto_review": auto and "auto_review" in reviewers,
                 },
+                "service_tiers": list(SERVICE_TIERS),
                 "cwd": cwd,
                 "runtime_id": runtime.runtime_id,
                 "fetched_at": now,
@@ -325,6 +368,10 @@ class RuntimeCapabilities:
         models = capabilities["models"]
         selected_model = settings.get("model", baseline.get("model") or defaults["model"])
         selected = next((entry for entry in models if entry.get("model") == selected_model), None)
+        if "service_tier" in settings and settings["service_tier"] not in model_service_tiers(
+            selected
+        ):
+            raise ValueError("Selected service tier is not supported by this model")
         if (
             "model" in settings
             and selected is None

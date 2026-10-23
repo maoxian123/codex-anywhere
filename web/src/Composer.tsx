@@ -17,12 +17,11 @@ import {
 import { api, errorText } from "./api";
 import { ErrorMessage, Modal, References, Spinner } from "./components";
 import { messageText } from "./Timeline";
-import { ThreadExecutionControls } from "./ExecutionControls";
 import {
-  permissionLabel,
-  serviceTierLabel,
-  settingsLabel,
-} from "./execution-settings";
+  ThreadExecutionControls,
+  ThreadServiceTierControl,
+} from "./ExecutionControls";
+import { permissionLabel, settingsLabel } from "./execution-settings";
 import type {
   Asset,
   Host,
@@ -413,12 +412,6 @@ function ComposerInput({
     ...thread.effective_settings,
     ...thread.execution_settings,
   };
-  const newConversation = thread.id.startsWith("new:");
-  const serviceTier = thread.effective_settings?.service_tier;
-  const modeLabel = serviceTierLabel(serviceTier);
-  const modeKnown =
-    serviceTier === null ||
-    (typeof serviceTier === "string" && Boolean(serviceTier.trim()));
   useEffect(() => {
     if (!mention) return;
     let cancelled = false;
@@ -902,6 +895,8 @@ function ComposerInput({
                     onSave={onSettingsChange}
                     onProjectSettings={onProjectSettings}
                     onBusyChange={setSettingsSaving}
+                    hideServiceTier
+                    disabled={settingsSaving || sending}
                   />
                 </div>
               </details>
@@ -912,24 +907,22 @@ function ComposerInput({
                 {nextSettings.effort || "默认强度"}
               </span>
             )}
-            <span
-              className={`composer-service-tier ${modeKnown ? "is-known" : "is-unknown"}${/^(fast|priority|ultrafast)$/i.test(serviceTier || "") ? " is-accelerated" : ""}`}
-              role="status"
-              aria-label={
-                newConversation ? "新对话 Codex 模式" : "当前 Codex 模式"
+            <ThreadServiceTierControl
+              thread={thread}
+              host={
+                host
+                  ? { ...host, online: hostOnline }
+                  : {
+                      id: thread.host_id,
+                      name: "",
+                      platform: "",
+                      online: hostOnline,
+                    }
               }
-              title={
-                modeKnown
-                  ? `${newConversation ? "来自节点新对话默认配置" : "来自会话最近同步的实际设置"}${serviceTier === null ? "；Codex 未选择加速档位，使用默认正常模式" : ""}${hostOnline ? "" : "；设备离线，显示缓存"}`
-                  : "节点尚未返回此会话的 Codex 模式，无法确认是否启用快速模式。请连接或更新节点后确认。"
-              }
-            >
-              {newConversation ? "新对话模式：" : "当前："}
-              {modeLabel}
-              {!hostOnline && (
-                <small>{modeKnown ? " · 离线缓存" : " · 设备离线"}</small>
-              )}
-            </span>
+              disabled={settingsSaving || sending}
+              onSave={onSettingsChange}
+              onBusyChange={setSettingsSaving}
+            />
           </div>
           <div className="composer-actions">
             {busy && (

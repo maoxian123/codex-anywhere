@@ -13,6 +13,7 @@ SETTINGS_KEYS = {
     "sandbox_mode",
     "approvals_reviewer",
     "network_access",
+    "service_tier",
 }
 
 
@@ -44,6 +45,8 @@ def execution_settings(value):
             "guardian_subagent",
         }:
             raise ValueError("不支持的审批执行者")
+        elif key == "service_tier" and option not in {"default", "fast"}:
+            raise ValueError("不支持的速度模式")
         result[key] = option
     return result
 
@@ -51,6 +54,8 @@ def execution_settings(value):
 def require_runtime_settings(host, settings):
     if settings and "runtimeSettings" not in (host.capabilities or []):
         raise Conflict("该节点尚不支持运行设置，请更新并重启节点")
+    if "service_tier" in settings and "serviceTierWrite" not in (host.capabilities or []):
+        raise Conflict("该节点尚不支持切换速度模式，请更新并重启节点")
 
 
 def project_effective_settings(thread, settings, revision):
@@ -64,7 +69,11 @@ def project_effective_settings(thread, settings, revision):
         return
     # Readbacks can contain native legacy values. Preserve them without making
     # those values newly selectable in the browser.
-    safe = {key: copy.deepcopy(value) for key, value in settings.items() if key in SETTINGS_KEYS}
+    safe = {
+        key: copy.deepcopy(value)
+        for key, value in settings.items()
+        if key in SETTINGS_KEYS and key != "service_tier"
+    }
     if "service_tier" in settings:
         tier = settings["service_tier"]
         if tier is None or isinstance(tier, str):
