@@ -156,7 +156,43 @@ test("each node paginates and disables its own button without blocking another n
   );
 });
 
-test("background activity updates preserve row order, project order and the shared scroll element", () => {
+test("large and small machines retain separate reachable conversation regions", () => {
+  render(
+    <ProjectNavigation
+      {...defaults}
+      hosts={[hosts[1], hosts[0]]}
+      threads={[
+        ...Array.from({ length: 50 }, (_, index) =>
+          thread(`Windows 会话 ${index + 1}`, "windows"),
+        ),
+        thread("Linux 唯一会话"),
+      ]}
+    />,
+  );
+  const windows = screen.getByRole("region", {
+    name: "Windows 节点 会话列表",
+  });
+  const linux = screen.getByRole("region", { name: "Linux 节点 会话列表" });
+  assert.equal(within(windows).getAllByRole("link").length, 50);
+  assert.equal(within(linux).getAllByRole("link").length, 1);
+  assert.ok(within(linux).getByRole("link", { name: /Linux 唯一会话/ }));
+  assert.equal(windows.tabIndex, 0);
+  assert.equal(linux.tabIndex, 0);
+  assert.equal(
+    screen
+      .getByRole("button", { name: "收起 Windows 节点 的会话" })
+      .getAttribute("aria-expanded"),
+    "true",
+  );
+  assert.equal(
+    screen
+      .getByRole("button", { name: "收起 Linux 节点 的会话" })
+      .getAttribute("aria-expanded"),
+    "true",
+  );
+});
+
+test("background activity updates preserve row order, project order and independent machine scroll positions", () => {
   const projects = [project("原第一项目"), project("原第二项目")];
   const threads = [
     thread("原第一条", "linux", { project_id: "原第一项目" }),
@@ -171,7 +207,12 @@ test("background activity updates preserve row order, project order and the shar
     name: "Windows 节点 会话列表",
   });
   const sharedList = screen.getByRole("region", { name: "项目与会话列表" });
-  sharedList.scrollTop = 120;
+  linuxList.scrollTop = 120;
+  windowsList.scrollTop = 45;
+  fireEvent.scroll(linuxList);
+  assert.equal(windowsList.scrollTop, 45);
+  fireEvent.scroll(windowsList);
+  assert.equal(linuxList.scrollTop, 120);
   rerender(
     <ProjectNavigation
       {...defaults}
@@ -198,7 +239,8 @@ test("background activity updates preserve row order, project order and the shar
     screen.getByRole("region", { name: "项目与会话列表" }),
     sharedList,
   );
-  assert.equal(sharedList.scrollTop, 120);
+  assert.equal(linuxList.scrollTop, 120);
+  assert.equal(windowsList.scrollTop, 45);
   assert.deepEqual(
     within(linuxList)
       .getAllByRole("link")
@@ -211,10 +253,116 @@ test("background activity updates preserve row order, project order and the shar
     ),
     ["原第一项目", "原第二项目"],
   );
-  assert.equal(sharedList.tabIndex, 0);
-  assert.equal(linuxList.tabIndex, -1);
-  assert.equal(windowsList.tabIndex, -1);
-  assert.equal(container.querySelectorAll(".host-thread-scroll").length, 0);
+  assert.equal(linuxList.tabIndex, 0);
+  assert.equal(windowsList.tabIndex, 0);
+});
+
+test("collapsing a machine preserves its scroll and project state without filtering or changing other machines", () => {
+  const filters: (string | null)[] = [];
+  render(
+    <ProjectNavigation
+      {...defaults}
+      hosts={[hosts[0], hosts[1]]}
+      projects={[project("Linux 项目"), project("Windows 项目", "windows")]}
+      threads={[
+        thread("Linux 会话", "linux", { project_id: "Linux 项目" }),
+        thread("Windows 会话", "windows", { project_id: "Windows 项目" }),
+      ]}
+      onFilter={(id) => filters.push(id)}
+    />,
+  );
+  const linuxList = screen.getByRole("region", { name: "Linux 节点 会话列表" });
+  const windowsList = screen.getByRole("region", {
+    name: "Windows 节点 会话列表",
+  });
+  const linuxProject = screen.getByRole("region", {
+    name: "Linux 项目 项目会话",
+  });
+  linuxList.scrollTop = 140;
+  windowsList.scrollTop = 75;
+  fireEvent.click(
+    within(linuxProject).getByRole("button", { name: "收起会话" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "收起 Linux 节点 的会话" }),
+  );
+  assert.ok(linuxList.hidden);
+  assert.equal(
+    screen.queryByRole("region", { name: "Linux 节点 会话列表" }),
+    null,
+  );
+  assert.ok(within(windowsList).getByRole("link", { name: /Windows 会话/ }));
+  assert.equal(windowsList.scrollTop, 75);
+  assert.deepEqual(filters, []);
+  fireEvent.click(
+    screen.getByRole("button", { name: "展开 Linux 节点 的会话" }),
+  );
+  assert.equal(
+    screen.getByRole("region", { name: "Linux 节点 会话列表" }),
+    linuxList,
+  );
+  assert.equal(linuxList.scrollTop, 140);
+  assert.equal(windowsList.scrollTop, 75);
+  assert.equal(within(linuxProject).queryByRole("link"), null);
+  assert.ok(within(linuxProject).getByRole("button", { name: "展开会话" }));
+  assert.deepEqual(filters, []);
+});
+
+test("navigation into a collapsed machine opens it while background metadata respects manual collapse", () => {
+  const threads = [
+    thread("Linux 当前会话"),
+    thread("Windows 目标会话", "windows"),
+  ];
+  const { rerender } = render(
+    <ProjectNavigation
+      {...defaults}
+      threads={threads}
+      currentThreadId="Linux 当前会话"
+    />,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "收起 Windows 节点 的会话" }),
+  );
+  const refreshedThreads = threads.map((value) => ({
+    ...value,
+    updated_at: "2026-10-23T12:00:00Z",
+  }));
+  rerender(
+    <ProjectNavigation
+      {...defaults}
+      threads={refreshedThreads}
+      currentThreadId="Linux 当前会话"
+    />,
+  );
+  assert.ok(screen.getByRole("button", { name: "展开 Windows 节点 的会话" }));
+  rerender(
+    <ProjectNavigation
+      {...defaults}
+      threads={refreshedThreads}
+      currentThreadId="Windows 目标会话"
+    />,
+  );
+  assert.ok(screen.getByRole("button", { name: "收起 Windows 节点 的会话" }));
+  assert.equal(
+    screen
+      .getByRole("link", { name: /Windows 目标会话/ })
+      .getAttribute("aria-current"),
+    "page",
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "收起 Windows 节点 的会话" }),
+  );
+  rerender(
+    <ProjectNavigation
+      {...defaults}
+      threads={refreshedThreads.map((value) => ({
+        ...value,
+        status: "active",
+      }))}
+      currentThreadId="Windows 目标会话"
+    />,
+  );
+  assert.ok(screen.getByRole("button", { name: "展开 Windows 节点 的会话" }));
 });
 
 test("project filters show only their node and retain project settings with legacy pagination", () => {

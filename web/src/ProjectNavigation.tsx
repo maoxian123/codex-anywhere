@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
@@ -243,6 +243,14 @@ export default function ProjectNavigation({
   const [localView, setLocalView] = useState<NavigationView>("all");
   const view = controlledView ?? localView;
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [collapsedHosts, setCollapsedHosts] = useState<Set<string>>(new Set());
+  const navigationId = useId();
+  const revealedThread = useRef<{ threadId: string; hostId: string } | null>(
+    null,
+  );
+  const currentThreadHostId = threads.find(
+    (thread) => thread.id === currentThreadId,
+  )?.host_id;
   const [menuThread, setMenuThread] = useState<string | null>(null);
   const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 });
   const [renameThread, setRenameThread] = useState<NavigationThread | null>(
@@ -250,6 +258,28 @@ export default function ProjectNavigation({
   );
   const [savingId, setSavingId] = useState<string | null>(null);
   const [updateError, setUpdateError] = useState("");
+  useEffect(() => {
+    if (!currentThreadId) {
+      revealedThread.current = null;
+      return;
+    }
+    if (!currentThreadHostId) return;
+    if (
+      revealedThread.current?.threadId === currentThreadId &&
+      revealedThread.current.hostId === currentThreadHostId
+    )
+      return;
+    revealedThread.current = {
+      threadId: currentThreadId,
+      hostId: currentThreadHostId,
+    };
+    setCollapsedHosts((previous) => {
+      if (!previous.has(currentThreadHostId)) return previous;
+      const next = new Set(previous);
+      next.delete(currentThreadHostId);
+      return next;
+    });
+  }, [currentThreadId, currentThreadHostId]);
   useEffect(() => {
     if (!menuThread) return;
     const close = (event: MouseEvent) => {
@@ -299,6 +329,15 @@ export default function ProjectNavigation({
       else next.add(key);
       return next;
     });
+  const toggleHost = (hostId: string) => {
+    setMenuThread(null);
+    setCollapsedHosts((previous) => {
+      const next = new Set(previous);
+      if (next.has(hostId)) next.delete(hostId);
+      else next.add(hostId);
+      return next;
+    });
+  };
   const selectedProject = projects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -433,36 +472,55 @@ export default function ProjectNavigation({
             ? hostPages[hostId] || { hasMore: false, loading: false }
             : { hasMore, loading: loadingMore };
           if (view !== "all" && !groups.length && !page.hasMore) return null;
+          const hostExpanded = !collapsedHosts.has(hostId);
+          const contentId = `${navigationId}-host-${encodeURIComponent(hostId)}`;
           return (
             <section
-              className="host-thread-group"
+              className={`host-thread-group${hostExpanded ? "" : " is-collapsed"}${!groups.length && !page.hasMore ? " is-empty" : ""}`}
               key={hostId}
               aria-label={`${hostName} 会话`}
               aria-busy={loading || page.loading}
             >
-              {(view === "all" || groups.length > 0) && (
-                <header className="host-thread-heading">
-                  <h3>
-                    <Monitor size={12} />
-                    <span title={hostName}>{hostName}</span>
-                  </h3>
-                  <i
-                    className={`mini-status ${host?.online ? "online" : ""}`}
-                    role="img"
-                    aria-label={host?.online ? "在线" : "离线"}
-                  />
-                  <span
-                    className="host-thread-count"
-                    title={`当前已加载 ${hostThreads.length} 个会话`}
-                  >
-                    {hostThreads.length}
-                  </span>
-                </header>
-              )}
+              <header className="host-thread-heading">
+                <button
+                  type="button"
+                  className="icon-button host-collapse-button"
+                  aria-label={`${hostExpanded ? "收起" : "展开"} ${hostName} 的会话`}
+                  aria-expanded={hostExpanded}
+                  aria-controls={contentId}
+                  title={`${hostExpanded ? "收起" : "展开"} ${hostName} 的会话`}
+                  onClick={() => toggleHost(hostId)}
+                >
+                  {hostExpanded ? (
+                    <ChevronDown size={15} />
+                  ) : (
+                    <ChevronRight size={15} />
+                  )}
+                </button>
+                <h3>
+                  <Monitor size={12} />
+                  <span title={hostName}>{hostName}</span>
+                </h3>
+                <i
+                  className={`mini-status ${host?.online ? "online" : ""}`}
+                  role="img"
+                  aria-label={host?.online ? "在线" : "离线"}
+                />
+                <span
+                  className="host-thread-count"
+                  title={`当前已加载 ${hostThreads.length} 个会话`}
+                >
+                  {hostThreads.length}
+                </span>
+              </header>
               <div
+                id={contentId}
                 className="host-thread-content"
                 role="region"
                 aria-label={`${hostName} 会话列表`}
+                hidden={!hostExpanded}
+                tabIndex={0}
+                onScroll={() => setMenuThread(null)}
               >
                 {groups.map((group) => {
                   const key = `${hostId}:${group.id}`;

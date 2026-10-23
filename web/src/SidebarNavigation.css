@@ -1,4 +1,4 @@
-/* A single scroll surface keeps projects and conversations in one flow. */
+/* Machines share the available height; each keeps an independent list. */
 .sidebar .unified-navigation {
   overflow: hidden;
   min-height: 0;
@@ -53,31 +53,79 @@
   overflow-wrap: anywhere;
 }
 .unified-navigation > .host-thread-groups {
-  display: block;
-  flex: 1;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  gap: 8px;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: thin;
-  padding-bottom: 18px;
+  padding-bottom: 4px;
 }
 .unified-navigation .host-thread-group {
-  display: block;
-  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 140px;
+  min-height: 140px;
   max-height: none;
-  overflow: visible;
+  overflow: hidden;
+  border: 1px solid #344a454f;
+  border-radius: 7px;
+  background: #14292236;
 }
 .unified-navigation .host-thread-group + .host-thread-group {
-  margin-top: 8px;
-  border-top: 0;
+  margin-top: 0;
   padding-top: 0;
 }
+.unified-navigation .host-thread-group.is-collapsed,
+.unified-navigation .host-thread-group.is-empty {
+  flex: 0 0 auto;
+  min-height: 0;
+}
 .unified-navigation .host-thread-content {
-  overflow: visible;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
+  padding: 2px 2px 5px;
+  scroll-padding-block: 6px;
+}
+.unified-navigation .host-thread-content[hidden] {
+  display: none;
+}
+.unified-navigation .host-thread-content:focus-visible {
+  outline: 1px solid #7da58c;
+  outline-offset: -2px;
+}
+.unified-navigation .host-thread-group.is-empty .host-thread-content {
+  flex: 0 0 auto;
+}
+.unified-navigation .host-thread-group.is-empty .sidebar-empty {
+  min-height: 0;
+  padding: 8px 10px;
+}
+.unified-navigation .host-thread-group.is-empty .sidebar-empty > svg {
+  display: none;
 }
 .unified-navigation .host-thread-heading {
-  min-height: 30px;
-  padding: 7px 9px 3px;
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: 3px 8px 3px 3px;
+  gap: 5px;
+  background: #223a2d66;
+  border-bottom: 1px solid #344a454f;
+}
+.unified-navigation .host-thread-group.is-collapsed .host-thread-heading {
+  border-bottom: 0;
+}
+.unified-navigation .host-collapse-button {
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  color: #92b29f;
 }
 .unified-navigation .host-thread-heading > h3,
 .unified-navigation .host-thread-count {
@@ -291,6 +339,24 @@
   min-height: 40px;
 }
 @media (max-width: 680px) {
+  .unified-navigation .host-thread-group {
+    flex-basis: 128px;
+    min-height: 128px;
+  }
+  .unified-navigation .host-thread-group.is-collapsed,
+  .unified-navigation .host-thread-group.is-empty {
+    flex-basis: auto;
+    min-height: 0;
+  }
+  .unified-navigation .host-thread-heading {
+    min-height: 46px;
+    padding-block: 0;
+  }
+  .unified-navigation .host-collapse-button {
+    flex-basis: 44px;
+    width: 44px;
+    height: 44px;
+  }
   .unified-navigation .navigation-views > button,
   .unified-navigation .navigation-scope > button,
   .unified-navigation .project-row,

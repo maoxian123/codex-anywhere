@@ -200,6 +200,27 @@ test("pinned conversations come first without mutating input and menu changes ar
   );
 });
 
+test("scrolling or collapsing a machine closes its conversation action portal", () => {
+  const { container } = render(
+    <ProjectNavigation
+      {...defaults}
+      threads={[thread("菜单任务")]}
+      onThreadUpdate={async () => {}}
+    />,
+  );
+  const list = screen.getByRole("region", { name: "工作电脑 会话列表" });
+  fireEvent.click(screen.getByLabelText("菜单任务 会话操作"));
+  assert.ok(screen.getByRole("button", { name: "置顶会话" }));
+  assert.equal(container.querySelector(".thread-menu-popover"), null);
+  fireEvent.scroll(list);
+  assert.equal(screen.queryByRole("button", { name: "置顶会话" }), null);
+  fireEvent.click(screen.getByLabelText("菜单任务 会话操作"));
+  assert.ok(screen.getByRole("button", { name: "置顶会话" }));
+  fireEvent.click(screen.getByRole("button", { name: "收起 工作电脑 的会话" }));
+  assert.equal(screen.queryByRole("button", { name: "置顶会话" }), null);
+  assert.equal(document.querySelector(".thread-menu-popover"), null);
+});
+
 test("rename failures keep the dialog and draft available for retry", async () => {
   let calls = 0;
   render(
@@ -319,7 +340,7 @@ for (const [view, status] of [
   });
 }
 
-test("zero-match views show one empty state while preserving pagination without empty device headings", () => {
+test("zero-match views keep one empty state and identify only machines with more pages", () => {
   const requested: string[] = [];
   const otherHost = { ...host, id: "other-node", name: "另一台电脑" };
   const { container, rerender } = render(
@@ -339,11 +360,9 @@ test("zero-match views show one empty state while preserving pagination without 
     screen.getByRole("status").textContent,
     "没有等待处理的会话当前已加载的会话中暂无匹配项，可继续加载更多。",
   );
-  assert.equal(
-    container.querySelectorAll(".machine-project-group, .host-thread-heading")
-      .length,
-    0,
-  );
+  assert.equal(container.querySelectorAll(".machine-project-group").length, 0);
+  assert.equal(container.querySelectorAll(".host-thread-heading").length, 1);
+  assert.ok(screen.getByRole("region", { name: "工作电脑 会话" }));
   assert.ok(!screen.queryByRole("region", { name: "另一台电脑 会话" }));
   fireEvent.click(
     screen.getByRole("button", { name: "加载 工作电脑 的更多会话" }),
