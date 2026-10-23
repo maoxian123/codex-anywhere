@@ -82,7 +82,9 @@ test("project collapse, filtering and scoped new conversations are independent a
     within(group).getByRole("button", { name: "在 当前项目 新建对话" }),
   );
   assert.deepEqual(created, [project.id]);
-  fireEvent.click(within(group).getByRole("button", { name: /^当前项目C:/ }));
+  fireEvent.click(
+    within(group).getByRole("button", { name: "当前项目 · C:\\work" }),
+  );
   assert.deepEqual(filters, [project.id]);
   rerender(<ProjectNavigation {...props} selectedProjectId={project.id} />);
   assert.ok(screen.getByText("正在筛选：当前项目"));
@@ -119,12 +121,129 @@ test("recent, active, waiting and archived views expose only matching conversati
   fireEvent.click(screen.getByRole("button", { name: "待处理" }));
   assert.equal(screen.getAllByRole("link").length, 1);
   assert.ok(screen.getByRole("link", { name: /需要审批/ }));
-  assert.ok(screen.getByText("等待你处理"));
+  assert.ok(
+    within(screen.getByRole("link", { name: /需要审批/ })).getByText("待处理"),
+  );
   fireEvent.click(screen.getByRole("button", { name: "已归档" }));
   assert.ok(screen.getByRole("link", { name: /已归档任务/ }));
   fireEvent.click(screen.getByRole("button", { name: "最近" }));
   assert.equal(screen.getAllByRole("link").length, 4);
   assert.deepEqual(views, ["active", "waiting", "archived", "all"]);
+});
+
+test("compact conversation rows show only titles and meaningful states while retaining full hover titles", () => {
+  const fullTitle = "修复跨机器对话历史中很长且需要完整查看的任务名称";
+  const states = [
+    ["等待审批的任务", "waiting", "待处理"],
+    ["执行中的任务", "active", "运行中"],
+    ["启动中的任务", "starting", "启动中"],
+    ["发生错误的任务", "error", "出错"],
+    ["失败的任务", "failed", "出错"],
+    ["停止的任务", "interrupted", "已停止"],
+    ["导入中的任务", "importing", "加载中"],
+  ] as const;
+  const navigated: string[] = [];
+  render(
+    <ProjectNavigation
+      {...defaults}
+      currentThreadId="原始任务名"
+      threads={[
+        thread("原始任务名", {
+          display_title: fullTitle,
+          last_activity_at: "2026-10-23T12:34:00Z",
+        }),
+        ...states.map(([title, status]) => thread(title, { status })),
+      ]}
+      onNavigate={(id) => navigated.push(id)}
+    />,
+  );
+  const idle = screen.getByRole("link", { name: fullTitle });
+  assert.equal(idle.textContent, fullTitle);
+  assert.ok(idle.getAttribute("title")?.includes(fullTitle));
+  assert.equal(idle.getAttribute("aria-current"), "page");
+  for (const [title, , label] of states) {
+    const row = screen.getByRole("link", { name: new RegExp(title) });
+    assert.ok(within(row).getByText(label));
+    assert.ok(row.getAttribute("title")?.includes(title));
+    assert.ok(row.getAttribute("title")?.includes(label));
+    assert.equal(row.querySelector(".thread-text")?.textContent, title);
+  }
+  for (const row of screen.getAllByRole("link")) {
+    assert.equal(row.querySelector("small, time"), null);
+    assert.equal(row.textContent?.includes("2026"), false);
+  }
+  fireEvent.click(idle);
+  assert.deepEqual(navigated, ["原始任务名"]);
+});
+
+test("compact project headings preserve full directory context without a visible path subtitle", () => {
+  const cwd = "C:\\work\\一个很长的完整项目目录\\codex-anywhere";
+  const filtered: (string | null)[] = [];
+  render(
+    <ProjectNavigation
+      {...defaults}
+      projects={[{ ...project, cwd }]}
+      threads={[thread("项目会话", { cwd })]}
+      onFilter={(id) => filtered.push(id)}
+    />,
+  );
+  const heading = screen.getByRole("button", {
+    name: `当前项目 · ${cwd}`,
+  });
+  assert.ok(heading.getAttribute("title")?.includes(cwd));
+  assert.equal(heading.querySelector("small"), null);
+  assert.equal(heading.textContent?.includes(cwd), false);
+  assert.ok(within(heading).getByText("当前项目"));
+  assert.ok(within(heading).getByText("2"));
+  fireEvent.click(heading);
+  assert.deepEqual(filtered, [project.id]);
+});
+
+test("empty project hints appear only when that project is selected", () => {
+  const emptyProjects = [
+    { ...project, id: "empty-one", name: "空项目一", thread_count: 0 },
+    {
+      ...project,
+      id: "empty-two",
+      name: "空项目二",
+      cwd: "C:\\empty-two",
+      thread_count: 0,
+    },
+  ];
+  const filtered: (string | null)[] = [];
+  const created: string[] = [];
+  const props = {
+    ...defaults,
+    projects: emptyProjects,
+    onFilter: (id: string | null) => filtered.push(id),
+    onNewConversation: (value: Project) => created.push(value.id),
+  };
+  const { rerender } = render(<ProjectNavigation {...props} />);
+  assert.equal(screen.queryByText("此项目还没有会话"), null);
+  for (const value of emptyProjects) {
+    const group = screen.getByRole("region", {
+      name: `${value.name} 项目会话`,
+    });
+    assert.ok(within(group).getByText("0"));
+    fireEvent.click(
+      within(group).getByRole("button", {
+        name: `${value.name} · ${value.cwd}`,
+      }),
+    );
+    fireEvent.click(
+      within(group).getByRole("button", {
+        name: `在 ${value.name} 新建对话`,
+      }),
+    );
+  }
+  assert.deepEqual(filtered, ["empty-one", "empty-two"]);
+  assert.deepEqual(created, ["empty-one", "empty-two"]);
+  rerender(<ProjectNavigation {...props} selectedProjectId="empty-two" />);
+  assert.equal(screen.getAllByText("此项目还没有会话").length, 1);
+  assert.equal(
+    screen.queryByRole("region", { name: "空项目一 项目会话" }),
+    null,
+  );
 });
 
 test("pinned conversations come first without mutating input and menu changes are persisted explicitly", async () => {

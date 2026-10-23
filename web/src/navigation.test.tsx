@@ -459,7 +459,7 @@ test("node lists contain project groups in supplied order, keep empty projects s
   assert.equal(within(second).queryByText("今天"), null);
   fireEvent.click(screen.getByRole("button", { name: /空项目/ }));
   assert.deepEqual(filtered, ["空项目"]);
-  assert.ok(screen.getByText("此项目还没有会话"));
+  assert.equal(screen.queryByText("此项目还没有会话"), null);
 });
 
 test("threads without project IDs match their node's directory or retain separate directory and unassigned groups", () => {

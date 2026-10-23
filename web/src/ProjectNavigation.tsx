@@ -5,8 +5,6 @@ import {
   ArchiveRestore,
   ChevronDown,
   ChevronRight,
-  CircleDot,
-  Clock3,
   Folder,
   Layers,
   MessageSquarePlus,
@@ -97,19 +95,13 @@ function matchesView(thread: NavigationThread, view: NavigationView) {
   return true;
 }
 function threadActivity(thread: NavigationThread) {
-  if (thread.status === "waiting") return "等待你处理";
+  if (thread.status === "waiting") return "待处理";
   if (thread.status === "active") return "运行中";
-  if (thread.status === "starting") return "正在启动";
-  if (thread.status === "error" || thread.status === "failed")
-    return "运行出错";
-  const date = new Date(thread.last_activity_at || thread.updated_at);
-  if (!Number.isFinite(date.getTime())) return "就绪";
-  return date.toLocaleString("zh-CN", {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  if (thread.status === "starting") return "启动中";
+  if (thread.status === "error" || thread.status === "failed") return "出错";
+  if (thread.status === "interrupted") return "已停止";
+  if (thread.status === "importing") return "加载中";
+  return "";
 }
 
 function RenameThreadDialog({
@@ -371,12 +363,12 @@ export default function ProjectNavigation({
       <div className="navigation-views" aria-label="会话视图">
         {(
           [
-            ["all", "最近", Clock3],
-            ["active", "运行中", CircleDot],
-            ["waiting", "待处理", CircleDot],
-            ["archived", "已归档", Archive],
+            ["all", "最近"],
+            ["active", "运行中"],
+            ["waiting", "待处理"],
+            ["archived", "已归档"],
           ] as const
-        ).map(([value, label, Icon]) => (
+        ).map(([value, label]) => (
           <button
             type="button"
             className={view === value ? "selected" : ""}
@@ -384,7 +376,6 @@ export default function ProjectNavigation({
             aria-pressed={view === value}
             onClick={() => changeView(value)}
           >
-            <Icon size={14} />
             {label}
           </button>
         ))}
@@ -553,6 +544,7 @@ export default function ProjectNavigation({
                         {group.project ? (
                           <button
                             title={`${group.cwd} · 点击筛选此项目`}
+                            aria-label={`${group.name} · ${group.cwd}`}
                             className={`project-row ${group.project.id === selectedProjectId ? "expanded" : ""}`}
                             aria-pressed={
                               group.project.id === selectedProjectId
@@ -568,7 +560,6 @@ export default function ProjectNavigation({
                             <Folder size={15} />
                             <span>
                               <strong>{group.name}</strong>
-                              <small>{group.cwd}</small>
                             </span>
                             <em
                               title={
@@ -593,7 +584,6 @@ export default function ProjectNavigation({
                             <Folder size={15} />
                             <span>
                               <strong>{group.name}</strong>
-                              {group.cwd && <small>{group.cwd}</small>}
                             </span>
                             <em>{group.threads.length}</em>
                           </div>
@@ -629,6 +619,7 @@ export default function ProjectNavigation({
                               <a
                                 href={`/tasks/${thread.id}`}
                                 className={`thread-row ${thread.id === currentThreadId ? "selected" : ""}`}
+                                title={`${threadLabel(thread)}${threadActivity(thread) ? ` · ${threadActivity(thread)}` : ""}`}
                                 aria-current={
                                   thread.id === currentThreadId
                                     ? "page"
@@ -641,22 +632,23 @@ export default function ProjectNavigation({
                               >
                                 <span
                                   className={`thread-dot status-${thread.status}`}
+                                  aria-hidden="true"
                                 />
                                 <span className="thread-text">
                                   <strong>{threadLabel(thread)}</strong>
-                                  <small>{threadActivity(thread)}</small>
                                 </span>
+                                {threadActivity(thread) && (
+                                  <span
+                                    className={`thread-state status-${thread.status}`}
+                                  >
+                                    {threadActivity(thread)}
+                                  </span>
+                                )}
                                 {thread.pinned && (
                                   <Pin
                                     className="thread-pin"
                                     size={12}
                                     aria-label="已置顶"
-                                  />
-                                )}
-                                {thread.status === "waiting" && (
-                                  <span
-                                    className="attention-dot"
-                                    title="等待处理"
                                   />
                                 )}
                               </a>
@@ -758,19 +750,20 @@ export default function ProjectNavigation({
                               )}
                             </div>
                           ))}
-                          {!group.threads.length && (
-                            <p className="project-conversation-empty">
-                              {loading || page.loading ? (
-                                <Spinner label="加载会话" />
-                              ) : view !== "all" ? (
-                                "当前视图没有会话"
-                              ) : group.project?.thread_count ? (
-                                "选择项目以加载会话"
-                              ) : (
-                                "此项目还没有会话"
-                              )}
-                            </p>
-                          )}
+                          {!group.threads.length &&
+                            group.project?.id === selectedProjectId && (
+                              <p className="project-conversation-empty">
+                                {loading || page.loading ? (
+                                  <Spinner label="加载会话" />
+                                ) : view !== "all" ? (
+                                  "当前视图没有会话"
+                                ) : group.project?.thread_count ? (
+                                  "选择项目以加载会话"
+                                ) : (
+                                  "此项目还没有会话"
+                                )}
+                              </p>
+                            )}
                         </div>
                       )}
                     </section>

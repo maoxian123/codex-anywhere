@@ -1,4 +1,21 @@
 /* Machines share the available height; each keeps an independent list. */
+.sidebar > .sidebar-toolbar {
+  min-height: 32px;
+}
+.sidebar .new-conversation-button {
+  min-height: 32px;
+  padding: 5px 9px;
+}
+.sidebar > .search-box {
+  min-height: 32px;
+  margin-top: 6px;
+}
+.sidebar > .search-box input {
+  padding-block: 5px;
+}
+.sidebar .project-navigation {
+  margin-top: 6px;
+}
 .sidebar .unified-navigation {
   overflow: hidden;
   min-height: 0;
@@ -10,21 +27,23 @@
 }
 .unified-navigation .navigation-views {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 3px;
-  padding: 2px 1px 9px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 2px;
+  padding: 1px 0 5px;
   border-bottom: 1px solid var(--border);
 }
 .navigation-views > button {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 36px;
-  padding: 7px 9px;
+  justify-content: center;
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 3px;
   border-radius: 6px;
   color: #91a8b0;
   font-size: 13px;
-  text-align: left;
+  text-align: center;
+  white-space: nowrap;
 }
 .navigation-views > button:hover,
 .navigation-views > button.selected {
@@ -32,20 +51,21 @@
   color: #c4dbcf;
 }
 .unified-navigation .navigation-scope {
-  padding-top: 6px;
+  min-height: 30px;
+  padding-top: 2px;
 }
 .unified-navigation .navigation-scope > .all-threads-button {
-  min-height: 38px;
-  padding: 8px;
+  min-height: 30px;
+  padding: 4px 7px;
   font-size: 13px;
 }
 .unified-navigation .navigation-scope > .icon-button {
-  width: 32px;
-  height: 36px;
+  width: 30px;
+  height: 30px;
 }
 .navigation-filter-note,
 .navigation-update-error {
-  padding: 3px 9px 8px;
+  padding: 2px 7px 5px;
   margin: 0;
   font-size: 12px;
   line-height: 1.6;
@@ -56,18 +76,18 @@
   display: flex;
   flex-direction: column;
   flex: 1 1 0;
-  gap: 8px;
+  gap: 4px;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: thin;
-  padding-bottom: 4px;
+  padding-bottom: 2px;
 }
 .unified-navigation .host-thread-group {
   display: flex;
   flex-direction: column;
-  flex: 1 0 140px;
-  min-height: 140px;
+  flex: 1 0 112px;
+  min-height: 112px;
   max-height: none;
   overflow: hidden;
   border: 1px solid #344a454f;
@@ -90,7 +110,7 @@
   overflow-x: hidden;
   overscroll-behavior-y: contain;
   scrollbar-width: thin;
-  padding: 2px 2px 5px;
+  padding: 1px 2px 3px;
   scroll-padding-block: 6px;
 }
 .unified-navigation .host-thread-content[hidden] {
@@ -112,9 +132,9 @@
 }
 .unified-navigation .host-thread-heading {
   flex: 0 0 auto;
-  min-height: 38px;
-  padding: 3px 8px 3px 3px;
-  gap: 5px;
+  min-height: 32px;
+  padding: 0 7px 0 2px;
+  gap: 4px;
   background: #223a2d66;
   border-bottom: 1px solid #344a454f;
 }
@@ -122,9 +142,9 @@
   border-bottom: 0;
 }
 .unified-navigation .host-collapse-button {
-  flex: 0 0 30px;
-  width: 30px;
-  height: 30px;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
   color: #92b29f;
 }
 .unified-navigation .host-thread-heading > h3,
@@ -132,31 +152,30 @@
   font-size: 11px;
 }
 .unified-navigation .machine-project-group {
-  margin: 0 0 5px;
+  margin: 0 0 2px;
 }
 .unified-navigation .project-row-with-settings {
   gap: 0;
+  flex-wrap: nowrap;
 }
 .unified-navigation .project-row,
 .unified-navigation .directory-group-heading {
-  min-height: 46px;
+  min-height: 30px;
   min-width: 0;
-  padding: 6px 4px;
-  gap: 6px;
+  padding: 3px 4px;
+  gap: 5px;
 }
 .unified-navigation .directory-group-heading {
   flex: 1;
+}
+.unified-navigation .project-row > svg:first-child {
+  flex: none;
+  transform: none;
 }
 .unified-navigation .project-row strong,
 .unified-navigation .directory-group-heading strong {
   font-size: 13px;
   font-weight: 500;
-}
-.unified-navigation .project-row small,
-.unified-navigation .directory-group-heading small {
-  font-size: 10px;
-  color: #76909c;
-  margin-top: 2px;
 }
 .unified-navigation .project-row em,
 .unified-navigation .directory-group-heading em {
@@ -165,7 +184,8 @@
 .unified-navigation .project-row-with-settings > .icon-button {
   flex: 0 0 28px;
   width: 28px;
-  height: 40px;
+  height: 30px;
+  min-height: 30px;
   color: #8fa99e;
 }
 .unified-navigation .project-row-with-settings > .project-collapse-button {
@@ -173,7 +193,8 @@
   width: 24px;
 }
 .unified-navigation .project-thread-list {
-  padding-left: 12px;
+  margin-left: 8px;
+  padding-left: 4px;
 }
 .thread-row-with-menu {
   position: relative;
@@ -183,20 +204,40 @@
 }
 .unified-navigation .project-thread-list .thread-row {
   flex: 1;
+  align-items: center;
   min-width: 0;
-  min-height: 50px;
-  padding: 7px 8px;
-  gap: 7px;
+  min-height: 32px;
+  margin-bottom: 0;
+  padding: 4px 7px;
+  gap: 6px;
+}
+.unified-navigation .thread-dot,
+.unified-navigation .attention-dot {
+  margin-top: 0;
 }
 .unified-navigation .thread-text strong {
   font-size: 13px;
   font-weight: 400;
 }
-.unified-navigation .thread-text small {
-  margin-top: 3px;
+.unified-navigation .thread-state {
+  flex: none;
   font-size: 11px;
-  line-height: 1.35;
-  color: #7f9b9e;
+  line-height: 1.3;
+  color: #9bb9a8;
+  white-space: nowrap;
+}
+.unified-navigation .thread-state.status-active,
+.unified-navigation .thread-state.status-starting,
+.unified-navigation .thread-state.status-importing {
+  color: #a2cebb;
+}
+.unified-navigation .thread-state.status-waiting {
+  color: #e4bf78;
+}
+.unified-navigation .thread-state.status-error,
+.unified-navigation .thread-state.status-failed,
+.unified-navigation .thread-state.status-interrupted {
+  color: #e5a5a0;
 }
 .thread-pin {
   flex: none;
@@ -211,7 +252,7 @@
   align-items: center;
   justify-content: center;
   height: 100%;
-  min-height: 44px;
+  min-height: 32px;
   cursor: pointer;
   list-style: none;
   color: #7f9c96;
@@ -224,6 +265,32 @@
 .thread-menu > summary:hover {
   color: #c4dbcf;
   background: #25392f;
+}
+.unified-navigation .thread-row:focus-visible,
+.unified-navigation .project-row:focus-visible,
+.unified-navigation .icon-button:focus-visible,
+.thread-menu > summary:focus-visible {
+  outline-offset: -2px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .thread-menu > summary,
+  .unified-navigation .project-new-button,
+  .unified-navigation .project-settings-button {
+    opacity: 0;
+  }
+  .thread-row-with-menu:hover .thread-menu > summary,
+  .thread-row-with-menu:focus-within .thread-menu > summary,
+  .thread-menu[open] > summary,
+  .unified-navigation .project-row-with-settings:hover .project-new-button,
+  .unified-navigation .project-row-with-settings:hover .project-settings-button,
+  .unified-navigation
+    .project-row-with-settings:focus-within
+    .project-new-button,
+  .unified-navigation
+    .project-row-with-settings:focus-within
+    .project-settings-button {
+    opacity: 1;
+  }
 }
 .thread-menu-popover {
   position: fixed;
@@ -262,10 +329,10 @@
   font-size: 12px;
 }
 .unified-navigation .project-conversation-empty {
-  padding: 8px 12px;
+  padding: 6px 8px;
 }
 .unified-navigation .sidebar-load-more {
-  min-height: 40px;
+  min-height: 32px;
 }
 .sidebar-rename-dialog form {
   display: flex;
@@ -284,7 +351,7 @@
   align-items: center;
   gap: 6px;
   flex: none;
-  padding: 10px 0;
+  padding: 5px 0;
   border-top: 1px solid var(--border);
 }
 .sidebar-footer-menu > .sidebar-menu {
@@ -292,10 +359,10 @@
   min-width: 0;
 }
 .sidebar-footer-menu .sidebar-menu > summary {
-  min-height: 42px;
+  min-height: 32px;
   justify-content: flex-start;
   gap: 8px;
-  padding: 9px;
+  padding: 5px 7px;
   font-size: 13px;
 }
 .sidebar-footer-menu .sidebar-menu > summary > small {
@@ -308,8 +375,8 @@
   align-items: center;
   justify-content: center;
   gap: 7px;
-  min-height: 42px;
-  padding: 9px;
+  min-height: 32px;
+  padding: 5px 7px;
   border-radius: 6px;
   font-size: 13px;
   color: #a8bcb2;
@@ -338,7 +405,21 @@
 .sidebar-footer-menu .sidebar-menu-popover > button {
   min-height: 40px;
 }
-@media (max-width: 680px) {
+@media (max-width: 680px), (pointer: coarse) {
+  .sidebar > .sidebar-toolbar,
+  .sidebar .new-conversation-button {
+    min-height: 44px;
+  }
+  .sidebar > .search-box {
+    min-height: 44px;
+  }
+  .sidebar > .search-box input {
+    padding-block: 10px;
+  }
+  .sidebar > .search-box .icon-button {
+    width: 44px;
+    height: 44px;
+  }
   .unified-navigation .host-thread-group {
     flex-basis: 128px;
     min-height: 128px;
@@ -362,6 +443,7 @@
   .unified-navigation .project-row,
   .unified-navigation .directory-group-heading,
   .unified-navigation .project-row-with-settings > .icon-button,
+  .unified-navigation .project-thread-list .thread-row,
   .thread-menu > summary,
   .thread-menu-popover > button,
   .sidebar-footer-menu .sidebar-menu > summary,
@@ -377,12 +459,9 @@
     flex-basis: 44px;
     width: 44px;
   }
-  .unified-navigation .project-row-with-settings {
-    flex-wrap: wrap;
-  }
   .unified-navigation .project-row,
   .unified-navigation .directory-group-heading {
-    min-width: 110px;
+    min-width: 0;
   }
   .unified-navigation .project-row-with-settings > .project-collapse-button {
     flex-basis: 44px;
