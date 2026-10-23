@@ -166,8 +166,23 @@ export type ThreadDetail = {
   thread: Thread;
   items: Item[];
   interactions: Interaction[];
+  message_queue?: MessageQueueState;
   has_more_items?: boolean;
   next_before_position?: number | null;
+};
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  assets: Asset[];
+  references: Reference[];
+  revision: number;
+  created_at: string;
+  updated_at: string;
+};
+export type MessageQueueState = {
+  messages: QueuedMessage[];
+  paused: boolean;
+  reason?: string;
 };
 export type Command = {
   id: string;

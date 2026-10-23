@@ -33,7 +33,11 @@ import {
   type HistoryCache,
 } from "./history";
 import { useAutomaticHistory } from "./useAutomaticHistory";
-import { waitForCommand, waitForHistoryPage } from "./commands";
+import {
+  RemoteCommandError,
+  waitForCommand,
+  waitForHistoryPage,
+} from "./commands";
 import { ProjectSettingsDialog } from "./ExecutionControls";
 import {
   applySettingsUpdate,
@@ -799,6 +803,10 @@ function Workspace({
       return;
     }
     const current = event.thread_id === selectedRef.current;
+    if (method === "anywhere/message_queue") {
+      if (current) scheduleRefresh();
+      return;
+    }
     if (
       method === "anywhere/catalog_sync" &&
       detail?.thread.native_id &&
@@ -1001,15 +1009,27 @@ function Workspace({
         `/threads/${id}/${steer ? "steer" : "messages"}`,
         payload,
       );
+      const queued = result.command.kind === "turn.queue";
+      if (queued) {
+        const failure =
+          result.command.status === "cancelled"
+            ? "排队消息已取消。草稿已保留，可重新发送。"
+            : commandFailure(result.command);
+        if (failure) throw new RemoteCommandError(failure, result.command);
+      }
       // The accepted user action moves the row now; command polling and
       // catalog snapshots can update its contents without changing its rank.
       if (thread?.id === id) markConversationActivity(thread);
-      if (ownershipEnabled) {
-        // A failed resume must leave the draft intact. Waiting ends when the
-        // start RPC is accepted, independently of the model's running turn.
-        await waitForCommand(result.command);
-        if (id === selectedRef.current) void ownership.check();
-      } else watchCommand(result.command, id);
+      // The hub owns queued message dispatch and terminal outcomes. Replayed
+      // queue commands must never enter the node command polling loop.
+      if (!queued) {
+        if (ownershipEnabled) {
+          // A failed resume must leave the draft intact. Waiting ends when the
+          // start RPC is accepted, independently of the model's running turn.
+          await waitForCommand(result.command);
+          if (id === selectedRef.current) void ownership.check();
+        } else watchCommand(result.command, id);
+      }
       if (id === selectedRef.current) setError("");
       scheduleRefresh();
     } catch (reason) {
@@ -1463,6 +1483,8 @@ function Workspace({
                   onSettingsChange={saveThreadSettings}
                   onProjectSettings={setSettingsProject}
                   onSend={sendMessage}
+                  queue={detail.message_queue}
+                  onQueueChange={() => refreshThread(detail.thread.id)}
                   onInterrupt={interrupt}
                   onNavigate={navigate}
                 />

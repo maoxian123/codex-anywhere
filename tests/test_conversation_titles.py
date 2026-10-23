@@ -194,7 +194,7 @@ def test_auto_title_preserves_custom_display_name(app, api, paired_host):
 
 
 @pytest.mark.parametrize(
-    "failure", ["empty", "missing_asset", "invalid_reference", "busy", "offline"]
+    "failure", ["empty", "missing_asset", "invalid_reference", "offline"]
 )
 def test_rejected_first_message_leaves_default_title_untouched(app, api, paired_host, failure):
     host = paired_host()
@@ -207,10 +207,6 @@ def test_rejected_first_message_leaves_default_title_untouched(app, api, paired_
         kwargs["asset_ids"] = ["missing-asset"]
     elif failure == "invalid_reference":
         kwargs["references"] = [{"kind": "web", "url": "javascript:invalid"}]
-    elif failure == "busy":
-        with app.app_context():
-            db.session.get(Thread, thread["id"]).status = "active"
-            db.session.commit()
     elif failure == "offline":
         app.extensions["broker"].detach(host["host"]["id"], host["socket"])
     response = message(api, thread, text, **kwargs)
@@ -218,6 +214,19 @@ def test_rejected_first_message_leaves_default_title_untouched(app, api, paired_
     assert state(api, thread)["title"] == "新对话"
     with app.app_context():
         assert Command.query.filter_by(thread_id=thread["id"], kind="turn.start").count() == 0
+
+
+@pytest.mark.parametrize("text", ["Name from queued message", "新对话"])
+def test_first_queued_message_names_unnamed_conversation_once(app, api, paired_host, text):
+    host = paired_host()
+    thread, _ = new_conversation(app, api, host)
+    native_event(app, host, thread, "turn/started", {"turn": {"id": "desktop-turn"}})
+    response = message(api, thread, text)
+    assert response.status_code == 202
+    assert response.get_json()["command"]["kind"] == "turn.queue"
+    assert state(api, thread)["title"] == text
+    assert message(api, thread, "Later queued message").status_code == 202
+    assert state(api, thread)["title"] == text
 
 
 def test_image_only_first_message_has_useful_title(app, api, paired_host):

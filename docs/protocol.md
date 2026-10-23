@@ -144,6 +144,51 @@ updating and restarting to enforce completion-based release; their running
 process cannot acquire it from a hub-only update. The browser explains when
 `completionIdleRelease` is missing.
 
+## Follow-up message queue
+
+The hub owns a durable FIFO queue per conversation. `POST /api/threads/<id>/messages`
+uses the existing text/assets/references/client-request-id contract. When a turn
+is active, waiting for approval, or already has pending follow-ups, it returns
+202 `{command}` with hub-only kind `turn.queue` and status `pending`. The browser
+clears the accepted draft without polling this unsent command. Explicit
+`POST /api/threads/<id>/steer` still supplements the current native turn immediately.
+Different conversations run independently.
+
+Queued commands preserve their prepared native input, attachment/reference
+snapshots and original idempotency signature. Retrying the original request cannot
+undo a later edit or cancellation. Queue records survive browser closure and hub
+restart; no new node capability or database migration is required.
+
+- Thread detail includes `message_queue:{messages,paused,reason?}`. Authenticated
+  `GET /api/threads/<id>/queue` returns that same queue object. Messages expose
+  `id,text,assets,references,revision,created_at,updated_at`, never native input
+  base64 or private journal fields.
+- `PATCH /api/threads/<id>/queue/<command_id>` accepts `{text,revision}`. Only
+  pending text is editable; attachments and references retain their snapshots.
+- `DELETE /api/threads/<id>/queue/<command_id>` accepts `{revision}` and returns
+  `{cancelled:true}`. The durable record becomes `cancelled` and is never sent.
+  A stale revision or an entry already dispatched returns 409.
+- `POST /api/threads/<id>/queue/resume` accepts `{}` and returns 202
+  `{command,queue}`. It explicitly acknowledges a paused queue and starts at most
+  its next entry when eligible. It never retries an earlier unknown command.
+- Durable `anywhere/message_queue` events carry `{queue}` for browser refresh.
+
+Dispatch requires a confirmed idle native turn, no current pending/answering
+approval, no unsettled turn-control command, and an online current runtime.
+Normal completion dispatches one next entry; native event/command processing and
+reconnection recover dispatch independently of any browser. Failure, interruption
+or uncertain execution pauses the remaining queue until explicit resume, even if
+later native activity changes the conversation's projected status. Offline,
+archived and unavailable-runtime states wait without fabricating completion.
+
+Before delivery, the same journal record becomes `turn.start` with status `queued`
+and the current runtime epoch. Desired thread settings are resolved at dispatch,
+with any explicit per-message override retained. Unsupported settings block
+dispatch rather than being silently dropped. The transaction commits before
+delivery through the existing broker. `turn.queue`/`pending` is never sent to a
+node or replayed as a native command, and unknown delivered outcomes retain the
+existing no-automatic-retry rule.
+
 ## Runtime settings, native pages and project inventory (v4)
 
 Hello capabilities are independent feature flags: `catalogSync`, `lazyHistory`, `runtimeSettings` and `projectInventory`. The hub sends new commands only to nodes advertising the corresponding feature. Catalog synchronization still requires explicit welcome negotiation. A welcome may contain `capabilities:{catalogSync:{recentLimit:50,intervalSeconds:60,includeProjects:true}}`; `includeProjects` is enabled only when the node advertised `projectInventory`. An older hub cannot accidentally enable background scans on a new node. Upgrade the hub, rebuilt browser and nodes together; transport `protocol:1` remains unchanged.

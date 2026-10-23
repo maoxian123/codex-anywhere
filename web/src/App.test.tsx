@@ -10,7 +10,14 @@ import {
   waitFor,
 } from "@testing-library/react";
 import App from "./App";
-import type { Host, HubEvent, Project, Thread, ThreadOwnership } from "./types";
+import type {
+  Host,
+  HubEvent,
+  MessageQueueState,
+  Project,
+  Thread,
+  ThreadOwnership,
+} from "./types";
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -391,6 +398,187 @@ test("managed conversations send normally without requesting presence before or 
   );
 });
 
+for (const withOwnership of [false, true]) {
+  test(`cancelled queue replays preserve the draft and allow an explicit new send without polling (ownership ${withOwnership})`, async () => {
+    const server = setup(
+      { status: "active", native_id: "native-t1", active_turn_id: "running" },
+      "/tasks/t1",
+      withOwnership ? ["threadOwnership", "completionIdleRelease"] : [],
+    );
+    const requestIds: string[] = [];
+    let polls = 0;
+    server.intercept((path, init) => {
+      if (path === "/api/threads/t1/ownership")
+        return response({
+          command: {
+            id: "ownership",
+            kind: "thread.ownership",
+            status: "completed",
+            result: {
+              state: "managed",
+              owners: [],
+              can_terminate: false,
+              owner_token: null,
+            },
+          },
+        });
+      if (path === "/api/threads/t1/messages") {
+        requestIds.push(
+          JSON.parse(String(init?.body)).client_request_id as string,
+        );
+        return response(
+          {
+            command: {
+              id: "replayed-queue",
+              kind: "turn.queue",
+              status: requestIds.length === 1 ? "cancelled" : "pending",
+            },
+          },
+          202,
+        );
+      }
+      if (path === "/api/commands/replayed-queue") {
+        polls++;
+        return response({
+          command: {
+            id: "replayed-queue",
+            kind: "turn.queue",
+            status: "cancelled",
+          },
+        });
+      }
+      return undefined;
+    });
+    const input = (await screen.findByRole("textbox", {
+      name: "排队消息",
+    })) as HTMLTextAreaElement;
+    fireEvent.change(input, {
+      target: { value: "preserve the cancelled draft" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "加入队列" }));
+    await screen.findByText("排队消息已取消。草稿已保留，可重新发送。");
+    assert.equal(input.value, "preserve the cancelled draft");
+    assert.equal(requestIds.length, 1);
+    assert.equal(polls, 0);
+    await waitFor(() => assert.equal(input.disabled, false));
+    fireEvent.click(screen.getByRole("button", { name: "加入队列" }));
+    await waitFor(() => assert.equal(input.value, ""));
+    assert.equal(requestIds.length, 2);
+    assert.notEqual(requestIds[0], requestIds[1]);
+    assert.equal(polls, 0);
+    assert.equal(server.thread.status, "active");
+    assert.equal(server.thread.active_turn_id, "running");
+  });
+
+  test(`pending queued sends clear the draft without polling and refresh across browser events (ownership ${withOwnership})`, async () => {
+    const server = setup(
+      { status: "active", native_id: "native-t1", active_turn_id: "running" },
+      "/tasks/t1",
+      withOwnership ? ["threadOwnership", "completionIdleRelease"] : [],
+    );
+    let queue: MessageQueueState = { messages: [], paused: false };
+    let polls = 0;
+    let steerRequests = 0;
+    const sent: Record<string, unknown>[] = [];
+    server.intercept((path, init) => {
+      if (path === "/api/threads/t1/ownership")
+        return response({
+          command: {
+            id: "ownership",
+            kind: "thread.ownership",
+            status: "completed",
+            result: {
+              state: "managed",
+              owners: [],
+              can_terminate: false,
+              owner_token: null,
+            },
+          },
+        });
+      if (path.startsWith("/api/threads/t1?"))
+        return response({
+          thread: server.thread,
+          items: [],
+          interactions: [],
+          message_queue: queue,
+        });
+      if (path === "/api/threads/t1/messages") {
+        const data = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        sent.push(data);
+        const id = `queued-${sent.length}`;
+        queue = {
+          messages: [
+            ...queue.messages,
+            {
+              id,
+              text: String(data.text),
+              assets: [],
+              references: [],
+              revision: 1,
+              created_at: "now",
+              updated_at: "now",
+            },
+          ],
+          paused: false,
+        };
+        return response(
+          { command: { id, kind: "turn.queue", status: "pending" } },
+          202,
+        );
+      }
+      if (path === "/api/threads/t1/steer") {
+        steerRequests++;
+        return response(
+          { command: { id: "steer", kind: "turn.steer", status: "completed" } },
+          202,
+        );
+      }
+      if (path.startsWith("/api/commands/queued-")) {
+        polls++;
+        return response({
+          command: { id: "queued-1", kind: "turn.queue", status: "pending" },
+        });
+      }
+      return undefined;
+    });
+    const input = (await screen.findByRole("textbox", {
+      name: "排队消息",
+    })) as HTMLTextAreaElement;
+    for (const text of ["first pending message", "second pending message"]) {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "加入队列" }));
+      await waitFor(() => assert.equal(input.value, ""));
+    }
+    await screen.findByText("second pending message");
+    assert.deepEqual(
+      sent.map((data) => data.text),
+      ["first pending message", "second pending message"],
+    );
+    assert.equal(polls, 0);
+    assert.equal(steerRequests, 0);
+    assert.equal(server.thread.status, "active");
+    assert.equal(server.thread.active_turn_id, "running");
+    queue = {
+      ...queue,
+      messages: [
+        {
+          ...queue.messages[1],
+          text: "updated from another browser",
+          revision: 2,
+        },
+      ],
+    };
+    server.event("anywhere/message_queue", { queue });
+    await screen.findByText("updated from another browser");
+    assert.ok(!screen.queryByText("first pending message"));
+    fireEvent.change(input, { target: { value: "adjust current execution" } });
+    fireEvent.click(screen.getByRole("button", { name: "立即补充" }));
+    await waitFor(() => assert.equal(steerRequests, 1));
+    assert.equal(sent.length, 2);
+    assert.equal(polls, 0);
+  });
+}
+
 test("switching from the conversation to settings never releases ownership or sends presence", async () => {
   const server = ownershipServer({
     state: "managed",
@@ -678,7 +866,7 @@ test("persisted thread error is visible on reload and clears with the next activ
       true,
     ),
   );
-  assert.ok(screen.getByRole("textbox", { name: "补充任务要求" }));
+  assert.ok(screen.getByRole("textbox", { name: "排队消息" }));
 });
 
 test("an expired session returns to login and the next login uses the refreshed CSRF token", async () => {

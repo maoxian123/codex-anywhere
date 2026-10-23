@@ -112,7 +112,7 @@ test("compact native items fetch full content only on an explicit click and keep
   }
 });
 
-test("idle sends start a turn, active sends steer, and interrupt uses its own action", async () => {
+test("idle sends start a turn, active sends queue by default, and explicit steering is separate", async () => {
   const calls: { payload: MessagePayload; steer: boolean }[] = [];
   let interruptions = 0;
   const props = {
@@ -138,12 +138,25 @@ test("idle sends start a turn, active sends steer, and interrupt uses its own ac
       {...props}
     />,
   );
-  fireEvent.change(screen.getByRole("textbox", { name: "补充任务要求" }), {
+  fireEvent.change(screen.getByRole("textbox", { name: "排队消息" }), {
     target: { value: "add a test" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "补充要求" }));
+  fireEvent.click(screen.getByRole("button", { name: "加入队列" }));
   await waitFor(() => assert.equal(calls.length, 2));
-  assert.equal(calls[1].steer, true);
+  assert.equal(calls[1].steer, false);
+  await waitFor(() =>
+    assert.equal(
+      (screen.getByRole("textbox", { name: "排队消息" }) as HTMLTextAreaElement)
+        .value,
+      "",
+    ),
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "排队消息" }), {
+    target: { value: "adjust the current task now" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "立即补充" }));
+  await waitFor(() => assert.equal(calls.length, 3));
+  assert.equal(calls[2].steer, true);
   fireEvent.click(screen.getByRole("button", { name: "中断当前执行" }));
   await waitFor(() => assert.equal(interruptions, 1));
 });
@@ -163,12 +176,17 @@ test("offline hosts preserve drafts and disable remote send and interruption", (
     />,
   );
   const input = screen.getByRole("textbox", {
-    name: "补充任务要求",
+    name: "排队消息",
   }) as HTMLTextAreaElement;
   fireEvent.change(input, { target: { value: "draft while offline" } });
   assert.equal(input.value, "draft while offline");
   assert.equal(
-    (screen.getByRole("button", { name: "补充要求" }) as HTMLButtonElement)
+    (screen.getByRole("button", { name: "加入队列" }) as HTMLButtonElement)
+      .disabled,
+    true,
+  );
+  assert.equal(
+    (screen.getByRole("button", { name: "立即补充" }) as HTMLButtonElement)
       .disabled,
     true,
   );

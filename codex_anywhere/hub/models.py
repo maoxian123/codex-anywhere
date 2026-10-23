@@ -215,7 +215,7 @@ def latest_thread_inputs():
     """Scan the command journal once for a list, rather than once per thread."""
     return (
         select(Command.thread_id, func.max(Command.created_at).label("created_at"))
-        .where(Command.kind.in_(["turn.start", "turn.steer"]))
+        .where(Command.kind.in_(["turn.start", "turn.steer", "turn.queue"]))
         .group_by(Command.thread_id)
         .subquery()
     )
@@ -223,7 +223,7 @@ def latest_thread_inputs():
 
 _latest_input_at = (
     select(func.max(Command.created_at))
-    .where(Command.thread_id == Thread.id, Command.kind.in_(["turn.start", "turn.steer"]))
+    .where(Command.thread_id == Thread.id, Command.kind.in_(["turn.start", "turn.steer", "turn.queue"]))
     .correlate_except(Command)
     .scalar_subquery()
 )

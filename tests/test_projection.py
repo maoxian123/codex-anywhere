@@ -1,10 +1,11 @@
 """Regressions for late results, concurrent approvals and visible user input."""
 
+import json
 from uuid import uuid4
 
 import pytest
 
-from codex_anywhere.hub.models import Command, db
+from codex_anywhere.hub.models import Command, Thread, db
 from codex_anywhere.hub.transport import handle_node_message
 
 
@@ -46,7 +47,27 @@ def test_old_same_runtime_command_result_cannot_replace_new_turn(
     old = start(api, thread, "First turn")
     event(app, host, thread, "turn/started", {"turn": {"id": "old"}})
     event(app, host, thread, "turn/completed", {"turn": {"id": "old", "status": "completed"}})
-    start(api, thread, "Second turn")
+    with app.app_context():
+        # The current API waits for the old start RPC before delivering another
+        # turn. Preserve coverage of legacy, already-delivered concurrent state.
+        previous = db.session.get(Command, old["id"])
+        db.session.add(
+            Command(
+                host_id=host["host"]["id"],
+                thread_id=thread["id"],
+                runtime_id=host["runtime_id"],
+                kind="turn.start",
+                status="sent",
+                payload={
+                    "native_thread_id": thread["native_id"],
+                    "input": [{"type": "text", "text": "Second turn"}],
+                },
+                created_at=previous.created_at + 0.001,
+            )
+        )
+        stored = db.session.get(Thread, thread["id"])
+        stored.status = "active"
+        db.session.commit()
     if new_started:
         event(app, host, thread, "turn/started", {"turn": {"id": "new"}})
     result = {"error": "Late rejection"} if failed else {"result": {"turn": {"id": "old"}}}
@@ -107,7 +128,14 @@ def test_retrying_error_does_not_unlock_a_second_turn(app, api, paired_host, cre
         f"/api/threads/{thread['id']}/messages",
         json=dict(text="Do not execute concurrently", client_request_id=uuid4().hex),
     )
-    assert blocked.status_code == 409
+    assert blocked.status_code == 202
+    queued = blocked.get_json()["command"]
+    assert queued["kind"] == "turn.queue"
+    assert queued["status"] == "pending"
+    assert not any(
+        frame.get("type") == "command" and frame["command"]["id"] == queued["id"]
+        for frame in map(json.loads, host["socket"].messages)
+    )
 
 
 def test_old_completion_cannot_clear_the_current_turn_failure(app, api, paired_host, create_thread):

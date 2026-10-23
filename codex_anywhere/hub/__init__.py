@@ -33,6 +33,15 @@ from .broker import Broker, install_full_writes
 from .execution import execution_settings, require_runtime_settings
 from .history import history_command_applied
 from .hosts import register_host_routes
+from .message_queue import (
+    cancel_queued,
+    dispatch_queue,
+    enqueue_prepared,
+    queue_state,
+    resume_queue,
+    should_enqueue,
+    update_queued,
+)
 from .models import (
     Asset,
     Command,
@@ -731,6 +740,8 @@ def create_app(test_config=None):
                 thread.settings_revision += 1
                 emit("anywhere/thread_settings", {"thread_id": thread.id}, thread.id, host.id)
                 db.session.commit()
+            dispatch_queue(app, thread_id=thread.id)
+            db.session.refresh(thread)
             return jsonify(thread=thread.as_dict())
 
     @app.post("/api/projects")
@@ -1025,6 +1036,7 @@ def create_app(test_config=None):
             thread=thread.as_dict(),
             items=displayed_items,
             interactions=[i.as_dict() for i in interactions],
+            message_queue=queue_state(thread),
             **page_info,
         )
 
@@ -1083,8 +1095,7 @@ def create_app(test_config=None):
                 return jsonify(error="节点当前离线"), 409
             if not thread.native_id:
                 return jsonify(error="任务尚未创建完成"), 409
-            if kind == "turn.start" and thread.status in {"active", "waiting"}:
-                return jsonify(error="任务正在运行，请补充要求或等待完成"), 409
+            should_queue = kind == "turn.start" and should_enqueue(thread, host)
             if kind == "turn.steer" and not thread.active_turn_id:
                 return jsonify(error="当前没有可补充要求的执行轮次"), 409
             assets = []
@@ -1127,24 +1138,29 @@ def create_app(test_config=None):
                     settings.update(overrides)
                 # Legacy model-only thread creation remains usable on old nodes.
                 if "runtimeSettings" in (host.capabilities or []):
+                    require_runtime_settings(host, settings)
                     payload.update(
                         execution_settings=settings, settings_revision=thread.settings_revision
                     )
                 elif overrides or set(settings) - {"model"}:
                     # A downgraded node must not ignore saved sandbox restrictions.
                     require_runtime_settings(host, settings)
-                for history_command in Command.query.filter_by(
-                    thread_id=thread.id, kind="thread.history"
-                ).filter(Command.status.in_(["queued", "sent", "running", "completed"])):
-                    if not history_command_applied(history_command):
-                        history_command.status = "failed"
-                        history_command.error = "会话已开始新轮次，此历史页未应用；请刷新历史"
+                if not should_queue:
+                    for history_command in Command.query.filter_by(
+                        thread_id=thread.id, kind="thread.history"
+                    ).filter(Command.status.in_(["queued", "sent", "running", "completed"])):
+                        if not history_command_applied(history_command):
+                            history_command.status = "failed"
+                            history_command.error = "会话已开始新轮次，此历史页未应用；请刷新历史"
             if kind == "turn.steer":
                 payload["expected_turn_id"] = thread.active_turn_id
             if (
                 kind == "turn.start"
                 and thread.title == "新对话"
-                and not Command.query.filter_by(thread_id=thread.id, kind="turn.start").first()
+                and not Command.query.filter(
+                    Command.thread_id == thread.id,
+                    Command.kind.in_(["turn.start", "turn.queue"]),
+                ).first()
             ):
                 creation = Command.query.filter_by(
                     thread_id=thread.id, kind="thread.start"
@@ -1156,6 +1172,15 @@ def create_app(test_config=None):
                     thread.title = " ".join(first_line.split())[:80] or (
                         "图片对话" if assets else "引用对话"
                     )
+            if should_queue:
+                if overrides is not None:
+                    payload["_queue_overrides"] = overrides
+                command = enqueue_prepared(host, thread, payload, key)
+                # The previous turn may have finished while this request was in
+                # flight. Its place in the queue remains stable either way.
+                dispatch_queue(app, host_id=host.id, thread_id=thread.id)
+                db.session.refresh(command)
+                return jsonify(command=command.as_dict()), 202
             thread.status = "active"
             thread.last_error = None
             command = _issue_command(host, thread, kind, payload, key)
@@ -1168,6 +1193,47 @@ def create_app(test_config=None):
     @app.post("/api/threads/<thread_id>/steer")
     def steer(thread_id):
         return send_message(thread_id, "turn.steer")
+
+    @app.get("/api/threads/<thread_id>/queue")
+    def queued_messages(thread_id):
+        with app.extensions["broker"].command_lock:
+            return jsonify(queue_state(_get_thread(thread_id)))
+
+    @app.patch("/api/threads/<thread_id>/queue/<command_id>")
+    @_command_locked
+    def edit_queued_message(thread_id, command_id):
+        data = _json()
+        if set(data) - {"text", "revision"}:
+            raise ValueError("排队消息只能修改文本")
+        thread = _get_thread(thread_id)
+        command = update_queued(
+            thread, _identifier(command_id, "command_id"), data.get("text"), data.get("revision")
+        )
+        message = next(item for item in queue_state(thread)["messages"] if item["id"] == command.id)
+        return jsonify(message=message)
+
+    @app.delete("/api/threads/<thread_id>/queue/<command_id>")
+    @_command_locked
+    def delete_queued_message(thread_id, command_id):
+        data = _json()
+        if set(data) - {"revision"}:
+            raise ValueError("取消排队消息的字段无效")
+        thread = _get_thread(thread_id)
+        cancel_queued(thread, _identifier(command_id, "command_id"), data.get("revision"))
+        return jsonify(cancelled=True)
+
+    @app.post("/api/threads/<thread_id>/queue/resume")
+    @_command_locked
+    def continue_queued_messages(thread_id):
+        if _json():
+            raise ValueError("继续队列不接受额外参数")
+        _get_thread(thread_id)
+        command = resume_queue(app, thread_id)
+        db.session.remove()
+        return jsonify(
+            command=command.as_dict() if command else None,
+            queue=queue_state(_get_thread(thread_id)),
+        ), 202
 
     @app.post("/api/threads/<thread_id>/interrupt")
     def interrupt(thread_id):

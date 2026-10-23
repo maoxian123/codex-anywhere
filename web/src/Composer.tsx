@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import {
   ArrowUp,
+  ListPlus,
   AtSign,
   ChevronLeft,
   FileCode2,
@@ -28,12 +29,14 @@ import type {
   Project,
   ExecutionSettings,
   MessagePayload,
+  MessageQueueState,
   Reference,
   Thread,
   ThreadDetail,
 } from "./types";
 import { fileName, safeLink } from "./utils";
 import { RemoteCommandError } from "./commands";
+import MessageQueue from "./MessageQueue";
 import {
   clearComposerDraft,
   emptyComposerDraft,
@@ -323,6 +326,8 @@ type ComposerProps = {
   draftScope?: string;
   hideSettings?: boolean;
   autoFocus?: boolean;
+  queue?: MessageQueueState;
+  onQueueChange?: () => void | Promise<void>;
 };
 
 export default function Composer(props: ComposerProps) {
@@ -347,6 +352,8 @@ function ComposerInput({
   draftScope = "",
   hideSettings = false,
   autoFocus = false,
+  queue,
+  onQueueChange,
 }: ComposerProps) {
   const [draft, setDraft] = useState(() =>
     readComposerDraft(thread.id, draftScope),
@@ -401,6 +408,7 @@ function ComposerInput({
     if (autoFocus && window.innerWidth > 680) textRef.current?.focus();
   }, [autoFocus]);
   const busy = ["active", "waiting"].includes(thread.status);
+  const queueing = busy || !!queue?.messages.length;
   const historyReady =
     thread.history_loaded !== false &&
     thread.status !== "importing" &&
@@ -485,7 +493,7 @@ function ComposerInput({
       if (inputRef.current) inputRef.current.value = "";
     }
   };
-  const send = async () => {
+  const send = async (steer = false) => {
     if (
       (!text.trim() && !assets.length && !references.length) ||
       sendingRef.current ||
@@ -522,7 +530,7 @@ function ComposerInput({
           ),
           client_request_id: requestId,
         },
-        busy,
+        steer,
       );
       // A send can finish after navigating away. Never erase a newer draft,
       // and never persist an unmounted component's old state during cleanup.
@@ -538,7 +546,7 @@ function ComposerInput({
     } catch (reason) {
       if (
         reason instanceof RemoteCommandError &&
-        ["failed", "error"].includes(reason.command.status)
+        ["failed", "error", "cancelled"].includes(reason.command.status)
       ) {
         if (
           JSON.stringify(readComposerDraft(thread.id, draftScope)) === sentDraft
@@ -592,6 +600,14 @@ function ComposerInput({
   };
   return (
     <div className="composer-area">
+      <MessageQueue
+        key={thread.id}
+        threadId={thread.id}
+        queue={queue}
+        hostOnline={hostOnline}
+        onChange={onQueueChange}
+        onNavigate={onNavigate}
+      />
       {error && (
         <div className="composer-error">
           <ErrorMessage>{error}</ErrorMessage>
@@ -748,11 +764,13 @@ function ComposerInput({
           placeholder={
             !historyReady
               ? "正在导入历史，完成后即可继续对话…"
-              : busy
-                ? "补充要求，帮助 Codex 调整当前任务…"
+              : queueing
+                ? queue?.paused
+                  ? "输入下一条消息，继续队列后依次执行…"
+                  : "输入下一条消息，当前任务完成后依次执行…"
                 : "描述你想完成的工作…"
           }
-          aria-label={busy ? "补充任务要求" : "发送消息给 Codex"}
+          aria-label={queueing ? "排队消息" : "发送消息给 Codex"}
           aria-autocomplete="list"
           aria-expanded={!!mention}
           aria-controls={mention ? suggestionsId : undefined}
@@ -762,7 +780,11 @@ function ComposerInput({
               : undefined
           }
           rows={1}
-          title="Enter 发送 · Shift+Enter 换行"
+          title={
+            queueing
+              ? "Enter 加入队列 · Shift+Enter 换行"
+              : "Enter 发送 · Shift+Enter 换行"
+          }
           disabled={sending}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
@@ -861,7 +883,6 @@ function ComposerInput({
             >
               <Globe size={18} />
             </button>
-            {busy && <span className="composer-mode">补充当前任务</span>}
           </div>
           <div className="composer-runtime-summary">
             {!hideSettings && (
@@ -927,6 +948,23 @@ function ComposerInput({
           <div className="composer-actions">
             {busy && (
               <button
+                className="composer-steer-button"
+                type="button"
+                title="立即交给正在运行的任务，不加入队列"
+                disabled={
+                  sending ||
+                  uploading ||
+                  settingsSaving ||
+                  !ready ||
+                  (!text.trim() && !assets.length && !references.length)
+                }
+                onClick={() => void send(true)}
+              >
+                立即补充
+              </button>
+            )}
+            {busy && (
+              <button
                 className="interrupt-button"
                 title="中断当前执行"
                 aria-label="中断当前执行"
@@ -948,8 +986,8 @@ function ComposerInput({
             )}
             <button
               className="send-button"
-              title={busy ? "补充要求" : "发送消息"}
-              aria-label={busy ? "补充要求" : "发送消息"}
+              title={queueing ? "加入队列" : "发送消息"}
+              aria-label={queueing ? "加入队列" : "发送消息"}
               disabled={
                 sending ||
                 uploading ||
@@ -961,6 +999,8 @@ function ComposerInput({
             >
               {sending ? (
                 <LoaderCircle className="spin" size={18} />
+              ) : queueing ? (
+                <ListPlus size={20} />
               ) : (
                 <ArrowUp size={20} />
               )}
@@ -986,7 +1026,7 @@ function ComposerInput({
           </span>
         )}
         <span className="composer-keyboard-hint">
-          Enter 发送 · Shift+Enter 换行
+          {queueing ? "Enter 加入队列" : "Enter 发送"} · Shift+Enter 换行
         </span>
       </div>
       {!ready && (

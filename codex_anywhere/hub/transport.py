@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import time
 
 from .execution import project_effective_settings
 from .history import project_history
+from .message_queue import CONTROL_KINDS, mark_queue_paused
 from .models import Asset, Command, Event, Host, Interaction, Item, Thread, db
 from .projects import ensure_project
 from .sync import CATALOG_INTERVAL, CATALOG_LIMIT, native_version, project_catalog
+
+log = logging.getLogger(__name__)
 
 
 def emit(method, params, thread_id=None, host_id=None):
@@ -354,6 +358,8 @@ def _project(thread, method, params, live=True):
         )
         for interaction in _open_interactions(thread):
             interaction.status = "expired"
+        if thread.status in {"error", "interrupted"}:
+            mark_queue_paused(thread)
     elif method == "serverRequest/resolved" and live:
         for interaction in _open_interactions(thread):
             if interaction.rpc_id == params.get("requestId"):
@@ -378,6 +384,7 @@ def _project(thread, method, params, live=True):
             return
         thread.status = "error"
         thread.last_error = _error_detail(params.get("error", params), "Codex 执行失败")
+        mark_queue_paused(thread)
 
 
 def handle_node_message(app, host_id, message, flush_outgoing=None, outgoing_socket=None):
@@ -403,6 +410,31 @@ def handle_node_message(app, host_id, message, flush_outgoing=None, outgoing_soc
                     return
                 emit("anywhere/host_online", {"host_id": host_id}, host_id=host_id)
                 db.session.commit()
+    # Only committed native state may release the next user message. This also
+    # recovers unsent follow-ups after reconnect without a browser being open.
+    # Streaming deltas cannot unblock a turn; avoid scanning other conversations
+    # for every output chunk. Heartbeats recover other deferred opportunities.
+    if message.get("type") not in {"hello", "ping", "command_result"}:
+        method = str(message.get("method", ""))
+        if message.get("type") != "event" or not (
+            method in {
+                "turn/completed",
+                "serverRequest/resolved",
+                "error",
+                "anywhere/runtime_stopped",
+                "anywhere/import_complete",
+                "anywhere/catalog_sync",
+            }
+            or method.startswith("anywhere/history_")
+        ):
+            return
+    try:
+        from .message_queue import dispatch_ready_queues
+
+        dispatch_ready_queues(app, host_id)
+    except Exception as exc:  # noqa: BLE001 - preserve the already committed frame and ACK
+        # SQL/transport exceptions can contain private input payloads.
+        log.error("Message queue dispatch deferred (%s)", type(exc).__name__)
 
 
 def _persist_node_message(app, host_id, message, defer_hello=False):
@@ -463,6 +495,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         thread.status = "interrupted"
                         thread.active_turn_id = None
                         thread.last_error = "节点运行进程已更换，执行结果未知；未自动重试"
+                        mark_queue_paused(thread)
             pending = Command.query.filter(
                 Command.host_id == host_id, Command.status.in_(["queued", "sent", "running"])
             ).all()
@@ -474,6 +507,8 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     affected = (
                         db.session.get(Thread, command.thread_id) if command.thread_id else None
                     )
+                    if affected and command.kind in CONTROL_KINDS:
+                        mark_queue_paused(affected, "上一条操作结果未知，请确认后继续队列")
                     if affected and command.kind in {
                         "thread.start",
                         "turn.start",
@@ -658,6 +693,13 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     command.thread_id,
                     host_id,
                 )
+                if (
+                    thread
+                    and project_result
+                    and command.kind in CONTROL_KINDS
+                    and command.status in {"failed", "unknown"}
+                ):
+                    mark_queue_paused(thread)
             db.session.commit()
             return
         if kind != "event":
@@ -741,5 +783,6 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     active.last_error = "Codex 进程已停止，当前执行已中断" + (
                         f"（退出码 {code}）" if code is not None else ""
                     )
+                    mark_queue_paused(active)
         db.session.commit()
         broker.send(host_id, {"type": "event_ack", "event_id": event_id})
