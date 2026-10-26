@@ -348,6 +348,12 @@ class WriterOwnership:
                     if descriptor_count > 32768 or time.monotonic() >= deadline:
                         return holders, False
                     try:
+                        # Unrelated fanotify/epoll fdinfo can be very large. Only
+                        # inspect lock metadata for this exact device and inode;
+                        # the subsequent lock record must still prove ownership.
+                        descriptor = (process_dir / "fd" / fdinfo.name).stat()
+                        if (descriptor.st_dev, descriptor.st_ino) != file_key:
+                            continue
                         with fdinfo.open() as stream:
                             contents = stream.read(65537)
                         if len(contents) > 65536:

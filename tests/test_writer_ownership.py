@@ -6,6 +6,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -306,27 +307,155 @@ def linux_proc(tmp_path, monkeypatch):
     return proc
 
 
-def test_linux_inherited_locked_descriptors_are_all_identified(writer, linux_proc):
+@pytest.fixture
+def linux_fd(linux_proc, monkeypatch):
+    """Model proc fd symlink identities without requiring Windows symlink privileges."""
+    identities = {}
+    original_stat = Path.stat
+
+    def descriptor_stat(path, *args, **kwargs):
+        if path in identities:
+            value = identities[path]
+            if isinstance(value, Exception):
+                raise value
+            return SimpleNamespace(st_dev=value[0], st_ino=value[1])
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", descriptor_stat)
+
+    def add(pid, descriptor, text, *, key=(2049, 9001), stat_error=None):
+        directory = linux_proc / str(pid)
+        (directory / "fdinfo").mkdir(parents=True, exist_ok=True)
+        (directory / "fd").mkdir(exist_ok=True)
+        fdinfo = directory / "fdinfo" / str(descriptor)
+        fdinfo.write_text(text)
+        identities[directory / "fd" / str(descriptor)] = stat_error or key
+        return fdinfo
+
+    return add
+
+
+def test_linux_inherited_locked_descriptors_are_all_identified(writer, linux_proc, linux_fd):
     line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
     (linux_proc / "locks").write_text(line)
     for pid in (101, 102):
-        fdinfo = linux_proc / str(pid) / "fdinfo"
-        fdinfo.mkdir(parents=True)
-        (fdinfo / "3").write_text(f"pos:\t0\nlock:\t{line}\n")
+        linux_fd(pid, 3, f"pos:\t0\nlock:\t{line}\n")
     # An unrelated descriptor for the same inode is not proof of ownership.
-    unowned = linux_proc / "103" / "fdinfo"
-    unowned.mkdir(parents=True)
-    (unowned / "3").write_text("pos:\t0\nino:\t9001\n")
+    linux_fd(103, 3, "pos:\t0\nino:\t9001\n")
     assert writer._linux_holders((2049, 9001)) == ({101, 102}, True)
 
 
-def test_linux_surviving_inherited_descriptor_can_outlive_original_pid(writer, linux_proc):
+def test_linux_surviving_inherited_descriptor_can_outlive_original_pid(writer, linux_proc, linux_fd):
     line = "7: FLOCK ADVISORY WRITE -1 08:01:9001 0 EOF"
     (linux_proc / "locks").write_text(line)
-    fdinfo = linux_proc / "102" / "fdinfo"
-    fdinfo.mkdir(parents=True)
-    (fdinfo / "3").write_text(f"lock:\t{line}\n")
+    linux_fd(102, 3, f"lock:\t{line}\n")
     assert writer._linux_holders((2049, 9001)) == ({102}, True)
+
+
+def test_linux_oversized_unrelated_fdinfo_is_never_read(
+    writer, linux_proc, linux_fd, monkeypatch
+):
+    line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
+    (linux_proc / "locks").write_text(line)
+    linux_fd(101, 3, f"lock:\t{line}\n")
+    unrelated = linux_fd(102, 4, "fanotify metadata\n" * 5000, key=(2049, 9002))
+    original_open = Path.open
+
+    def open_fdinfo(path, *args, **kwargs):
+        assert path != unrelated, "Unrelated fanotify descriptors must not be read"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_fdinfo)
+    assert writer._linux_holders((2049, 9001)) == ({101}, True)
+
+
+def test_linux_oversized_matching_fdinfo_is_bounded_and_incomplete(
+    writer, linux_proc, linux_fd, monkeypatch
+):
+    line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
+    (linux_proc / "locks").write_text(line)
+    target = linux_fd(101, 3, f"lock:\t{line}\n" + "x" * 70000)
+    original_open = Path.open
+    reads = []
+
+    class BoundedReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.stream.close()
+
+        def read(self, size=-1):
+            assert size == 65537
+            reads.append(size)
+            return self.stream.read(size)
+
+    def open_fdinfo(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return BoundedReader(stream) if path == target else stream
+
+    monkeypatch.setattr(Path, "open", open_fdinfo)
+    assert writer._linux_holders((2049, 9001)) == ({101}, False)
+    assert reads == [65537]
+
+
+def test_linux_disappearing_descriptor_does_not_invalidate_verified_holder(
+    writer, linux_proc, linux_fd, monkeypatch
+):
+    line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
+    (linux_proc / "locks").write_text(line)
+    linux_fd(101, 3, f"lock:\t{line}\n")
+    disappeared = linux_fd(102, 4, "closed", stat_error=FileNotFoundError())
+    original_open = Path.open
+
+    def open_fdinfo(path, *args, **kwargs):
+        assert path != disappeared, "A closed descriptor cannot supply lock metadata"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_fdinfo)
+    assert writer._linux_holders((2049, 9001)) == ({101}, True)
+
+
+@pytest.mark.parametrize("failure", ["stat", "fdinfo"])
+def test_linux_unverifiable_or_unreadable_matching_descriptor_is_incomplete(
+    writer, linux_proc, linux_fd, monkeypatch, failure
+):
+    line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
+    (linux_proc / "locks").write_text(line)
+    linux_fd(101, 3, f"lock:\t{line}\n")
+    inaccessible = linux_fd(
+        102, 4, f"lock:\t{line}\n", stat_error=PermissionError() if failure == "stat" else None
+    )
+    original_open = Path.open
+
+    def open_fdinfo(path, *args, **kwargs):
+        if path == inaccessible:
+            assert failure != "stat", "Unverifiable descriptors must not be opened"
+            raise PermissionError("Descriptor metadata cannot be read")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_fdinfo)
+    assert writer._linux_holders((2049, 9001)) == ({101}, False)
+
+
+def test_linux_same_inode_on_another_device_is_excluded(
+    writer, linux_proc, linux_fd, monkeypatch
+):
+    line = "7: FLOCK ADVISORY WRITE 101 08:01:9001 0 EOF"
+    (linux_proc / "locks").write_text(line)
+    linux_fd(101, 3, f"lock:\t{line}\n")
+    other_device = linux_fd(102, 4, f"lock:\t{line}\n", key=(2050, 9001))
+    original_open = Path.open
+
+    def open_fdinfo(path, *args, **kwargs):
+        assert path != other_device, "Inode alone does not identify the locked file"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_fdinfo)
+    assert writer._linux_holders((2049, 9001)) == ({101}, True)
 
 
 def test_linux_proc_scan_cutoff_cannot_authorize_termination(writer, linux_proc, monkeypatch):
