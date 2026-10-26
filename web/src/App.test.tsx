@@ -8,13 +8,16 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import App from "./App";
 import type {
   Host,
   HubEvent,
+  Interaction,
   MessageQueueState,
   Project,
+  PendingInteraction,
   Thread,
   ThreadOwnership,
 } from "./types";
@@ -124,6 +127,13 @@ function setup(
     else if (path === "/api/settings/hosts") result = { hosts: [] };
     else if (path === "/api/projects") result = { projects };
     else if (path === "/api/hosts") result = { hosts };
+    else if (path.startsWith("/api/interactions?"))
+      result = {
+        interactions: [],
+        total: 0,
+        has_more: false,
+        next_offset: null,
+      };
     else if (path.startsWith("/api/threads?")) {
       refreshes += 1;
       const query = new URLSearchParams(path.split("?")[1]);
@@ -183,6 +193,162 @@ function setup(
       act(() => FakeWebSocket.instances.at(-1)!.emit(event));
     },
   };
+}
+
+function questionServer(pathname = "/tasks/t1", linked = true) {
+  const server = setup({}, pathname);
+  let pending = false;
+  const answers: unknown[] = [];
+  const interaction: Interaction = {
+    id: "model-question",
+    thread_id: linked ? "not-in-loaded-list" : null,
+    method: "item/tool/requestUserInput",
+    status: "pending",
+    params: {
+      isBlocking: true,
+      questions: [
+        {
+          id: "choice",
+          header: "实施方案",
+          question: "请选择接下来的实施方案",
+          options: [
+            { label: "方案 A", description: "先修复当前问题" },
+            { label: "方案 B", description: "先调整整体结构" },
+          ],
+        },
+      ],
+    },
+  };
+  const summary: PendingInteraction = {
+    id: interaction.id,
+    thread_id: interaction.thread_id,
+    host_id: "h1",
+    thread_title: linked ? "列表外的会话" : "未关联会话",
+    host_name: "测试设备",
+    method: interaction.method,
+    created_at: "2026-10-26T00:00:00Z",
+    question_count: 1,
+    blocking: true,
+  };
+  server.intercept((path, init) => {
+    if (path.startsWith("/api/interactions?"))
+      return new Response(
+        JSON.stringify({
+          interactions: pending ? [summary] : [],
+          total: pending ? 1 : 0,
+          has_more: false,
+          next_offset: null,
+        }),
+      );
+    if (path === `/api/interactions/${interaction.id}`)
+      return new Response(JSON.stringify({ interaction }));
+    if (path === `/api/interactions/${interaction.id}/answer`) {
+      answers.push(JSON.parse(String(init?.body)));
+      pending = false;
+      interaction.status = "answering";
+      return new Response(
+        JSON.stringify({
+          command: {
+            id: "question-answer-command",
+            kind: "interaction.answer",
+            status: "completed",
+          },
+        }),
+        { status: 202 },
+      );
+    }
+    if (path === "/api/commands/question-answer-command")
+      return new Response(
+        JSON.stringify({
+          command: {
+            id: "question-answer-command",
+            kind: "interaction.answer",
+            status: "completed",
+          },
+        }),
+      );
+  });
+  return {
+    ...server,
+    answers,
+    interaction,
+    announce: () => {
+      pending = true;
+      server.event(
+        "anywhere/interaction",
+        { method: interaction.method },
+        interaction.thread_id || "",
+      );
+    },
+    resolve: () => {
+      pending = false;
+      interaction.status = "resolved";
+      server.event(
+        "serverRequest/resolved",
+        { requestId: "native-question" },
+        interaction.thread_id || "",
+      );
+    },
+  };
+}
+
+test("global model questions can be answered without changing conversations or clearing composer drafts", async () => {
+  const server = questionServer();
+  const composer = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  fireEvent.change(composer, { target: { value: "保留当前会话的草稿" } });
+  server.announce();
+  await waitFor(() => assert.match(document.title, /1.*待处理/));
+  const attention = screen.getByRole("button", { name: "待处理交互" });
+  assert.match(attention.textContent || "", /1/);
+  assert.equal(
+    screen.queryByRole("dialog"),
+    null,
+    "arrival must not steal focus with a modal",
+  );
+  fireEvent.click(attention);
+  const modal = screen.getByRole("dialog");
+  fireEvent.click(
+    await within(modal).findByRole("button", { name: /列表外的会话/ }),
+  );
+  const option = await within(modal).findByRole("radio", { name: /方案 B/ });
+  assert.equal(server.answers.length, 0);
+  fireEvent.click(option);
+  fireEvent.click(within(modal).getByRole("button", { name: "提交回答" }));
+  await waitFor(() =>
+    assert.deepEqual(server.answers, [
+      { response: { answers: { choice: { answers: ["方案 B"] } } } },
+    ]),
+  );
+  assert.equal(window.location.pathname, "/tasks/t1");
+  assert.equal((composer as HTMLTextAreaElement).value, "保留当前会话的草稿");
+  await waitFor(() => assert.doesNotMatch(document.title, /待处理/));
+});
+
+for (const pathname of ["/", "/settings"]) {
+  test(`unlinked native questions stay reachable from ${pathname}`, async () => {
+    const server = questionServer(pathname, false);
+    await screen.findByRole("button", { name: "待处理交互" });
+    server.announce();
+    await waitFor(() => assert.match(document.title, /1.*待处理/));
+    fireEvent.click(screen.getByRole("button", { name: "待处理交互" }));
+    const modal = screen.getByRole("dialog");
+    fireEvent.click(
+      await within(modal).findByRole("button", { name: /未关联会话/ }),
+    );
+    assert.ok(await within(modal).findByRole("radio", { name: /方案 A/ }));
+    assert.equal(
+      within(modal).queryByRole("button", { name: "打开会话" }),
+      null,
+    );
+    server.resolve();
+    await waitFor(() =>
+      assert.ok(within(modal).getByText("这条请求已处理或已过期。")),
+    );
+    await waitFor(() => assert.doesNotMatch(document.title, /待处理/));
+    assert.equal(window.location.pathname, pathname);
+  });
 }
 
 test("history failure exposes a button that explicitly retries native history", async () => {

@@ -17,6 +17,7 @@ import Composer from "./Composer";
 import NewConversation from "./NewConversation";
 import { Login, PairingDialog, useInitialSession } from "./Dialogs";
 import Interactions from "./Interactions";
+import InteractionAttention from "./InteractionAttention";
 import { ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
 import ProjectNavigation from "./ProjectNavigation";
@@ -155,6 +156,7 @@ function Workspace({
     "connecting" | "connected" | "reconnecting"
   >("connecting");
   const [online, setOnline] = useState(navigator.onLine);
+  const [attentionRefresh, setAttentionRefresh] = useState(0);
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
@@ -764,6 +766,19 @@ function Workspace({
 
   eventRef.current = (event) => {
     const method = event.method;
+    if (
+      [
+        "anywhere/interaction",
+        "serverRequest/resolved",
+        "turn/completed",
+        "anywhere/runtime_stopped",
+        "anywhere/host_online",
+        "anywhere/host_deleted",
+      ].includes(method) ||
+      (method === "anywhere/command_completed" &&
+        object(event.params.command).kind === "interaction.answer")
+    )
+      setAttentionRefresh((value) => value + 1);
     if (method === "anywhere/host_deleted") {
       const hostId = string(event.params.host_id);
       if (hostId) handleHostDeleted(hostId);
@@ -888,6 +903,7 @@ function Workspace({
             JSON.stringify({ type: "subscribe", after: lastCursor.current }),
           );
           setConnection("connected");
+          setAttentionRefresh((value) => value + 1);
           retryDelay = 800;
           void refreshList();
           void refreshThread();
@@ -1322,6 +1338,16 @@ function Workspace({
             </div>
           </div>
           <div className="topbar-right">
+            <InteractionAttention
+              refreshKey={attentionRefresh}
+              hosts={hosts}
+              onNavigate={navigate}
+              onCommand={(command) => {
+                watchCommand(command);
+                setAttentionRefresh((value) => value + 1);
+                scheduleRefresh();
+              }}
+            />
             {!route.settings &&
               !loadingThread &&
               detail?.thread.id === route.id &&
@@ -1461,9 +1487,16 @@ function Workspace({
             {detail && (
               <>
                 <Interactions
+                  key={`interactions:${detail.thread.id}`}
                   interactions={detail.interactions}
+                  hostOnline={!!selectedHost?.online}
+                  onResolved={() => {
+                    scheduleRefresh();
+                    setAttentionRefresh((value) => value + 1);
+                  }}
                   onCommand={(command) => {
                     watchCommand(command, detail.thread.id);
+                    setAttentionRefresh((value) => value + 1);
                     scheduleRefresh();
                   }}
                 />

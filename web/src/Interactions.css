@@ -1,0 +1,214 @@
+.interactions.interactions--questions {
+  --question-panel-height: min(52dvh, 560px);
+  max-height: var(--question-panel-height);
+}
+
+.interaction-attention-detail .interactions.interactions--questions {
+  --question-panel-height: min(64dvh, 640px);
+  max-height: var(--question-panel-height);
+  padding: 0;
+}
+
+.interactions .interaction-card--questions {
+  display: flex;
+  flex-direction: column;
+  border-color: #657b91;
+  background: #202b35;
+}
+
+.interaction-card--questions .interaction-heading {
+  flex-shrink: 0;
+  color: #c1d7eb;
+}
+
+.interaction-card--questions .interaction-heading p {
+  color: #a8bac9;
+  font-size: 12px;
+  max-height: 3em;
+  overflow: auto;
+}
+
+.interaction-card--questions .questions-form {
+  display: flex;
+  flex-direction: column;
+  margin-top: 12px;
+}
+
+.questions-scroll {
+  min-height: 112px;
+  max-height: max(112px, calc(var(--question-panel-height) - 210px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 1px 7px 1px 1px;
+}
+
+.questions-form .questions-scroll fieldset {
+  padding: 10px;
+  margin-bottom: 10px;
+  border: 1px solid #485969;
+  border-radius: 7px;
+  background: #17232d;
+}
+
+.questions-form .questions-scroll legend {
+  padding: 0 5px;
+  color: #dce8f1;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.question-number {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: #364a5b;
+  font-size: 11px;
+}
+
+.questions-form .questions-scroll fieldset > p {
+  color: #b7c8d4;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.questions-form .question-option {
+  align-items: flex-start;
+  min-height: 42px;
+  padding: 10px;
+  background: #21313e;
+  border-color: #465d70;
+  color: #d2e0eb;
+}
+
+.questions-form .question-option input {
+  flex: 0 0 15px;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+}
+
+.questions-form .question-option strong {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.questions-form .question-option small {
+  color: #b0c0ce;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.questions-form .question-option.selected {
+  background: #294637;
+  border-color: #92c7a5;
+  color: #e1f3e7;
+}
+
+.questions-form .question-option:focus-within {
+  outline: 2px solid #a0c1dd;
+  outline-offset: 2px;
+}
+
+.question-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  color: #b7c8d4;
+  font-size: 12px;
+}
+
+.questions-form .question-answer input {
+  min-height: 38px;
+  border-color: #516c81;
+  background: #14212b;
+  color: #e3edf5;
+}
+
+.questions-form .questions-scroll .question-invalid {
+  border-color: #df9b80;
+}
+
+.questions-form .questions-scroll .question-error {
+  color: #f3bda7;
+  margin: 9px 0 0;
+  font-size: 11px;
+}
+
+.questions-footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-top: 12px;
+  background: #202b35;
+}
+
+.questions-footer > .inline-error {
+  flex-basis: 100%;
+}
+
+.questions-submit-hint {
+  color: #a8bac9;
+  font-size: 11px;
+}
+
+.interaction-notice {
+  flex-shrink: 0;
+  color: #d8c193;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0;
+}
+
+.interaction-card--questions .raw-details {
+  flex-shrink: 0;
+  max-height: 70px;
+  overflow: auto;
+  margin-top: 12px;
+}
+
+@media (max-width: 640px) {
+  .questions-form .questions-scroll fieldset {
+    padding: 8px;
+  }
+
+  .questions-submit-hint {
+    flex-basis: 100%;
+  }
+}
+
+/* When the keyboard or a short screen reduces the available height, keep
+   all controls in one reachable outer scroll area instead of shrinking
+   the questions between fixed headings and actions. */
+@media (max-height: 680px) {
+  .interactions--questions .questions-scroll {
+    min-height: 0;
+    max-height: none;
+    overflow: visible;
+    padding-right: 1px;
+  }
+
+  .interactions--questions .questions-footer {
+    position: static;
+  }
+}
+
+@media (pointer: coarse), (max-width: 640px) {
+  .interactions .question-option,
+  .interactions .question-answer input,
+  .interactions .interaction-card button {
+    min-height: 44px;
+  }
+
+  .interactions .interaction-card button {
+    min-width: 44px;
+  }
+}

@@ -1,0 +1,164 @@
+.interaction-attention-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #9cadb8;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.interaction-attention-button:hover,
+.interaction-attention-button[aria-expanded="true"] {
+  background: #23333d;
+  color: #e0e9ef;
+}
+
+.interaction-attention-button.has-pending {
+  color: #f2ce83;
+  border-color: #665537;
+  background: #332d24;
+}
+
+.interaction-attention-button.has-error {
+  color: #efaaaa;
+  border-color: #754848;
+  background: #392727;
+}
+
+.interaction-attention-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #ecbf67;
+  color: #251e12;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.interaction-attention-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.interaction-attention-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 160px;
+}
+
+.interaction-attention-toolbar,
+.interaction-attention-context,
+.interaction-attention-notifications {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.interaction-attention-toolbar > span {
+  color: #9cadb8;
+  font-size: 12px;
+}
+
+.interaction-attention-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: min(460px, 48vh);
+  overflow-y: auto;
+}
+
+.interaction-attention-list li + li {
+  border-top: 1px solid #2b3943;
+}
+
+.interaction-attention-list li > button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  padding: 11px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #dce5eb;
+  text-align: left;
+  cursor: pointer;
+}
+
+.interaction-attention-list li > button:hover {
+  background: #23333d;
+}
+
+.interaction-attention-item-title {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.interaction-attention-item-meta,
+.interaction-attention-context small,
+.interaction-attention-notifications small,
+.interaction-attention-empty {
+  color: #9cadb8;
+  font-size: 12px;
+}
+
+.interaction-attention-context > div {
+  min-width: 0;
+}
+
+.interaction-attention-context strong,
+.interaction-attention-context small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.interaction-attention-context small {
+  margin-top: 4px;
+}
+
+.interaction-attention-context > button {
+  flex-shrink: 0;
+}
+
+.interaction-attention-detail .interactions {
+  margin-top: 12px;
+}
+
+.interaction-attention-notifications {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  padding-top: 14px;
+  border-top: 1px solid #2b3943;
+}
+
+@media (max-width: 600px), (pointer: coarse) {
+  .interaction-attention-button {
+    min-height: 44px;
+    min-width: 44px;
+    gap: 4px;
+    padding-inline: 6px;
+  }
+
+  .interaction-attention-context {
+    align-items: flex-start;
+  }
+}

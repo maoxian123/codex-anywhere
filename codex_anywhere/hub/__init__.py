@@ -66,6 +66,7 @@ from .projects import ensure_project
 from .references import quote_references, resolve_references
 from .settings import administrator_changes, administrator_credentials, public_settings
 from .transport import emit, handle_node_message
+from .user_input import pending_interactions, validate_user_input
 
 
 def token_hash(value):
@@ -1267,6 +1268,19 @@ def create_app(test_config=None):
             return jsonify(error="事件不存在"), 404
         return jsonify(event=event.as_dict())
 
+    @app.get("/api/interactions")
+    def interaction_list():
+        limit = _integer(request.args.get("limit", 50), "limit", 1, 200)
+        offset = _integer(request.args.get("offset", 0), "offset", 0, 10**9)
+        return jsonify(pending_interactions(limit, offset))
+
+    @app.get("/api/interactions/<interaction_id>")
+    def interaction_detail(interaction_id):
+        interaction = db.session.get(Interaction, _identifier(interaction_id, "interaction_id"))
+        if not interaction:
+            return jsonify(error="交互请求不存在"), 404
+        return jsonify(interaction=interaction.as_dict())
+
     @app.post("/api/interactions/<interaction_id>/answer")
     def answer(interaction_id):
         data = _json()
@@ -1274,11 +1288,16 @@ def create_app(test_config=None):
         if not isinstance(response, dict):
             raise ValueError("response 必须是 JSON 对象")
         with app.extensions["broker"].command_lock:
+            db.session.remove()
             interaction = db.session.get(Interaction, interaction_id)
             if not interaction:
                 return jsonify(error="交互请求不存在"), 404
             host = db.session.get(Host, interaction.host_id)
-            if interaction.status != "pending" or interaction.runtime_id != host.runtime_id:
+            if (
+                not host
+                or interaction.status != "pending"
+                or interaction.runtime_id != host.runtime_id
+            ):
                 return jsonify(error="该请求已处理或已过期"), 409
             if not app.extensions["broker"].is_online(host.id):
                 return jsonify(error="节点当前离线"), 409
@@ -1292,6 +1311,7 @@ def create_app(test_config=None):
                     available = ["accept", "acceptForSession", "decline", "cancel"]
                 if decision not in available:
                     raise ValueError("请选择该请求允许的审批选项")
+            validate_user_input(interaction, response)
             interaction.status = "answering"
             thread = (
                 db.session.get(Thread, interaction.thread_id) if interaction.thread_id else None

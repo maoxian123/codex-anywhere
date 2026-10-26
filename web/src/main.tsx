@@ -9,6 +9,8 @@ import "./Timeline.css";
 import "./Workspace.css";
 import "./SidebarNavigation.css";
 import "./Composer.css";
+import "./Interactions.css";
+import "./InteractionAttention.css";
 import "highlight.js/styles/github-dark-dimmed.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

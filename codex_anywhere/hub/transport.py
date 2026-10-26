@@ -14,6 +14,7 @@ from .message_queue import CONTROL_KINDS, mark_queue_paused
 from .models import Asset, Command, Event, Host, Interaction, Item, Thread, db
 from .projects import ensure_project
 from .sync import CATALOG_INTERVAL, CATALOG_LIMIT, native_version, project_catalog
+from .user_input import is_blocking
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def _open_interactions(thread):
 def _refresh_waiting(thread):
     if thread.status not in {"active", "waiting"}:
         return
-    if _open_interactions(thread).first():
+    if any(is_blocking(interaction) for interaction in _open_interactions(thread)):
         thread.status = "waiting"
     else:
         thread.status = "active" if thread.active_turn_id else "idle"
@@ -360,11 +361,6 @@ def _project(thread, method, params, live=True):
             interaction.status = "expired"
         if thread.status in {"error", "interrupted"}:
             mark_queue_paused(thread)
-    elif method == "serverRequest/resolved" and live:
-        for interaction in _open_interactions(thread):
-            if interaction.rpc_id == params.get("requestId"):
-                interaction.status = "resolved"
-        _refresh_waiting(thread)
     elif method == "anywhere/assets":
         item = Item.query.filter_by(
             thread_id=thread.id, native_id=str(params.get("itemId"))
@@ -744,6 +740,21 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
             project_directories(host, params)
         elif live and method == "anywhere/catalog_sync_error":
             host.sync_error = _error_detail(params.get("error"), "Automatic catalog sync failed")
+        if live and method == "serverRequest/resolved" and "requestId" in params:
+            affected_threads = set()
+            for interaction in Interaction.query.filter(
+                Interaction.host_id == host_id,
+                Interaction.runtime_id == epoch,
+                Interaction.status.in_(["pending", "answering"]),
+            ):
+                if interaction.rpc_id == params["requestId"]:
+                    interaction.status = "resolved"
+                    if interaction.thread_id:
+                        affected_threads.add(interaction.thread_id)
+            for affected_id in affected_threads:
+                affected = db.session.get(Thread, affected_id)
+                if affected:
+                    _refresh_waiting(affected)
         _project(thread, method, params, live=live)
         if "rpc_id" in message:
             interaction = Interaction(
@@ -766,7 +777,10 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
             db.session.add(interaction)
             if thread and interaction.status == "pending":
                 thread.active_turn_id = thread.active_turn_id or params.get("turnId")
-                thread.status = "waiting"
+                if is_blocking(interaction):
+                    thread.status = "waiting"
+                elif thread.status in {"active", "waiting"}:
+                    _refresh_waiting(thread)
             emit("anywhere/interaction", {"method": method}, thread.id if thread else None, host_id)
         if method == "anywhere/runtime_stopped" and live:
             for interaction in Interaction.query.filter(

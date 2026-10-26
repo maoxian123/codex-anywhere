@@ -157,10 +157,27 @@ export type DirectoryListing = {
 };
 export type Interaction = {
   id: string;
-  thread_id: string;
+  thread_id: string | null;
   method: string;
   params: JsonObject;
   status: string;
+};
+export type PendingInteraction = {
+  id: string;
+  thread_id: string | null;
+  host_id: string;
+  thread_title: string;
+  host_name: string;
+  method: string;
+  created_at: string;
+  question_count: number;
+  blocking: boolean;
+};
+export type InteractionPage = {
+  interactions: PendingInteraction[];
+  total: number;
+  has_more: boolean;
+  next_offset: number | null;
 };
 export type ThreadDetail = {
   thread: Thread;
