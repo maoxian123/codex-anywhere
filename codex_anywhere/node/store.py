@@ -34,6 +34,10 @@ class NodeStore:
             CREATE TABLE IF NOT EXISTS uploaded_assets (
                 cache_key TEXT PRIMARY KEY, asset TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS desktop_projects (
+                cwd_key TEXT PRIMARY KEY, cwd TEXT NOT NULL, name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', native_project TEXT, result TEXT
+            );
         """)
         self.db.commit()
 
@@ -43,6 +47,9 @@ class NodeStore:
     def recover_uncertain(self) -> None:
         rows = self.db.execute("SELECT id FROM commands WHERE status='started'").fetchall()
         with self.db:
+            # A project/create may have reached Codex. Only a new explicit
+            # registration may recover it; background work never retries it.
+            self.db.execute("UPDATE desktop_projects SET status='unknown' WHERE status='started'")
             for row in rows:
                 response = {
                     "type": "command_result",
@@ -145,6 +152,45 @@ class NodeStore:
     def save_thread(self, thread_id: str, cwd: str) -> None:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO threads(id,cwd) VALUES(?,?)", (thread_id, cwd))
+
+    def desktop_project(self, cwd_key: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM desktop_projects WHERE cwd_key=?", (cwd_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("native_project", "result"):
+            result[key] = json.loads(result[key]) if result[key] else None
+        return result
+
+    def queue_desktop_project(self, cwd_key: str, cwd: str, name: str) -> dict:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO desktop_projects(cwd_key,cwd,name) VALUES(?,?,?) "
+                "ON CONFLICT(cwd_key) DO UPDATE SET cwd=excluded.cwd,name=excluded.name,"
+                "status='pending',result=NULL",
+                (cwd_key, cwd, name),
+            )
+        return self.desktop_project(cwd_key)
+
+    def pending_desktop_projects(self, limit: int = 20) -> list[dict]:
+        keys = self.db.execute(
+            "SELECT cwd_key FROM desktop_projects WHERE status='pending' ORDER BY rowid LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self.desktop_project(row[0]) for row in keys]
+
+    def update_desktop_project(
+        self, cwd_key: str, status: str, *, native_project=None, result=None
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE desktop_projects SET status=?,native_project=COALESCE(?,native_project),"
+                "result=? WHERE cwd_key=?",
+                (status, json.dumps(native_project) if native_project is not None else None,
+                 json.dumps(result) if result is not None else None, cwd_key),
+            )
 
     def thread_cwd(self, thread_id: str) -> str | None:
         row = self.db.execute("SELECT cwd FROM threads WHERE id=?", (thread_id,)).fetchone()

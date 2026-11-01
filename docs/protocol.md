@@ -189,6 +189,53 @@ delivery through the existing broker. `turn.queue`/`pending` is never sent to a
 node or replayed as a native command, and unknown delivered outcomes retain the
 existing no-automatic-retry rule.
 
+## Desktop project registration
+
+Nodes advertise the independent `desktopProjects` capability. New explicit
+`project.open` commands automatically attempt registration in the desktop project
+list belonging to that node account and `CODEX_HOME`; historical inventory scans
+do not register projects. This never transfers directories between machines.
+An existing project can be registered explicitly with authenticated,
+CSRF-protected `POST /api/projects/<id>/desktop` `{}` -> 202 `{command}`.
+The hub derives the node, canonical cwd and name from the saved project, journals
+`project.desktop` before delivery and reuses only matching pending commands for
+the current runtime. Unsupported nodes require updating; failed and unknown
+commands are never automatically redelivered.
+
+`project.open` results retain `{project:Project}` and optionally add
+`desktop_registration:{status,reason?,refresh_required?}`. `project.desktop`
+returns `{cwd,desktop_registration}`. Status is `registered`, `already_registered`,
+`pending`, `unavailable` or `error`. A completed Anywhere project creation remains
+successful when desktop registration is unavailable or fails. Browser notices
+distinguish these outcomes and the project settings dialog provides explicit
+retry. Old node responses without registration remain compatible.
+
+Native registration uses experimental app-server `project/list` pages of 100
+(at most 100 pages) and `project/create` with a stable cwd-based idempotency key.
+Any matching root reuses the native project without renaming it or changing its
+other roots. No inference, new thread, deep link or approval/sandbox change occurs.
+
+Desktop versions currently using `local-projects` also cache their sidebar
+projection in `.codex-global-state.json`. The adapter recognizes only the known
+modern schema, preserves existing entries, unknown fields, active selection and
+native backups, and merges the native project's ID, name, roots and timestamps
+only while the same-account desktop is confirmed stopped. It rechecks process
+state and source contents before an atomic replacement, keeps a separate private
+backup, and verifies the result. Missing state is `unavailable/desktop_not_found`;
+it never fabricates a desktop installation or creates that state file on a
+headless server. Legacy-only and malformed schemas are reported explicitly.
+
+Running or unverifiable desktop processes defer the request to the node's
+durable SQLite queue. A node worker checks pending requests every five seconds,
+independently of browsers and the hub connection. Known native creation results
+are persisted before the sidebar merge, so restart or deferred completion cannot
+repeat project creation. In-flight requests become `unknown` on recovery and
+are never retried by the worker. Only a fresh explicit registration can recover
+them. `registered` means the sidebar entry was verified, not merely that the
+native create RPC succeeded. The browser explains when the desktop must be
+reopened to see the updated list. No hub database migration is required; the node
+adds its queue table automatically while retaining pairing and command journals.
+
 ## Runtime settings, native pages and project inventory (v4)
 
 Hello capabilities are independent feature flags: `catalogSync`, `lazyHistory`, `runtimeSettings` and `projectInventory`. The hub sends new commands only to nodes advertising the corresponding feature. Catalog synchronization still requires explicit welcome negotiation. A welcome may contain `capabilities:{catalogSync:{recentLimit:50,intervalSeconds:60,includeProjects:true}}`; `includeProjects` is enabled only when the node advertised `projectInventory`. An older hub cannot accidentally enable background scans on a new node. Upgrade the hub, rebuilt browser and nodes together; transport `protocol:1` remains unchanged.

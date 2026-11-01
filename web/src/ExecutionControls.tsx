@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { RefreshCw, Settings2 } from "lucide-react";
 import { api, errorText } from "./api";
 import { ErrorMessage, Modal, Spinner } from "./components";
+import { RemoteCommandError, remoteCommand } from "./commands";
+import { desktopRegistrationMessage } from "./Projects";
 import {
   availablePresets,
   availableServiceTiers,
@@ -18,6 +20,7 @@ import {
 import { useRuntimeCapabilities } from "./useRuntimeCapabilities";
 import type {
   ExecutionSettings,
+  DesktopRegistration,
   NativeExecutionSettings,
   Host,
   Project,
@@ -655,7 +658,38 @@ export function ProjectSettingsDialog({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const desktopRequest = useRef(false);
+  const [desktopBusy, setDesktopBusy] = useState(false);
+  const [desktopResult, setDesktopResult] = useState("");
+  const desktopSupported =
+    host?.id === project.host_id &&
+    host.capabilities?.includes("desktopProjects");
+  const syncDesktop = async () => {
+    if (!host?.online || !desktopSupported || busy || desktopRequest.current)
+      return;
+    desktopRequest.current = true;
+    setDesktopBusy(true);
+    setDesktopResult("");
+    try {
+      const result = await remoteCommand<{
+        cwd: string;
+        desktop_registration: DesktopRegistration;
+      }>(`/projects/${encodeURIComponent(project.id)}/desktop`, {});
+      setDesktopResult(desktopRegistrationMessage(result.desktop_registration));
+    } catch (reason) {
+      setDesktopResult(
+        reason instanceof RemoteCommandError &&
+          reason.command.status === "unknown"
+          ? "登记结果尚未确认，请重新检查后手动同步。"
+          : "同步暂未完成，请检查设备连接后手动重试。",
+      );
+    } finally {
+      desktopRequest.current = false;
+      setDesktopBusy(false);
+    }
+  };
   const save = async () => {
+    if (busy || desktopRequest.current) return;
     setBusy(true);
     setError("");
     try {
@@ -678,7 +712,10 @@ export function ProjectSettingsDialog({
     <Modal
       title="项目默认设置"
       subtitle={`${project.name} · ${project.cwd}`}
-      onClose={onClose}
+      preventClose={busy || desktopBusy}
+      onClose={() => {
+        if (!busy && !desktopRequest.current) onClose();
+      }}
     >
       <div className="form-stack">
         <p className="field-hint">
@@ -688,15 +725,47 @@ export function ProjectSettingsDialog({
           host={host}
           cwd={project.cwd}
           settings={settings}
-          disabled={busy}
+          disabled={busy || desktopBusy}
           onChange={setSettings}
         />
+        <section className="form-stack" aria-label="桌面版项目">
+          <p className="field-hint">
+            登记到{host?.name ? ` ${host.name} 的` : "此设备的"} Codex
+            项目列表，请在同一设备、同一 Codex 数据目录下查看。
+          </p>
+          <div>
+            <button
+              type="button"
+              className="button button-small"
+              disabled={
+                busy || desktopBusy || !host?.online || !desktopSupported
+              }
+              onClick={() => void syncDesktop()}
+            >
+              {desktopBusy ? (
+                <Spinner label="同步桌面项目中" />
+              ) : (
+                "同步到桌面版"
+              )}
+            </button>
+          </div>
+          {!desktopSupported ? (
+            <p className="field-hint">更新节点后支持同步到桌面版。</p>
+          ) : !host?.online ? (
+            <p className="field-hint">设备上线后可同步到桌面版。</p>
+          ) : null}
+          {desktopResult && (
+            <p role="status" className="field-hint">
+              {desktopResult}
+            </p>
+          )}
+        </section>
         {error && <ErrorMessage>{error}</ErrorMessage>}
         <div className="modal-actions">
           <button
             className="button button-quiet"
             onClick={onClose}
-            disabled={busy}
+            disabled={busy || desktopBusy}
           >
             取消
           </button>
@@ -705,6 +774,7 @@ export function ProjectSettingsDialog({
             onClick={() => void save()}
             disabled={
               busy ||
+              desktopBusy ||
               !host?.online ||
               !host.capabilities?.includes("runtimeSettings")
             }

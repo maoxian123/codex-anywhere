@@ -33,6 +33,7 @@ from .config import (
     validate_server,
     websocket_url,
 )
+from .desktop_projects import DesktopProjects
 from .directories import list_directories, open_project
 from .history import import_thread, list_threads, load_history_page
 from .ownership import WriterOwnership
@@ -106,6 +107,7 @@ class NodeService:
         self.codex_bin = codex_bin
         self.store = NodeStore(state_dir / "node.sqlite3")
         self.store.recover_uncertain()
+        self.desktop_projects = DesktopProjects(self.store)
         self.runtime: CodexRuntime | None = None
         self.ws = None
         self.send_lock = asyncio.Lock()
@@ -483,6 +485,7 @@ class NodeService:
                             "threadOwnership",
                             "completionIdleRelease",
                             "serviceTierWrite",
+                            "desktopProjects",
                         ],
                     }
                 )
@@ -609,6 +612,16 @@ class NodeService:
             except TimeoutError:
                 pass
 
+    async def _sync_desktop_projects(self) -> None:
+        while True:
+            runtime = self.runtime
+            if runtime and runtime.process and runtime.process.returncode is None:
+                try:
+                    await self.desktop_projects.flush(runtime)
+                except Exception:  # noqa: BLE001 - never log private desktop state
+                    log.warning("Deferred desktop registration could not complete")
+            await asyncio.sleep(5)
+
     async def handle_command(self, command: dict) -> dict | None:
         payload = command.get("payload", {})
         thread_id = payload.get("native_thread_id")
@@ -730,8 +743,21 @@ class NodeService:
         kind, payload = command["kind"], command.get("payload", {})
         if kind == "directory.list":
             return await asyncio.to_thread(list_directories, payload)
-        if kind == "project.open":
-            return await asyncio.to_thread(open_project, payload)
+        if kind in {"project.open", "project.desktop"}:
+            directory = payload if kind == "project.open" else {
+                "cwd": payload["cwd"], "name": payload.get("name"),
+            }
+            result = await asyncio.to_thread(open_project, directory)
+            try:
+                registration = await self.desktop_projects.register(
+                    self.runtime, result["cwd"], result["name"],
+                )
+            except Exception:  # noqa: BLE001 - project creation already succeeded
+                log.warning("Desktop registration could not be confirmed")
+                registration = {"status": "error", "reason": "registration_failed"}
+            if kind == "project.desktop":
+                return {"cwd": result["cwd"], "desktop_registration": registration}
+            return {**result, "desktop_registration": registration}
         runtime = self.runtime
         if not runtime or not runtime.process or runtime.process.returncode is not None:
             raise ValueError("Codex is restarting; submit a new command after it reconnects")
@@ -1011,6 +1037,7 @@ class NodeService:
                     asyncio.create_task(self._supervise()),
                     asyncio.create_task(self._assets(client)),
                     asyncio.create_task(self._sweep_threads()),
+                    asyncio.create_task(self._sync_desktop_projects()),
                 ]
                 await self._network()
         finally:

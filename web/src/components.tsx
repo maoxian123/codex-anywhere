@@ -38,12 +38,14 @@ export function Modal({
   children,
   onClose,
   wide = false,
+  preventClose = false,
 }: {
   title: string;
   subtitle?: string;
   children: ReactNode;
   onClose: () => void;
   wide?: boolean;
+  preventClose?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -76,8 +78,12 @@ export function Modal({
     <dialog
       ref={ref}
       className={`modal ${wide ? "modal-wide" : ""}`}
-      onCancel={onClose}
+      onCancel={(event) => {
+        if (preventClose) event.preventDefault();
+        else onClose();
+      }}
       onClick={(event) => {
+        if (preventClose) return;
         if (event.target === event.currentTarget) {
           const box = event.currentTarget.getBoundingClientRect();
           if (
@@ -95,7 +101,12 @@ export function Modal({
           <h2>{title}</h2>
           {subtitle && <p>{subtitle}</p>}
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="关闭窗口">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label="关闭窗口"
+          disabled={preventClose}
+        >
           <X size={19} />
         </button>
       </header>

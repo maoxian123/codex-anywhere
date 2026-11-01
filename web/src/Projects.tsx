@@ -11,7 +11,46 @@ import {
 import { errorText } from "./api";
 import { remoteCommand } from "./commands";
 import { ErrorMessage, Modal, Spinner } from "./components";
-import type { DirectoryListing, Host, Project } from "./types";
+import type {
+  DesktopRegistration,
+  DirectoryListing,
+  Host,
+  Project,
+} from "./types";
+
+export function desktopRegistrationMessage(registration?: DesktopRegistration) {
+  if (!registration) return "更新节点后支持同步到该设备的 Codex 项目列表。";
+  if (
+    registration.status === "registered" ||
+    registration.status === "already_registered"
+  )
+    return `已登记到该设备的 Codex 项目列表。${registration.refresh_required ? "桌面版尚未显示时，请重新打开桌面版。" : ""}`;
+  if (registration.status === "pending") {
+    if (registration.reason === "state_changed")
+      return "已排队，节点会在项目列表稳定后自动完成登记。";
+    return registration.reason === "desktop_state_unverified"
+      ? "已排队，节点确认桌面版退出后会自动完成登记，重新打开即可查看。"
+      : "桌面版正在运行，已排队；退出桌面版后节点会自动完成登记，重新打开即可查看。";
+  }
+  if (registration.reason === "outcome_unknown")
+    return "登记结果尚未确认，请重新检查后手动同步。";
+  if (registration.reason === "state_changed")
+    return "桌面项目列表已变化，本次同步未完成。请重新检查后手动同步。";
+  if (registration.reason === "state_invalid")
+    return "此设备的桌面项目列表暂不可用，请检查 Codex 桌面版后手动重试。";
+  if (registration.status === "unavailable") {
+    if (registration.reason === "desktop_not_found")
+      return "该设备未检测到桌面项目列表，项目仍可在 Anywhere 使用。";
+    if (registration.reason === "unsupported_state")
+      return "该设备的桌面版本暂不兼容，请更新 Codex 桌面版后重试。";
+    if (registration.reason === "native_unsupported")
+      return "此设备的 Codex 版本暂不支持项目同步，请更新 Codex 后重试。";
+    if (registration.reason === "runtime_unavailable")
+      return "此设备的 Codex 暂不可用，请稍后手动重试。";
+    return "此设备暂时无法同步 Codex 项目列表，可稍后手动重试。";
+  }
+  return "同步到桌面版失败，可在项目默认设置中手动重试。";
+}
 
 export function joinDirectory(path: string, name: string, platform: string) {
   if (!name.trim() || /[\\/]/.test(name) || [".", ".."].includes(name.trim()))
@@ -31,7 +70,7 @@ export function ProjectDialog({
 }: {
   hosts: Host[];
   onClose: () => void;
-  onCreated: (project: Project) => void;
+  onCreated: (project: Project, registration?: DesktopRegistration) => void;
 }) {
   const [hostId, setHostId] = useState(
     hosts.find((host) => host.online)?.id || "",
@@ -96,7 +135,10 @@ export function ProjectDialog({
     setError("");
     setLoading(false);
     try {
-      const result = await remoteCommand<{ project: Project }>(
+      const result = await remoteCommand<{
+        project: Project;
+        desktop_registration?: DesktopRegistration;
+      }>(
         "/projects",
         {
           host_id: hostId,
@@ -107,7 +149,7 @@ export function ProjectDialog({
         controller.signal,
       );
       if (!controller.signal.aborted && alive.current)
-        onCreated(result.project);
+        onCreated(result.project, result.desktop_registration);
     } catch (reason) {
       if (!controller.signal.aborted && alive.current)
         setError(errorText(reason));
@@ -307,6 +349,11 @@ export function ProjectDialog({
           />
           手动输入的目录不存在时，创建该目录
         </label>
+        <p className="field-hint">
+          {host?.capabilities?.includes("desktopProjects")
+            ? "同时登记到所选设备当前 Codex 数据目录的项目列表。"
+            : "更新节点后支持同步到所选设备的 Codex 项目列表。"}
+        </p>
         {!host?.online && <ErrorMessage>请选择一台在线设备。</ErrorMessage>}
         {error && <ErrorMessage>{error}</ErrorMessage>}
         <div className="modal-actions">

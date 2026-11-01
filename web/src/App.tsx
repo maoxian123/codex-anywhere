@@ -18,7 +18,7 @@ import NewConversation from "./NewConversation";
 import { Login, PairingDialog, useInitialSession } from "./Dialogs";
 import Interactions from "./Interactions";
 import InteractionAttention from "./InteractionAttention";
-import { ProjectDialog } from "./Projects";
+import { desktopRegistrationMessage, ProjectDialog } from "./Projects";
 import { ImportDialog } from "./Imports";
 import ProjectNavigation from "./ProjectNavigation";
 import SidebarMenu from "./SidebarMenu";
@@ -147,6 +147,7 @@ function Workspace({
     null,
   );
   const [error, setError] = useState("");
+  const [projectNotice, setProjectNotice] = useState("");
   const [networkError, setNetworkError] = useState("");
   const [threadError, setThreadError] = useState("");
   const [historyError, setHistoryError] = useState("");
@@ -1415,6 +1416,20 @@ function Workspace({
             </button>
           </div>
         )}
+        {projectNotice && (
+          <div className="offline-banner" role="status">
+            <Folder size={15} aria-hidden="true" />
+            <span>{projectNotice}</span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="关闭项目提示"
+              onClick={() => setProjectNotice("")}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        )}
         {!online && (
           <div className="offline-banner">
             <WifiOff size={14} />
@@ -1575,8 +1590,11 @@ function Workspace({
         <ProjectDialog
           hosts={hosts}
           onClose={() => setDialog(null)}
-          onCreated={(project) => {
+          onCreated={(project, registration) => {
             if (removedHosts.current.has(project.host_id)) return;
+            setProjectNotice(
+              `项目「${project.name}」已创建。${desktopRegistrationMessage(registration)}`,
+            );
             setProjects((current) => [
               project,
               ...current.filter((value) => value.id !== project.id),

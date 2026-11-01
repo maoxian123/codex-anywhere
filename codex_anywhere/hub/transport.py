@@ -25,6 +25,24 @@ def emit(method, params, thread_id=None, host_id=None):
     return event
 
 
+def _desktop_registration(value):
+    """Expose the small desktop registration contract, not native diagnostics."""
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("status"), str)
+        or value["status"] not in {
+            "registered", "already_registered", "pending", "unavailable", "error"
+        }
+    ):
+        return None
+    result = {"status": value["status"]}
+    if isinstance(value.get("reason"), str):
+        result["reason"] = value["reason"][:8000]
+    if isinstance(value.get("refresh_required"), bool):
+        result["refresh_required"] = value["refresh_required"]
+    return result
+
+
 def _error_detail(value, fallback):
     """Keep native human-readable diagnostics available after a page reload."""
     if isinstance(value, str):
@@ -601,6 +619,19 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                     else:
                         project = ensure_project(host, cwd, directory.get("name"))
                         command.result = {"project": project.as_dict()}
+                        registration = _desktop_registration(result.get("desktop_registration"))
+                        if registration is not None:
+                            command.result["desktop_registration"] = registration
+                if command.status == "completed" and command.kind == "project.desktop":
+                    result = command.result if isinstance(command.result, dict) else {}
+                    cwd = result.get("cwd")
+                    if not isinstance(cwd, str) or not cwd:
+                        command.status, command.error = "failed", "节点未返回项目目录"
+                    else:
+                        command.result = {"cwd": cwd}
+                        registration = _desktop_registration(result.get("desktop_registration"))
+                        if registration is not None:
+                            command.result["desktop_registration"] = registration
                 if (
                     command.status == "completed"
                     and command.kind == "runtime.capabilities"

@@ -1096,7 +1096,8 @@ def test_node_cli_has_no_project_or_artifact_allowlist_options():
     assert "--asset-root" not in run_help.output
 
 
-def test_directory_browsing_and_explicit_project_creation_use_any_absolute_path(tmp_path):
+def test_directory_browsing_and_explicit_project_creation_use_any_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "isolated-codex-home"))
     async def scenario():
         service = NodeService(
             {"server": "http://localhost:9876", "host_id": "test", "token": "test"},
@@ -1127,7 +1128,10 @@ def test_directory_browsing_and_explicit_project_creation_use_any_absolute_path(
                     "payload": {"cwd": str(path), "name": "Example", "create_directory": True},
                 }
             )
-            assert opened["result"] == {"cwd": str(path), "name": "Example"} and path.is_dir()
+            assert opened["result"] == {
+                "cwd": str(path), "name": "Example",
+                "desktop_registration": {"status": "unavailable", "reason": "desktop_not_found"},
+            } and path.is_dir()
             relative = await service.handle_command(
                 {
                     "id": "relative",

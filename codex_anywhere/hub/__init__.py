@@ -763,6 +763,29 @@ def create_app(test_config=None):
             payload["name"] = data["name"].strip()
         return jsonify(command=_issue_command(host, None, "project.open", payload)), 202
 
+    @app.post("/api/projects/<project_id>/desktop")
+    @_command_locked
+    def register_desktop_project(project_id):
+        if _json():
+            raise ValueError("桌面项目登记不接受额外参数")
+        project = db.session.get(Project, _identifier(project_id, "project_id"))
+        if not project:
+            return jsonify(error="项目不存在"), 404
+        host = _online_host(project.host_id)
+        if "desktopProjects" not in (host.capabilities or []):
+            return jsonify(error="节点暂不支持桌面项目登记，请先更新节点"), 409
+        payload = dict(cwd=project.cwd, name=project.name)
+        pending = Command.query.filter(
+            Command.host_id == host.id,
+            Command.kind == "project.desktop",
+            Command.runtime_id == host.runtime_id,
+            Command.status.in_(["queued", "sent", "running"]),
+        ).order_by(Command.created_at, Command.id)
+        for command in pending:
+            if command.payload == payload:
+                return jsonify(command=command.as_dict()), 202
+        return jsonify(command=_issue_command(host, None, "project.desktop", payload)), 202
+
     @app.post("/api/hosts/<host_id>/directories")
     @_command_locked
     def directories(host_id):

@@ -9,7 +9,9 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { ProjectDialog } from "./Projects";
+import { desktopRegistrationMessage, ProjectDialog } from "./Projects";
+import { ProjectSettingsDialog } from "./ExecutionControls";
+import { Modal } from "./components";
 import { ImportDialog } from "./Imports";
 import { NewTaskDialog } from "./Dialogs";
 import ProjectNavigation from "./ProjectNavigation";
@@ -20,7 +22,7 @@ import {
   threadActivityLabel,
   threadActivityTime,
 } from "./sidebar-activity";
-import type { Host, Project, Thread } from "./types";
+import type { DesktopRegistration, Host, Project, Thread } from "./types";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -268,6 +270,312 @@ test("remote directory picker browses the selected node and creates a folder pro
       create_directory: true,
     },
   );
+});
+
+test("desktop registration messages describe outcomes without exposing node state details", () => {
+  assert.equal(
+    desktopRegistrationMessage({ status: "pending", reason: "state_changed" }),
+    "已排队，节点会在项目列表稳定后自动完成登记。",
+  );
+  assert.equal(
+    desktopRegistrationMessage({
+      status: "unavailable",
+      reason: "desktop_not_found",
+    }),
+    "该设备未检测到桌面项目列表，项目仍可在 Anywhere 使用。",
+  );
+  assert.equal(
+    desktopRegistrationMessage({
+      status: "unavailable",
+      reason: "unsupported_state",
+    }),
+    "该设备的桌面版本暂不兼容，请更新 Codex 桌面版后重试。",
+  );
+  assert.match(
+    desktopRegistrationMessage({
+      status: "registered",
+      refresh_required: true,
+    }),
+    /该设备的 Codex 项目列表.*重新打开桌面版/,
+  );
+  assert.match(
+    desktopRegistrationMessage({ status: "already_registered" }),
+    /已登记到该设备/,
+  );
+  assert.match(
+    desktopRegistrationMessage({ status: "pending" }),
+    /桌面版正在运行.*已排队.*退出桌面版后节点会自动完成登记/,
+  );
+  assert.match(
+    desktopRegistrationMessage({
+      status: "pending",
+      reason: "desktop_state_unverified",
+    }),
+    /已排队.*确认桌面版退出后.*自动完成登记/,
+  );
+  assert.match(
+    desktopRegistrationMessage({ status: "error", reason: "state_changed" }),
+    /项目列表已变化.*手动同步/,
+  );
+  assert.match(
+    desktopRegistrationMessage({ status: "error", reason: "state_invalid" }),
+    /项目列表暂不可用.*手动重试/,
+  );
+  assert.match(
+    desktopRegistrationMessage({ status: "error", reason: "outcome_unknown" }),
+    /尚未确认.*手动同步/,
+  );
+  assert.match(
+    desktopRegistrationMessage({
+      status: "unavailable",
+      reason: "native_unsupported",
+    }),
+    /更新 Codex/,
+  );
+  assert.match(
+    desktopRegistrationMessage({
+      status: "unavailable",
+      reason: "runtime_unavailable",
+    }),
+    /暂不可用.*手动重试/,
+  );
+  assert.match(desktopRegistrationMessage(), /更新节点/);
+  for (const status of ["error", "unavailable"] as const) {
+    const message = desktopRegistrationMessage({
+      status,
+      reason: "state_write_failed: C:/private/node/state.json",
+    });
+    assert.doesNotMatch(message, /state_write_failed|private|state\.json/);
+  }
+});
+
+for (const registration of [
+  { status: "registered", refresh_required: true },
+  { status: "already_registered" },
+  { status: "pending" },
+  { status: "unavailable", reason: "native_unsupported" },
+  { status: "error", reason: "private_failure" },
+  undefined,
+] satisfies (DesktopRegistration | undefined)[]) {
+  test(`project creation forwards ${registration?.status || "legacy node"} registration without failing project creation`, async () => {
+    let created:
+      { value: Project; registration?: DesktopRegistration } | undefined;
+    let creates = 0;
+    globalThis.fetch = async (input) => {
+      if (String(input) === "/api/hosts/h1/directories")
+        return command(listing());
+      assert.equal(String(input), "/api/projects");
+      creates++;
+      return command({
+        project,
+        ...(registration ? { desktop_registration: registration } : {}),
+      });
+    };
+    render(
+      <ProjectDialog
+        hosts={[{ ...hosts[0], capabilities: ["desktopProjects"] }]}
+        onClose={() => {}}
+        onCreated={(value, result) => {
+          created = { value, registration: result };
+        }}
+      />,
+    );
+    await screen.findByRole("button", { name: "existing" });
+    fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
+    await waitFor(() => assert.ok(created));
+    assert.equal(created!.value.id, project.id);
+    assert.deepEqual(created!.registration, registration);
+    assert.equal(screen.queryByRole("alert"), null);
+    assert.equal(creates, 1);
+  });
+}
+
+test("existing project desktop sync is explicit, stays open and blocks duplicate clicks and closing while pending", async () => {
+  let resolve!: (value: Response) => void;
+  const requests: { path: string; method?: string; body: unknown }[] = [];
+  let closed = 0;
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      path: String(input),
+      method: init?.method,
+      body: JSON.parse(String(init?.body)),
+    });
+    return new Promise<Response>((accept) => {
+      resolve = accept;
+    });
+  };
+  render(
+    <ProjectSettingsDialog
+      project={project}
+      host={{ ...hosts[0], capabilities: ["desktopProjects"] }}
+      onClose={() => {
+        closed++;
+      }}
+      onSaved={() => {
+        throw new Error("must not save settings");
+      }}
+    />,
+  );
+  assert.equal(requests.length, 0);
+  const sync = screen.getByRole("button", { name: "同步到桌面版" });
+  fireEvent.click(sync);
+  fireEvent.click(sync);
+  assert.deepEqual(requests, [
+    { path: "/api/projects/p1/desktop", method: "POST", body: {} },
+  ]);
+  fireEvent.click(screen.getByRole("button", { name: "关闭窗口" }));
+  assert.equal(closed, 0);
+  const dialog = screen.getByRole("dialog") as HTMLDialogElement;
+  const escape = new Event("cancel", { cancelable: true });
+  fireEvent(dialog, escape);
+  if (!escape.defaultPrevented) dialog.close();
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(dialog.hasAttribute("open"), true);
+  assert.equal(closed, 0);
+  assert.equal(
+    (screen.getByRole("button", { name: "取消" }) as HTMLButtonElement)
+      .disabled,
+    true,
+  );
+  await act(async () => {
+    resolve(
+      command({
+        cwd: project.cwd,
+        desktop_registration: {
+          status: "already_registered",
+          refresh_required: true,
+        },
+      }),
+    );
+  });
+  await screen.findByText(/已登记到该设备.*重新打开桌面版/);
+  assert.equal(closed, 0);
+  assert.ok(screen.getByRole("dialog").hasAttribute("open"));
+  assert.equal(requests.length, 1);
+  const completedEscape = new Event("cancel", { cancelable: true });
+  fireEvent(dialog, completedEscape);
+  assert.equal(completedEscape.defaultPrevented, false);
+  assert.equal(closed, 1);
+});
+
+test("ordinary dialogs retain native Escape close behavior without an explicit guard", () => {
+  let closed = 0;
+  render(
+    <Modal
+      title="普通弹窗"
+      onClose={() => {
+        closed++;
+      }}
+    >
+      <p>内容</p>
+    </Modal>,
+  );
+  const dialog = screen.getByRole("dialog") as HTMLDialogElement;
+  const escape = new Event("cancel", { cancelable: true });
+  fireEvent(dialog, escape);
+  if (!escape.defaultPrevented) dialog.close();
+  assert.equal(escape.defaultPrevented, false);
+  assert.equal(closed, 1);
+  assert.equal(dialog.hasAttribute("open"), false);
+});
+
+for (const owner of [
+  { ...hosts[0], online: false, capabilities: ["desktopProjects"] },
+  { ...hosts[0], capabilities: [] },
+]) {
+  test(`existing project desktop sync requires ${owner.online ? "node support" : "online device"}`, () => {
+    let requests = 0;
+    globalThis.fetch = async () => {
+      requests++;
+      throw new Error("must not send");
+    };
+    render(
+      <ProjectSettingsDialog
+        project={project}
+        host={owner}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    const sync = screen.getByRole("button", {
+      name: "同步到桌面版",
+    }) as HTMLButtonElement;
+    assert.equal(sync.disabled, true);
+    assert.ok(
+      screen.getByText(
+        owner.online
+          ? "更新节点后支持同步到桌面版。"
+          : "设备上线后可同步到桌面版。",
+      ),
+    );
+    fireEvent.click(sync);
+    assert.equal(requests, 0);
+  });
+}
+
+test("desktop sync failures show safe inline feedback and retry only on another explicit click", async () => {
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return command({
+      cwd: project.cwd,
+      desktop_registration:
+        requests === 1
+          ? {
+              status: "error",
+              reason: "state_write_failed: /private/state.json",
+            }
+          : { status: "registered" },
+    });
+  };
+  const view = render(
+    <ProjectSettingsDialog
+      project={project}
+      host={{ ...hosts[0], capabilities: ["desktopProjects"] }}
+      onClose={() => {}}
+      onSaved={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "同步到桌面版" }));
+  await screen.findByText(/同步到桌面版失败/);
+  assert.doesNotMatch(
+    view.container.textContent || "",
+    /private|state_write_failed|state\.json/,
+  );
+  assert.equal(requests, 1);
+  fireEvent.click(screen.getByRole("button", { name: "同步到桌面版" }));
+  await screen.findByText(/已登记到该设备/);
+  assert.equal(requests, 2);
+});
+
+test("unknown desktop sync outcomes are not automatically retried or exposed as raw errors", async () => {
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return new Response(
+      JSON.stringify({
+        command: {
+          id: "uncertain-sync",
+          kind: "desktop.project",
+          status: "unknown",
+          error: "C:/private/state.json",
+        },
+      }),
+      { status: 202 },
+    );
+  };
+  const view = render(
+    <ProjectSettingsDialog
+      project={project}
+      host={{ ...hosts[0], capabilities: ["desktopProjects"] }}
+      onClose={() => {}}
+      onSaved={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "同步到桌面版" }));
+  await screen.findByText(/登记结果尚未确认/);
+  assert.equal(requests, 1);
+  assert.doesNotMatch(view.container.textContent || "", /private|state\.json/);
 });
 
 test("changing nodes ignores a late directory response from the previous filesystem", async () => {

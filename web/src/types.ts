@@ -142,6 +142,12 @@ export type Project = {
   last_activity_at?: string;
   execution_settings?: ExecutionSettings;
 };
+export type DesktopRegistration = {
+  status:
+    "registered" | "already_registered" | "pending" | "unavailable" | "error";
+  reason?: string;
+  refresh_required?: boolean;
+};
 export type ThreadPage = {
   threads: Thread[];
   has_more?: boolean;

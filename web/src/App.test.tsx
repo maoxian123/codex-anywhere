@@ -20,6 +20,7 @@ import type {
   PendingInteraction,
   Thread,
   ThreadOwnership,
+  DesktopRegistration,
 } from "./types";
 
 class FakeWebSocket {
@@ -193,6 +194,95 @@ function setup(
       act(() => FakeWebSocket.instances.at(-1)!.emit(event));
     },
   };
+}
+
+for (const registration of [
+  { status: "registered", refresh_required: true },
+  { status: "pending" },
+  { status: "unavailable", reason: "native_unsupported" },
+  { status: "error", reason: "outcome_unknown" },
+  undefined,
+] satisfies (DesktopRegistration | undefined)[]) {
+  test(`project creation shows ${registration?.status || "legacy"} desktop registration feedback after opening the new conversation`, async () => {
+    const server = setup({}, "/new", ["desktopProjects"]);
+    let created = false;
+    server.intercept((path, init) => {
+      if (path === "/api/hosts/h1/directories")
+        return new Response(
+          JSON.stringify({
+            command: {
+              id: "directories",
+              kind: "host.directories",
+              status: "completed",
+              result: {
+                path: "C:\\newwork",
+                parent: "C:\\",
+                home: "C:\\Users\\tester",
+                locations: [],
+                directories: [],
+                truncated: false,
+              },
+            },
+          }),
+          { status: 202 },
+        );
+      if (path === "/api/projects" && init?.method === "POST") {
+        created = true;
+        const project: Project = {
+          ...server.projects[0],
+          id: "created-project",
+          name: "newwork",
+          cwd: "C:\\newwork",
+          thread_count: 0,
+        };
+        server.projects.push(project);
+        return new Response(
+          JSON.stringify({
+            command: {
+              id: "create-project",
+              kind: "project.create",
+              status: "completed",
+              result: {
+                project,
+                ...(registration ? { desktop_registration: registration } : {}),
+              },
+            },
+          }),
+          { status: 202 },
+        );
+      }
+      return undefined;
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "添加项目" }));
+    const create = await screen.findByRole("button", { name: "创建项目" });
+    await waitFor(() =>
+      assert.equal((create as HTMLButtonElement).disabled, false),
+    );
+    fireEvent.click(create);
+    const notice = await screen.findByText(/项目「newwork」已创建。/);
+    assert.equal(created, true);
+    assert.ok(notice.closest('[role="status"]'));
+    assert.equal(screen.queryByRole("dialog"), null);
+    assert.equal(window.location.pathname, "/new");
+    assert.match(window.location.search, /project_id=created-project/);
+    if (registration?.status === "registered")
+      assert.match(
+        notice.textContent || "",
+        /该设备的 Codex 项目列表.*重新打开桌面版/,
+      );
+    else if (registration?.status === "pending")
+      assert.match(
+        notice.textContent || "",
+        /桌面版正在运行.*已排队.*退出桌面版后节点会自动完成登记/,
+      );
+    else if (registration?.status === "unavailable")
+      assert.match(notice.textContent || "", /更新 Codex/);
+    else if (registration?.status === "error")
+      assert.match(notice.textContent || "", /尚未确认.*手动同步/);
+    else assert.match(notice.textContent || "", /更新节点/);
+    fireEvent.click(screen.getByRole("button", { name: "关闭项目提示" }));
+    assert.equal(screen.queryByText(/项目「newwork」已创建。/), null);
+  });
 }
 
 function questionServer(pathname = "/tasks/t1", linked = true) {
