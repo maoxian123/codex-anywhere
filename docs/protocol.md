@@ -539,6 +539,41 @@ open; no push subscription or closed-browser delivery is claimed. Offline answer
 remain editable but cannot be sent. A stale request is refreshed before it can be
 retried, and unconfirmed submissions are never retried automatically.
 
+### Async questions attached to agent messages
+
+Codex 0.163 also emits `agentMessage.questions:[{title,options?:string[]|null}]`.
+These are asynchronous message items, not server requests: completing the item
+does not answer the questions, and there is no question RPC ID or
+`serverRequest/resolved` notification. The node forwards the original native item
+unchanged. The hub projects its questions into a durable interaction with method
+`anywhere/message_questions`, `isBlocking:false`, and source item/turn IDs.
+Question IDs use compact JSON serialization of
+`["request_user_input_async",nativeItemId,zeroBasedQuestionIndex]`. Repeated item
+snapshots and history loads reuse the same interaction without reopening answers.
+Existing cached items are reconciled into this projection, including native
+answers already present in their history.
+
+The global pending API also includes unanswered async questions from earlier
+turns or runtime epochs, and async answers whose execution outcome is unknown.
+The persistent visible browser banner remains across task progress, navigation,
+refresh and temporary refresh failures. Only explicit answers resolve these
+questions; their reminders do not expire with a turn. Async questions permit work,
+normal follow-up queues and completion-based writer release to continue. Native
+RPC approvals and blocking questions retain their original lifecycle.
+
+The existing answer endpoint validates one nonempty answer per async question
+and journals ordinary native user input, never `interaction.answer`. Running
+turns receive `turn.steer` with the expected turn ID; idle threads receive
+`turn.start` with their saved execution settings. These explicit answers bypass
+the normal follow-up queue while respecting unsettled control commands. Text is
+the native `<send_user_message_question_reply>` envelope containing a compact
+JSON array of `{questionItemId,question,answer}` objects. The browser displays a
+readable answer rather than that transport envelope. Native `userMessage` and
+accepted `steeringUserMessage` envelopes also reconcile answers from other clients.
+Successful delivery resolves the interaction; a definitive failure permits an
+explicit retry, while an unknown outcome stays visible and cannot be retried
+automatically. Steer failures never silently start a second turn.
+
 ## Browser WebSocket
 
 Browser event parameters use the same bounded presentation as paginated items. Large strings, inline images and oversized structures may be summarized with `params._truncated:true` and `params._raw_url:'/api/events/<id>'`. Authenticated `GET /api/events/<id>` returns `{event:originalEvent}`. Raw native events remain unchanged in durable storage. Serialize replay rows one at a time so large events do not accumulate in server memory. Approval interactions retain their full native decision payload in the interactions API.

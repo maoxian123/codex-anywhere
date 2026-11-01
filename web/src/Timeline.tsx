@@ -55,7 +55,7 @@ export function messageText(item: Item): string {
   const data = item.data;
   if (typeof data._displayText === "string") return data._displayText;
   if (typeof data.text === "string") return data.text;
-  return list(data.content)
+  return list(data.content ?? data.input)
     .map((part) => string(object(part).text))
     .filter(Boolean)
     .join("\n\n");
@@ -119,8 +119,12 @@ function NativeTimelineItem({
       <AssetGallery assets={assets} onImage={onImage} />
     </>
   );
-  if (type === "userMessage" || type === "user_message") {
-    const nativeImages = list(data.content)
+  if (
+    type === "userMessage" ||
+    type === "user_message" ||
+    (type === "steeringUserMessage" && data.status === "accepted")
+  ) {
+    const nativeImages = list(data.content ?? data.input)
       .map(object)
       .filter((content) => content.type === "image")
       .map((content) => string(content.url))

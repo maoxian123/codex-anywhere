@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertCircle,
   ArrowLeft,
@@ -52,11 +53,13 @@ export default function InteractionAttention({
   hosts,
   onNavigate,
   onCommand,
+  bannerTarget,
 }: {
   refreshKey: number;
   hosts: Host[];
   onNavigate: (threadId: string) => void;
   onCommand: (command: Command) => void;
+  bannerTarget?: HTMLElement | null;
 }) {
   const [page, setPage] = useState(emptyPage);
   const pageRef = useRef(emptyPage);
@@ -289,6 +292,21 @@ export default function InteractionAttention({
     setDetailUnverified(false);
     setDetailLoading(false);
   };
+  const selectInteraction = (item: PendingInteraction) => {
+    selectedRef.current = item;
+    setSelected(item);
+    setDetail(null);
+    setDetailError("");
+    setDetailUnverified(false);
+    void loadDetail(item);
+  };
+  const openPending = () => {
+    setOpen(true);
+    const current = pageRef.current;
+    if (current.total === 1 && current.interactions.length === 1)
+      selectInteraction(current.interactions[0]);
+    else clearSelection();
+  };
   const close = () => {
     setOpen(false);
     clearSelection();
@@ -318,6 +336,61 @@ export default function InteractionAttention({
   const online = selected
     ? hosts.find((host) => host.id === selected.host_id)?.online === true
     : false;
+  const questionCount = page.interactions.reduce(
+    (count, item) => count + item.question_count,
+    0,
+  );
+  const approvalCount = page.interactions.filter((item) =>
+    item.method.toLowerCase().includes("approval"),
+  ).length;
+  const otherCount = page.interactions.filter(
+    (item) =>
+      !item.question_count && !item.method.toLowerCase().includes("approval"),
+  ).length;
+  const completeCounts =
+    !page.has_more && page.interactions.length === page.total;
+  const counts = [
+    questionCount ? `${questionCount} 个问题` : "",
+    approvalCount ? `${approvalCount} 项审批` : "",
+    otherCount ? `${otherCount} 项交互` : "",
+  ].filter(Boolean);
+  const nonBlockingQuestions =
+    completeCounts &&
+    page.interactions.every(
+      (item) => item.question_count > 0 && !item.blocking,
+    );
+  const banner =
+    page.total > 0 ? (
+      <section
+        className={`interaction-attention-banner${loadError ? " has-stale-data" : ""}`}
+        aria-label="待处理提醒"
+      >
+        <Bell size={19} aria-hidden="true" />
+        <div className="interaction-attention-banner-copy">
+          <strong>
+            {completeCounts && counts.length
+              ? `你有 ${counts.join("、")}等待处理`
+              : `你有 ${page.total} 项问题或审批等待处理`}
+          </strong>
+          <p>
+            {loadError
+              ? "提醒暂时无法更新，仍保留上次的待处理记录。"
+              : nonBlockingQuestions
+                ? "任务可以继续运行；待回答的问题会持续保留。"
+                : "查看问题和操作内容，提交回答或审批后继续。"}
+          </p>
+        </div>
+        <button
+          type="button"
+          className="button button-small interaction-attention-banner-action"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onClick={openPending}
+        >
+          {page.total === 1 && questionCount > 0 ? "回答问题" : "查看待处理"}
+        </button>
+      </section>
+    ) : null;
 
   return (
     <>
@@ -355,6 +428,9 @@ export default function InteractionAttention({
             ? `有 ${page.total} 项待处理交互，需要你的回答或审批。`
             : ""}
       </span>
+      {bannerTarget === undefined
+        ? banner
+        : bannerTarget && createPortal(banner, bannerTarget)}
       {open && (
         <Modal
           title="待处理交互"
@@ -419,9 +495,13 @@ export default function InteractionAttention({
                 )}
                 {detail &&
                   !detailUnverified &&
-                  (["pending", "open", "waiting", "answering"].includes(
-                    detail.status,
-                  ) ? (
+                  ([
+                    "pending",
+                    "open",
+                    "waiting",
+                    "answering",
+                    "answer_unknown",
+                  ].includes(detail.status) ? (
                     <Interactions
                       interactions={[detail]}
                       hostOnline={online}
@@ -445,14 +525,7 @@ export default function InteractionAttention({
                     <li key={item.id}>
                       <button
                         type="button"
-                        onClick={() => {
-                          selectedRef.current = item;
-                          setSelected(item);
-                          setDetail(null);
-                          setDetailError("");
-                          setDetailUnverified(false);
-                          void loadDetail(item);
-                        }}
+                        onClick={() => selectInteraction(item)}
                       >
                         <span className="interaction-attention-item-title">
                           {item.thread_title}

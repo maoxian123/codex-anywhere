@@ -357,7 +357,7 @@ test("answering requests and unknown command outcomes cannot be answered again",
   viewQuestion(interaction);
   fireEvent.click(screen.getByRole("radio", { name: /只做原型/ }));
   fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
-  await screen.findByText(/提交结果尚未确认/);
+  await screen.findByText(/回答结果未知/);
   assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
   assert.equal(calls.length, 1);
 });
@@ -421,10 +421,68 @@ test("an offline conflict allows explicit retry only after a refreshed pending r
   assert.equal(calls, 2);
 });
 
+test("unknown asynchronous answers remain visible without any resubmit controls", () => {
+  const item = {
+    ...question(),
+    method: "anywhere/message_questions",
+    status: "answer_unknown",
+    params: {
+      ...question().params,
+      isBlocking: false,
+      answerCommandStatus: "unknown",
+    },
+  };
+  viewQuestion(item);
+  assert.ok(screen.getByText("回答结果未知，请先检查对话记录，避免重复提交。"));
+  assert.equal(screen.queryByRole("radio"), null);
+  assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
+});
+
+for (const observedAnswering of [true, false]) {
+  test(`a definitively failed asynchronous answer can be retried after refresh (observed answering ${observedAnswering})`, async () => {
+    const calls = capturePosts();
+    const initial = { ...question(), method: "anywhere/message_questions" };
+    const view = viewQuestion(initial);
+    fireEvent.click(screen.getByRole("radio", { name: /只做原型/ }));
+    fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+    await screen.findByText("已提交，等待远程设备确认");
+    const queued = {
+      ...initial,
+      params: { ...initial.params, answerCommandStatus: "queued" },
+    };
+    view.rerender(
+      <Interactions interactions={[queued]} onCommand={() => {}} />,
+    );
+    assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
+    if (observedAnswering)
+      view.rerender(
+        <Interactions
+          interactions={[{ ...queued, status: "answering" }]}
+          onCommand={() => {}}
+        />,
+      );
+    view.rerender(
+      <Interactions
+        interactions={[
+          {
+            ...initial,
+            params: { ...initial.params, answerCommandStatus: "failed" },
+          },
+        ]}
+        onCommand={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("radio", { name: /完整实现/ }));
+    fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+    await screen.findByText("已提交，等待远程设备确认");
+    assert.equal(calls.length, 2);
+  });
+}
+
 test("nonblocking model questions explain that the task continues", () => {
   viewQuestion(question({ isBlocking: false }));
   assert.ok(screen.getByText("Codex 提问"));
-  assert.ok(screen.getByText("任务仍在继续，你可以在这里回答。"));
+  assert.ok(screen.getByText("任务可继续运行，问题会保留至回答。"));
   assert.equal(screen.queryByText("Codex 等待你的回答"), null);
 });
 

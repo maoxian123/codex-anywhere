@@ -43,6 +43,25 @@ function groupToggle(container: HTMLElement) {
   return container.querySelector<HTMLElement>(".work-process > summary")!;
 }
 
+test("accepted async steering answers stay visible between work groups", () => {
+  const answer = item("answer", "steeringUserMessage", "turn-1", {
+    status: "accepted",
+    input: [{ type: "text", text: "native answer transport" }],
+    _displayText: "要建立索引吗？\n暂不建立，继续部署",
+  });
+  const items = [item("before"), answer, item("after")];
+  assert.deepEqual(
+    timelineUnits(items, {}).map((unit) => unit.kind),
+    ["work", "item", "work"],
+  );
+  const { container } = render(<Timeline {...base} items={items} />);
+  assert.match(
+    container.querySelector(".user-bubble")?.textContent || "",
+    /暂不建立，继续部署/,
+  );
+  assert.doesNotMatch(container.textContent || "", /native answer transport/);
+});
+
 test("work blocks retain native order and stop at messages, images and turn boundaries", () => {
   const units = timelineUnits(
     [

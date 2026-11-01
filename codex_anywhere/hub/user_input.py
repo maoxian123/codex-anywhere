@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+from sqlalchemy import or_
+
+from .async_questions import ASYNC_QUESTION_METHOD, backfill_async_questions
 from .models import Host, Interaction, Thread, db, iso
 
 USER_INPUT_METHODS = {"item/tool/requestUserInput", "tool/requestUserInput"}
+QUESTION_METHODS = USER_INPUT_METHODS | {ASYNC_QUESTION_METHOD}
 
 
 def is_blocking(interaction):
     """Only native question requests can explicitly permit work to continue."""
     return not (
-        interaction.method in USER_INPUT_METHODS and interaction.params.get("isBlocking") is False
+        interaction.method in QUESTION_METHODS and interaction.params.get("isBlocking") is False
     )
 
 
 def validate_user_input(interaction, response):
-    if interaction.method not in USER_INPUT_METHODS:
+    if interaction.method not in QUESTION_METHODS:
         return
     if set(response) != {"answers"} or not isinstance(response["answers"], dict):
         raise ValueError("请按问题提交 answers 对象")
@@ -40,6 +44,10 @@ def validate_user_input(interaction, response):
         if not isinstance(value, dict) or set(value) != {"answers"}:
             raise ValueError("每个问题需要一个 answers 数组")
         supplied = value["answers"]
+        if interaction.method == ASYNC_QUESTION_METHOD and (
+            not isinstance(supplied, list) or len(supplied) != 1
+        ):
+            raise ValueError("每个异步问题需要一个回答")
         if (
             not isinstance(supplied, list)
             or not supplied
@@ -65,11 +73,23 @@ def validate_user_input(interaction, response):
 
 def pending_interactions(limit, offset):
     """Return bounded metadata without exposing questions, secrets or RPC IDs."""
+    backfill_async_questions()
+    db.session.commit()
     query = (
         db.session.query(Interaction, Host.name, Thread.display_title, Thread.title)
         .join(Host, Interaction.host_id == Host.id)
         .outerjoin(Thread, Interaction.thread_id == Thread.id)
-        .filter(Interaction.status == "pending", Interaction.runtime_id == Host.runtime_id)
+        .filter(
+            or_(
+                Interaction.status == "pending",
+                (Interaction.method == ASYNC_QUESTION_METHOD)
+                & (Interaction.status == "answer_unknown"),
+            ),
+            or_(
+                Interaction.runtime_id == Host.runtime_id,
+                Interaction.method == ASYNC_QUESTION_METHOD,
+            ),
+        )
     )
     total = query.count()
     rows = query.order_by(Interaction.created_at, Interaction.id).offset(offset).limit(limit).all()
@@ -86,7 +106,7 @@ def pending_interactions(limit, offset):
                 method=interaction.method,
                 created_at=iso(interaction.created_at),
                 question_count=len(questions)
-                if interaction.method in USER_INPUT_METHODS and isinstance(questions, list)
+                if interaction.method in QUESTION_METHODS and isinstance(questions, list)
                 else 0,
                 blocking=is_blocking(interaction),
             )

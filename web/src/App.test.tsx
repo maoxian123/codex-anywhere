@@ -285,17 +285,21 @@ for (const registration of [
   });
 }
 
-function questionServer(pathname = "/tasks/t1", linked = true) {
+function questionServer(
+  pathname = "/tasks/t1",
+  linked = true,
+  method = "item/tool/requestUserInput",
+) {
   const server = setup({}, pathname);
   let pending = false;
   const answers: unknown[] = [];
   const interaction: Interaction = {
     id: "model-question",
     thread_id: linked ? "not-in-loaded-list" : null,
-    method: "item/tool/requestUserInput",
+    method,
     status: "pending",
     params: {
-      isBlocking: true,
+      isBlocking: method !== "anywhere/message_questions",
       questions: [
         {
           id: "choice",
@@ -318,7 +322,7 @@ function questionServer(pathname = "/tasks/t1", linked = true) {
     method: interaction.method,
     created_at: "2026-10-26T00:00:00Z",
     question_count: 1,
-    blocking: true,
+    blocking: method !== "anywhere/message_questions",
   };
   server.intercept((path, init) => {
     if (path.startsWith("/api/interactions?"))
@@ -365,7 +369,9 @@ function questionServer(pathname = "/tasks/t1", linked = true) {
     announce: () => {
       pending = true;
       server.event(
-        "anywhere/interaction",
+        method === "anywhere/message_questions"
+          ? method
+          : "anywhere/interaction",
         { method: interaction.method },
         interaction.thread_id || "",
       );
@@ -397,11 +403,11 @@ test("global model questions can be answered without changing conversations or c
     null,
     "arrival must not steal focus with a modal",
   );
-  fireEvent.click(attention);
+  const banner = screen.getByRole("region", { name: "待处理提醒" });
+  assert.ok(banner.closest("main"));
+  assert.equal(banner.closest("header"), null);
+  fireEvent.click(within(banner).getByRole("button", { name: "回答问题" }));
   const modal = screen.getByRole("dialog");
-  fireEvent.click(
-    await within(modal).findByRole("button", { name: /列表外的会话/ }),
-  );
   const option = await within(modal).findByRole("radio", { name: /方案 B/ });
   assert.equal(server.answers.length, 0);
   fireEvent.click(option);
@@ -416,17 +422,16 @@ test("global model questions can be answered without changing conversations or c
   await waitFor(() => assert.doesNotMatch(document.title, /待处理/));
 });
 
-for (const pathname of ["/", "/settings"]) {
+for (const pathname of ["/", "/settings", "/new"]) {
   test(`unlinked native questions stay reachable from ${pathname}`, async () => {
     const server = questionServer(pathname, false);
     await screen.findByRole("button", { name: "待处理交互" });
     server.announce();
     await waitFor(() => assert.match(document.title, /1.*待处理/));
-    fireEvent.click(screen.getByRole("button", { name: "待处理交互" }));
+    const banner = screen.getByRole("region", { name: "待处理提醒" });
+    assert.ok(banner.closest("main"));
+    fireEvent.click(within(banner).getByRole("button", { name: "回答问题" }));
     const modal = screen.getByRole("dialog");
-    fireEvent.click(
-      await within(modal).findByRole("button", { name: /未关联会话/ }),
-    );
     assert.ok(await within(modal).findByRole("radio", { name: /方案 A/ }));
     assert.equal(
       within(modal).queryByRole("button", { name: "打开会话" }),
@@ -440,6 +445,34 @@ for (const pathname of ["/", "/settings"]) {
     assert.equal(window.location.pathname, pathname);
   });
 }
+
+test("message-question reminders stay visible while background work continues without touching the current draft", async () => {
+  const server = questionServer(
+    "/tasks/t1",
+    true,
+    "anywhere/message_questions",
+  );
+  const draft = (await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  })) as HTMLTextAreaElement;
+  fireEvent.change(draft, { target: { value: "当前任务继续保留的草稿" } });
+  draft.focus();
+  server.announce();
+  const banner = await screen.findByRole("region", { name: "待处理提醒" });
+  assert.match(banner.textContent || "", /任务可以继续运行/);
+  assert.equal(document.activeElement, draft);
+  assert.equal(screen.queryByRole("dialog"), null);
+  server.event(
+    "turn/completed",
+    { turn: { id: "background-turn", status: "completed" } },
+    "not-in-loaded-list",
+  );
+  await waitFor(() => assert.match(document.title, /1.*待处理/));
+  assert.ok(screen.getByRole("region", { name: "待处理提醒" }));
+  assert.equal(draft.value, "当前任务继续保留的草稿");
+  assert.equal(window.location.pathname, "/tasks/t1");
+  assert.equal(server.answers.length, 0);
+});
 
 test("history failure exposes a button that explicitly retries native history", async () => {
   const server = setup({ history_loaded: false, history_stale: true });

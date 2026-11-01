@@ -29,6 +29,8 @@ export function entryAliases(entry: TimelineEntry) {
 
 function isStandalone(item: Item) {
   return (
+    (nativeType(item) === "steeringusermessage" &&
+      item.data.status === "accepted") ||
     ["usermessage", "agentmessage", "imageview", "imagegeneration"].includes(
       nativeType(item),
     ) ||

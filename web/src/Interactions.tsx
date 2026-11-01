@@ -380,17 +380,31 @@ function InteractionCard({
   const [submitted, setSubmitted] = useState(false);
   const [uncertain, setUncertain] = useState(false);
   const [stale, setStale] = useState(false);
+  const previousStatus = useRef(interaction.status);
   useEffect(() => {
+    const previous = previousStatus.current;
+    previousStatus.current = interaction.status;
     // A 409 can also mean the device went offline. Only an authoritative
     // refreshed pending request makes an explicit retry available again.
     if (["pending", "open", "waiting"].includes(interaction.status)) {
       setStale(false);
       setError("");
+      if (
+        ["answering", "answer_unknown"].includes(previous) ||
+        interaction.params.answerCommandStatus === "failed"
+      ) {
+        inFlight.current = false;
+        setSubmitted(false);
+        setUncertain(false);
+      }
     }
   }, [interaction]);
   const questions = list(interaction.params.questions).length > 0;
   const nonBlocking = questions && interaction.params.isBlocking === false;
   const waitingForDevice = interaction.status === "answering" || submitted;
+  const answerUnknown =
+    interaction.status === "answer_unknown" ||
+    interaction.params.answerCommandStatus === "unknown";
   const disabled = sending || waitingForDevice || stale || !hostOnline;
   const approval = interaction.method.toLowerCase().includes("approval");
   const permissions = interaction.method === "item/permissions/requestApproval";
@@ -432,13 +446,17 @@ function InteractionCard({
     }
     onCommand(command);
   };
-  if (waitingForDevice)
+  if (waitingForDevice || answerUnknown)
     return (
       <div className="interaction-submitted" role="status">
-        {uncertain ? <HelpCircle size={15} /> : <Check size={15} />}
+        {uncertain || answerUnknown ? (
+          <HelpCircle size={15} />
+        ) : (
+          <Check size={15} />
+        )}
         <span>
-          {uncertain
-            ? "回答的提交结果尚未确认，请等待设备同步，避免重复回答。"
+          {uncertain || answerUnknown
+            ? "回答结果未知，请先检查对话记录，避免重复提交。"
             : "已提交，等待远程设备确认"}
         </span>
       </div>
@@ -467,7 +485,7 @@ function InteractionCard({
                 ? "请检查操作内容，再选择允许范围。"
                 : questions
                   ? nonBlocking
-                    ? "任务仍在继续，你可以在这里回答。"
+                    ? "任务可继续运行，问题会保留至回答。"
                     : "请回答下面的问题，提交后继续任务。"
                   : interaction.method,
             )}
@@ -621,7 +639,9 @@ export default function Interactions({
   onResolved?: () => void;
 }) {
   const pending = interactions.filter((interaction) =>
-    ["pending", "open", "waiting", "answering"].includes(interaction.status),
+    ["pending", "open", "waiting", "answering", "answer_unknown"].includes(
+      interaction.status,
+    ),
   );
   if (!pending.length) return null;
   const hasQuestions = pending.some(

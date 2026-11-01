@@ -8,6 +8,7 @@ import logging
 import math
 import time
 
+from .async_questions import ASYNC_QUESTION_METHOD, project_async_questions, reply_display_text
 from .execution import project_effective_settings
 from .history import project_history
 from .message_queue import CONTROL_KINDS, mark_queue_paused
@@ -23,6 +24,32 @@ def emit(method, params, thread_id=None, host_id=None):
     event = Event(method=method, params=params, thread_id=thread_id, host_id=host_id)
     db.session.add(event)
     return event
+
+
+def _settle_async_answer(command):
+    """Async question replies are ordinary journaled user input, never RPC replies."""
+    identifier = command.payload.get("_async_question_id")
+    if not identifier or command.kind not in {"turn.start", "turn.steer"}:
+        return
+    interaction = db.session.get(Interaction, identifier)
+    if (
+        interaction is None
+        or interaction.method != ASYNC_QUESTION_METHOD
+        or interaction.thread_id != command.thread_id
+        or interaction.host_id != command.host_id
+        or interaction.status == "resolved"
+    ):
+        return
+    statuses = {"completed": "resolved", "failed": "pending", "unknown": "answer_unknown"}
+    if command.status in statuses:
+        interaction.status = statuses[command.status]
+        interaction.params = dict(interaction.params, answerCommandStatus=command.status)
+        emit(
+            ASYNC_QUESTION_METHOD,
+            {"interaction_id": interaction.id},
+            interaction.thread_id,
+            interaction.host_id,
+        )
 
 
 def _desktop_registration(value):
@@ -103,6 +130,7 @@ def _open_interactions(thread):
         Interaction.thread_id == thread.id,
         Interaction.runtime_id == host.runtime_id,
         Interaction.status.in_(["pending", "answering"]),
+        Interaction.method != ASYNC_QUESTION_METHOD,
     )
 
 
@@ -148,7 +176,7 @@ def _put_item(thread, data, turn_id, position=None, created_at=None):
     attached_assets = _assets(item)
     if attached_assets:
         value["_assets"] = attached_assets
-    if item.type == "userMessage" and "_displayText" not in value:
+    if item.type in {"userMessage", "steeringUserMessage"} and "_displayText" not in value:
         commands = (
             Command.query.filter(
                 Command.thread_id == thread.id,
@@ -159,7 +187,7 @@ def _put_item(thread, data, turn_id, position=None, created_at=None):
             .order_by(Command.created_at, Command.id)
             .all()
         )
-        identity = _input_identity(data.get("content"))
+        identity = _input_identity(data.get("content", data.get("input")))
         for command in commands:
             payload = command.payload
             if identity is None or _input_identity(payload.get("input")) != identity:
@@ -170,7 +198,15 @@ def _put_item(thread, data, turn_id, position=None, created_at=None):
                 value["_assets"] = payload.get("_assets", [])
                 command.payload = dict(payload, _attached_item=native_id)
                 break
+    readable_reply = reply_display_text(data)
+    if readable_reply is not None:
+        value.setdefault("_displayText", readable_reply)
     item.data = value
+    interaction = project_async_questions(thread, data, turn_id, created_at=item.created_at)
+    if interaction is not None:
+        emit(ASYNC_QUESTION_METHOD, {"interaction_id": interaction.id}, thread.id, thread.host_id)
+    elif item.type in {"userMessage", "steeringUserMessage"}:
+        emit(ASYNC_QUESTION_METHOD, {}, thread.id, thread.host_id)
 
 
 def _native_time(value, fallback):
@@ -496,6 +532,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 for interaction in Interaction.query.filter(
                     Interaction.host_id == host_id,
                     Interaction.status.in_(["pending", "answering"]),
+                    Interaction.method != ASYNC_QUESTION_METHOD,
                 ):
                     interaction.status = "expired"
                 for thread in Thread.query.filter_by(host_id=host_id):
@@ -518,6 +555,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 if command.runtime_id and command.runtime_id != epoch:
                     command.status = "unknown"
                     command.error = "节点运行进程已更换，执行结果未知；未自动重试"
+                    _settle_async_answer(command)
                     affected = (
                         db.session.get(Thread, command.thread_id) if command.thread_id else None
                     )
@@ -714,6 +752,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         )
                         if thread and project_result:
                             _refresh_waiting(thread)
+                _settle_async_answer(command)
                 emit(
                     "anywhere/command_completed",
                     {"command": command.as_dict()},
@@ -777,6 +816,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 Interaction.host_id == host_id,
                 Interaction.runtime_id == epoch,
                 Interaction.status.in_(["pending", "answering"]),
+                Interaction.method != ASYNC_QUESTION_METHOD,
             ):
                 if interaction.rpc_id == params["requestId"]:
                     interaction.status = "resolved"
@@ -818,6 +858,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 Interaction.host_id == host_id,
                 Interaction.runtime_id == epoch,
                 Interaction.status.in_(["pending", "answering"]),
+                Interaction.method != ASYNC_QUESTION_METHOD,
             ):
                 interaction.status = "expired"
             for active in Thread.query.filter_by(host_id=host_id):

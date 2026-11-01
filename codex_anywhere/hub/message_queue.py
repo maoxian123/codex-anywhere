@@ -9,6 +9,7 @@ from flask import current_app
 from sqlalchemy import and_, or_
 from werkzeug.exceptions import Conflict, NotFound
 
+from .async_questions import ASYNC_QUESTION_METHOD
 from .execution import execution_settings, require_runtime_settings
 from .history import history_command_applied
 from .models import Command, Event, Host, Interaction, Thread, db, iso
@@ -52,6 +53,7 @@ def _interactions(thread, host):
         Interaction.thread_id == thread.id,
         Interaction.runtime_id == host.runtime_id,
         Interaction.status.in_(("pending", "answering")),
+        Interaction.method != ASYNC_QUESTION_METHOD,
     ).first()
 
 

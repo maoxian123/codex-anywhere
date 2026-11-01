@@ -158,6 +158,8 @@ function Workspace({
   >("connecting");
   const [online, setOnline] = useState(navigator.onLine);
   const [attentionRefresh, setAttentionRefresh] = useState(0);
+  const [attentionBannerTarget, setAttentionBannerTarget] =
+    useState<HTMLDivElement | null>(null);
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
@@ -770,6 +772,7 @@ function Workspace({
     if (
       [
         "anywhere/interaction",
+        "anywhere/message_questions",
         "serverRequest/resolved",
         "turn/completed",
         "anywhere/runtime_stopped",
@@ -1342,6 +1345,7 @@ function Workspace({
             <InteractionAttention
               refreshKey={attentionRefresh}
               hosts={hosts}
+              bannerTarget={attentionBannerTarget}
               onNavigate={navigate}
               onCommand={(command) => {
                 watchCommand(command);
@@ -1392,6 +1396,10 @@ function Workspace({
             </button>
           </div>
         </header>
+        <div
+          className="interaction-attention-banner-slot"
+          ref={setAttentionBannerTarget}
+        />
         {networkError && (
           <div className="global-error">
             <ErrorMessage>{networkError}</ErrorMessage>

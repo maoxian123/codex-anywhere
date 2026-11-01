@@ -148,6 +148,125 @@ const props = {
   onCommand: (_command: Command) => {},
 };
 const bell = () => screen.getByRole("button", { name: "待处理交互" });
+const reminder = () => screen.getByRole("region", { name: "待处理提醒" });
+
+test("foreground pending reminders are visible without moving focus or loading question text", async () => {
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const path = String(input);
+    paths.push(path);
+    return response(
+      path.includes("?")
+        ? page([
+            metadata("message", {
+              method: "anywhere/message_questions",
+              blocking: false,
+              question_count: 2,
+            }),
+          ])
+        : {
+            interaction: {
+              ...interaction("message"),
+              method: "anywhere/message_questions",
+              params: { ...interaction("message").params, isBlocking: false },
+            },
+          },
+    );
+  };
+  render(
+    <>
+      <input aria-label="当前草稿" defaultValue="继续保留草稿" />
+      <InteractionAttention {...props} />
+    </>,
+  );
+  const draft = screen.getByRole("textbox", {
+    name: "当前草稿",
+  }) as HTMLInputElement;
+  draft.focus();
+  await screen.findByRole("region", { name: "待处理提醒" });
+  assert.match(reminder().textContent || "", /2 个问题等待处理/);
+  assert.match(reminder().textContent || "", /任务可以继续运行/);
+  assert.equal(document.activeElement, draft);
+  assert.equal(draft.value, "继续保留草稿");
+  assert.equal(screen.queryByRole("dialog"), null);
+  assert.equal(FakeNotification.instances.length, 0);
+  assert.deepEqual(paths, ["/api/interactions?limit=50&offset=0"]);
+  fireEvent.click(screen.getByRole("button", { name: "回答问题" }));
+  await screen.findByText("Question message");
+  assert.equal(paths.at(-1), "/api/interactions/message");
+  assert.ok(
+    screen
+      .getAllByRole("radio")
+      .every((radio) => !(radio as HTMLInputElement).checked),
+  );
+  assert.equal(draft.value, "继续保留草稿");
+});
+
+test("a visible reminder summarizes questions and approvals and opens the complete pending list", async () => {
+  globalThis.fetch = async () =>
+    response(
+      page([
+        metadata("questions", { question_count: 2 }),
+        metadata("approval", {
+          method: "item/commandExecution/requestApproval",
+          question_count: 0,
+        }),
+      ]),
+    );
+  render(<InteractionAttention {...props} />);
+  await screen.findByRole("region", { name: "待处理提醒" });
+  assert.match(reminder().textContent || "", /2 个问题、1 项审批等待处理/);
+  fireEvent.click(screen.getByRole("button", { name: "查看待处理" }));
+  assert.ok(screen.getByRole("list", { name: "待处理交互列表" }));
+  assert.ok(screen.getByText("Conversation questions"));
+  assert.ok(screen.getByText("Conversation approval"));
+});
+
+test("pending reminders survive periodic refresh and failed fetches until the server confirms resolution", async () => {
+  let tick: (() => void) | undefined;
+  let failed = false;
+  let resolved = false;
+  let reads = 0;
+  window.setInterval = ((callback: () => void, delay: number) => {
+    assert.equal(delay, 30_000);
+    tick = callback;
+    return 321;
+  }) as typeof window.setInterval;
+  globalThis.fetch = async () => {
+    reads++;
+    return failed
+      ? response({ error: "Temporary outage" }, 503)
+      : response(page(resolved ? [] : [metadata("kept", { blocking: false })]));
+  };
+  const view = render(<InteractionAttention {...props} />);
+  await screen.findByRole("region", { name: "待处理提醒" });
+  act(() => {
+    tick?.();
+  });
+  await waitFor(() => assert.equal(reads, 2));
+  assert.match(reminder().textContent || "", /1 个问题等待处理/);
+  assert.equal(screen.queryByRole("dialog"), null);
+  failed = true;
+  act(() => {
+    tick?.();
+  });
+  await waitFor(() =>
+    assert.ok(reminder().classList.contains("has-stale-data")),
+  );
+  assert.match(reminder().textContent || "", /仍保留上次的待处理记录/);
+  assert.ok(screen.getByRole("button", { name: "回答问题" }));
+  failed = false;
+  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
+  await waitFor(() =>
+    assert.ok(!reminder().classList.contains("has-stale-data")),
+  );
+  assert.match(reminder().textContent || "", /1 个问题等待处理/);
+  resolved = true;
+  await act(async () => {
+    tick?.();
+  });
+  assert.equal(screen.queryByRole("region", { name: "待处理提醒" }), null);
+});
 const open = () => fireEvent.click(bell());
 
 test("unseen conversations update the bell and tab title without opening or stealing focus", async () => {
@@ -441,6 +560,49 @@ test("answering and resolved detail resync preserves selected context and never 
   await screen.findByText("这条请求已处理或已过期。");
   assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
   assert.equal(posted, 1);
+});
+
+test("unknown asynchronous answers remain globally visible and cannot be resubmitted", async () => {
+  let status = "answer_unknown";
+  let posts = 0;
+  globalThis.fetch = async (input, init) => {
+    if (init?.method === "POST") posts++;
+    return response(
+      String(input).includes("?")
+        ? page([
+            metadata("unknown", {
+              method: "anywhere/message_questions",
+              blocking: false,
+            }),
+          ])
+        : {
+            interaction: {
+              ...interaction("unknown", status),
+              method: "anywhere/message_questions",
+              params: {
+                ...interaction("unknown").params,
+                isBlocking: false,
+                answerCommandStatus:
+                  status === "answer_unknown" ? "unknown" : "failed",
+              },
+            },
+          },
+    );
+  };
+  const view = render(<InteractionAttention {...props} />);
+  await screen.findByRole("region", { name: "待处理提醒" });
+  fireEvent.click(screen.getByRole("button", { name: "回答问题" }));
+  await screen.findByText("回答结果未知，请先检查对话记录，避免重复提交。");
+  assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
+  assert.ok(reminder());
+  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
+  await screen.findByText("回答结果未知，请先检查对话记录，避免重复提交。");
+  assert.equal(posts, 0);
+  status = "pending";
+  view.rerender(<InteractionAttention {...props} refreshKey={2} />);
+  await screen.findByRole("radio", { name: /Proceed/ });
+  assert.ok(reminder());
+  assert.equal(posts, 0);
 });
 
 test("offline devices disable submitting an answer while retaining question content", async () => {
