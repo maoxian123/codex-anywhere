@@ -367,11 +367,15 @@ function InteractionCard({
   onCommand,
   hostOnline,
   onResolved,
+  verified,
+  onDraftChange,
 }: {
   interaction: Interaction;
   onCommand: (command: Command) => void;
   hostOnline: boolean;
   onResolved?: () => void;
+  verified: boolean;
+  onDraftChange?: () => void;
 }) {
   const inFlight = useRef(false);
   const [sending, setSending] = useState(false);
@@ -405,7 +409,8 @@ function InteractionCard({
   const answerUnknown =
     interaction.status === "answer_unknown" ||
     interaction.params.answerCommandStatus === "unknown";
-  const disabled = sending || waitingForDevice || stale || !hostOnline;
+  const disabled =
+    sending || waitingForDevice || stale || !hostOnline || !verified;
   const approval = interaction.method.toLowerCase().includes("approval");
   const permissions = interaction.method === "item/permissions/requestApproval";
   const elicitation = interaction.method.toLowerCase().includes("elicitation");
@@ -465,6 +470,7 @@ function InteractionCard({
     <section
       className={`interaction-card ${questions ? "interaction-card--questions" : ""}`}
       aria-label={questions ? "Codex 提问" : "交互请求"}
+      onChangeCapture={onDraftChange}
     >
       <div className="interaction-heading">
         {approval ? <ShieldCheck size={19} /> : <HelpCircle size={19} />}
@@ -485,7 +491,7 @@ function InteractionCard({
                 ? "请检查操作内容，再选择允许范围。"
                 : questions
                   ? nonBlocking
-                    ? "任务可继续运行，问题会保留至回答。"
+                    ? "当前轮次的问题，结束后自动收起。"
                     : "请回答下面的问题，提交后继续任务。"
                   : interaction.method,
             )}
@@ -495,6 +501,11 @@ function InteractionCard({
       {!hostOnline && (
         <p className="interaction-notice" role="status">
           设备离线，回答暂时无法提交。设备上线后可继续。
+        </p>
+      )}
+      {!verified && (
+        <p className="interaction-notice" role="status">
+          正在确认当前轮次的问题，确认后可提交回答。
         </p>
       )}
       {stale && (
@@ -632,11 +643,15 @@ export default function Interactions({
   onCommand,
   hostOnline = true,
   onResolved,
+  verified = true,
+  onDraftChange,
 }: {
   interactions: Interaction[];
   onCommand: (command: Command) => void;
   hostOnline?: boolean;
   onResolved?: () => void;
+  verified?: boolean;
+  onDraftChange?: () => void;
 }) {
   const pending = interactions.filter((interaction) =>
     ["pending", "open", "waiting", "answering", "answer_unknown"].includes(
@@ -659,6 +674,8 @@ export default function Interactions({
           onCommand={onCommand}
           hostOnline={hostOnline}
           onResolved={onResolved}
+          verified={verified}
+          onDraftChange={onDraftChange}
         />
       ))}
     </div>

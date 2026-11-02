@@ -8,7 +8,13 @@ import logging
 import math
 import time
 
-from .async_questions import ASYNC_QUESTION_METHOD, project_async_questions, reply_display_text
+from .async_questions import (
+    ASYNC_QUESTION_METHOD,
+    expire_inactive_async_questions,
+    is_current_async_question,
+    project_async_questions,
+    reply_display_text,
+)
 from .execution import project_effective_settings
 from .history import project_history
 from .message_queue import CONTROL_KINDS, mark_queue_paused
@@ -37,8 +43,17 @@ def _settle_async_answer(command):
         or interaction.method != ASYNC_QUESTION_METHOD
         or interaction.thread_id != command.thread_id
         or interaction.host_id != command.host_id
-        or interaction.status == "resolved"
+        or interaction.status in {"resolved", "expired"}
     ):
+        return
+    if not is_current_async_question(interaction):
+        interaction.status = "expired"
+        emit(
+            ASYNC_QUESTION_METHOD,
+            {"interaction_id": interaction.id},
+            interaction.thread_id,
+            interaction.host_id,
+        )
         return
     statuses = {"completed": "resolved", "failed": "pending", "unknown": "answer_unknown"}
     if command.status in statuses:
@@ -149,7 +164,7 @@ def _next_position(thread):
     ) + 1
 
 
-def _put_item(thread, data, turn_id, position=None, created_at=None):
+def _put_item(thread, data, turn_id, position=None, created_at=None, *, live_questions=False):
     native_id = data.get("id")
     if not native_id:
         return
@@ -202,7 +217,9 @@ def _put_item(thread, data, turn_id, position=None, created_at=None):
     if readable_reply is not None:
         value.setdefault("_displayText", readable_reply)
     item.data = value
-    interaction = project_async_questions(thread, data, turn_id, created_at=item.created_at)
+    interaction = project_async_questions(
+        thread, data, turn_id, created_at=item.created_at, live=live_questions
+    )
     if interaction is not None:
         emit(ASYNC_QUESTION_METHOD, {"interaction_id": interaction.id}, thread.id, thread.host_id)
     elif item.type in {"userMessage", "steeringUserMessage"}:
@@ -351,7 +368,7 @@ def _project(thread, method, params, live=True):
     elif method in {"item/started", "item/completed"}:
         item = params.get("item", {})
         if isinstance(item, dict):
-            _put_item(thread, item, turn_id)
+            _put_item(thread, item, turn_id, live_questions=live)
     elif method == "item/agentMessage/delta":
         native_id = str(params.get("itemId", ""))
         item = Item.query.filter_by(thread_id=thread.id, native_id=native_id).first()
@@ -547,6 +564,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         thread.active_turn_id = None
                         thread.last_error = "节点运行进程已更换，执行结果未知；未自动重试"
                         mark_queue_paused(thread)
+                expire_inactive_async_questions()
             pending = Command.query.filter(
                 Command.host_id == host_id, Command.status.in_(["queued", "sent", "running"])
             ).all()
@@ -827,6 +845,9 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                 if affected:
                     _refresh_waiting(affected)
         _project(thread, method, params, live=live)
+        if live and method in {"turn/started", "turn/completed", "error"} and thread:
+            if expire_inactive_async_questions(thread.id):
+                emit(ASYNC_QUESTION_METHOD, {}, thread.id, host_id)
         if "rpc_id" in message:
             interaction = Interaction(
                 host_id=host_id,
@@ -870,5 +891,7 @@ def _persist_node_message(app, host_id, message, defer_hello=False):
                         f"（退出码 {code}）" if code is not None else ""
                     )
                     mark_queue_paused(active)
+            if expire_inactive_async_questions():
+                emit(ASYNC_QUESTION_METHOD, {}, host_id=host_id)
         db.session.commit()
         broker.send(host_id, {"type": "event_ack", "event_id": event_id})

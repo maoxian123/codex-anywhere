@@ -25,14 +25,25 @@ import type {
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
+  static readyCursor: number | undefined;
+  sent: unknown[] = [];
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   constructor() {
     FakeWebSocket.instances.push(this);
-    queueMicrotask(() => this.emit({ type: "ready" }));
+    queueMicrotask(() =>
+      this.emit({
+        type: "ready",
+        ...(FakeWebSocket.readyCursor !== undefined
+          ? { event_cursor: FakeWebSocket.readyCursor }
+          : {}),
+      }),
+    );
   }
-  send() {}
+  send(data: string) {
+    this.sent.push(JSON.parse(data));
+  }
   close() {}
   emit(event: unknown) {
     this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
@@ -46,6 +57,7 @@ afterEach(() => {
   sessionStorage.clear();
   window.history.replaceState({}, "", "/");
   FakeWebSocket.instances.length = 0;
+  FakeWebSocket.readyCursor = undefined;
 });
 
 function setup(
@@ -70,7 +82,7 @@ function setup(
     value: FakeWebSocket,
   });
   let refreshes = 0;
-  let sequence = 0;
+  let sequence = FakeWebSocket.readyCursor ?? 0;
   const threads = catalog?.threads || [thread];
   const hosts = catalog?.hosts || [
     {
@@ -385,6 +397,15 @@ function questionServer(
         interaction.thread_id || "",
       );
     },
+    expireTurn: () => {
+      pending = false;
+      interaction.status = "expired";
+      server.event(
+        "turn/completed",
+        { turn: { id: "source-turn", status: "completed" } },
+        interaction.thread_id || "",
+      );
+    },
   };
 }
 
@@ -406,12 +427,11 @@ test("global model questions can be answered without changing conversations or c
   const banner = screen.getByRole("region", { name: "待处理提醒" });
   assert.ok(banner.closest("main"));
   assert.equal(banner.closest("header"), null);
-  fireEvent.click(within(banner).getByRole("button", { name: "回答问题" }));
-  const modal = screen.getByRole("dialog");
-  const option = await within(modal).findByRole("radio", { name: /方案 B/ });
+  const panel = await screen.findByRole("region", { name: "当前轮次问题" });
+  const option = await within(panel).findByRole("radio", { name: /方案 B/ });
   assert.equal(server.answers.length, 0);
   fireEvent.click(option);
-  fireEvent.click(within(modal).getByRole("button", { name: "提交回答" }));
+  fireEvent.click(within(panel).getByRole("button", { name: "提交回答" }));
   await waitFor(() =>
     assert.deepEqual(server.answers, [
       { response: { answers: { choice: { answers: ["方案 B"] } } } },
@@ -430,23 +450,22 @@ for (const pathname of ["/", "/settings", "/new"]) {
     await waitFor(() => assert.match(document.title, /1.*待处理/));
     const banner = screen.getByRole("region", { name: "待处理提醒" });
     assert.ok(banner.closest("main"));
-    fireEvent.click(within(banner).getByRole("button", { name: "回答问题" }));
-    const modal = screen.getByRole("dialog");
-    assert.ok(await within(modal).findByRole("radio", { name: /方案 A/ }));
+    const panel = await screen.findByRole("region", { name: "当前轮次问题" });
+    assert.ok(await within(panel).findByRole("radio", { name: /方案 A/ }));
     assert.equal(
-      within(modal).queryByRole("button", { name: "打开会话" }),
+      within(panel).queryByRole("button", { name: "打开会话" }),
       null,
     );
-    server.resolve();
-    await waitFor(() =>
-      assert.ok(within(modal).getByText("这条请求已处理或已过期。")),
-    );
+    await act(async () => {
+      server.resolve();
+    });
+    assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
     await waitFor(() => assert.doesNotMatch(document.title, /待处理/));
     assert.equal(window.location.pathname, pathname);
   });
 }
 
-test("message-question reminders stay visible while background work continues without touching the current draft", async () => {
+test("message questions appear immediately and collapse at their current turn end without touching another draft", async () => {
   const server = questionServer(
     "/tasks/t1",
     true,
@@ -459,18 +478,46 @@ test("message-question reminders stay visible while background work continues wi
   draft.focus();
   server.announce();
   const banner = await screen.findByRole("region", { name: "待处理提醒" });
-  assert.match(banner.textContent || "", /任务可以继续运行/);
+  assert.match(banner.textContent || "", /当前轮次的问题/);
   assert.equal(document.activeElement, draft);
   assert.equal(screen.queryByRole("dialog"), null);
-  server.event(
-    "turn/completed",
-    { turn: { id: "background-turn", status: "completed" } },
-    "not-in-loaded-list",
-  );
-  await waitFor(() => assert.match(document.title, /1.*待处理/));
-  assert.ok(screen.getByRole("region", { name: "待处理提醒" }));
+  assert.ok(await screen.findByRole("radio", { name: /方案 A/ }));
+  await act(async () => {
+    server.expireTurn();
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
   assert.equal(draft.value, "当前任务继续保留的草稿");
   assert.equal(window.location.pathname, "/tasks/t1");
+  assert.equal(server.answers.length, 0);
+});
+
+test("ready event head skips an old replay backlog and delivers the next question immediately", async () => {
+  sessionStorage.setItem("anywhere:cursor:test", "7");
+  FakeWebSocket.readyCursor = 966805;
+  const server = questionServer(
+    "/tasks/t1",
+    true,
+    "anywhere/message_questions",
+  );
+  const draft = (await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  })) as HTMLTextAreaElement;
+  fireEvent.change(draft, { target: { value: "不能被实时问题覆盖的草稿" } });
+  draft.focus();
+  await waitFor(() =>
+    assert.deepEqual(FakeWebSocket.instances[0].sent[0], {
+      type: "subscribe",
+      after: 966805,
+    }),
+  );
+  assert.equal(sessionStorage.getItem("anywhere:cursor:test"), "966805");
+  server.announce();
+  const option = await screen.findByRole("radio", { name: /方案 A/ });
+  assert.equal(sessionStorage.getItem("anywhere:cursor:test"), "966806");
+  assert.equal(document.activeElement, draft);
+  assert.equal((option as HTMLInputElement).checked, false);
+  assert.equal(draft.value, "不能被实时问题覆盖的草稿");
+  assert.equal(screen.queryByRole("dialog"), null);
   assert.equal(server.answers.length, 0);
 });
 

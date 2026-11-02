@@ -8,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import InteractionAttention from "./InteractionAttention";
 import type {
@@ -29,15 +30,13 @@ const originalFocus = window.focus;
 const originalTitle = document.title;
 const originalSetInterval = window.setInterval;
 const originalClearInterval = window.clearInterval;
-
 class FakeNotification {
   static permission: NotificationPermission = "default";
   static requests = 0;
   static instances: FakeNotification[] = [];
   static async requestPermission(): Promise<NotificationPermission> {
     FakeNotification.requests++;
-    FakeNotification.permission = "granted";
-    return "granted";
+    return (FakeNotification.permission = "granted");
   }
   onclick: (() => void) | null = null;
   onclose: (() => void) | null = null;
@@ -53,7 +52,6 @@ class FakeNotification {
     this.onclose?.();
   }
 }
-
 beforeEach(() => {
   FakeNotification.permission = "default";
   FakeNotification.requests = 0;
@@ -87,7 +85,6 @@ afterEach(() => {
   window.clearInterval = originalClearInterval;
   sessionStorage.clear();
 });
-
 const host: Host = {
   id: "h1",
   name: "Workstation",
@@ -103,34 +100,25 @@ const metadata = (
   host_id: "h1",
   thread_title: `Conversation ${id}`,
   host_name: "Workstation",
-  method: "item/tool/requestUserInput",
-  created_at: "2026-10-26T12:00:00Z",
+  method: "anywhere/message_questions",
+  created_at: "2026-11-02T12:00:00Z",
   question_count: 1,
-  blocking: true,
+  blocking: false,
   ...overrides,
-});
-const page = (
-  interactions: PendingInteraction[],
-  total = interactions.length,
-  next: number | null = null,
-): InteractionPage => ({
-  interactions,
-  total,
-  next_offset: next,
-  has_more: next !== null,
 });
 const interaction = (id: string, status = "pending"): Interaction => ({
   id,
   thread_id: `thread-${id}`,
-  method: "item/tool/requestUserInput",
+  method: "anywhere/message_questions",
   status,
   params: {
-    isBlocking: true,
+    isBlocking: false,
     questions: [
       {
         id: "approach",
         header: "方案",
         question: `Question ${id}`,
+        isOther: true,
         options: [
           { label: "Proceed", description: "Use the existing approach" },
           { label: "Revise", description: "Change the approach" },
@@ -138,6 +126,16 @@ const interaction = (id: string, status = "pending"): Interaction => ({
       },
     ],
   },
+});
+const page = (
+  items: PendingInteraction[],
+  total = items.length,
+  next: number | null = null,
+): InteractionPage => ({
+  interactions: items,
+  total,
+  has_more: next !== null,
+  next_offset: next,
 });
 const response = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status });
@@ -148,663 +146,398 @@ const props = {
   onCommand: (_command: Command) => {},
 };
 const bell = () => screen.getByRole("button", { name: "待处理交互" });
+const panel = () => screen.getByRole("region", { name: "当前轮次问题" });
 const reminder = () => screen.getByRole("region", { name: "待处理提醒" });
-
-test("foreground pending reminders are visible without moving focus or loading question text", async () => {
-  const paths: string[] = [];
-  globalThis.fetch = async (input) => {
-    const path = String(input);
-    paths.push(path);
-    return response(
-      path.includes("?")
-        ? page([
-            metadata("message", {
-              method: "anywhere/message_questions",
-              blocking: false,
-              question_count: 2,
-            }),
-          ])
-        : {
-            interaction: {
-              ...interaction("message"),
-              method: "anywhere/message_questions",
-              params: { ...interaction("message").params, isBlocking: false },
-            },
-          },
-    );
+function server(initial: PendingInteraction[] = [metadata("one")]) {
+  const state = {
+    items: initial,
+    details: new Map(initial.map((item) => [item.id, interaction(item.id)])),
+    paths: [] as string[],
+    posts: [] as unknown[],
+    listError: false,
+    detailError: false,
   };
+  globalThis.fetch = async (input, init) => {
+    const path = String(input);
+    state.paths.push(path);
+    if (path.includes("?"))
+      return state.listError
+        ? response({ error: "Temporary list outage" }, 503)
+        : response(page(state.items));
+    const id = path.split("/")[3];
+    if (init?.method === "POST") {
+      state.posts.push(JSON.parse(String(init.body)));
+      state.items = state.items.filter((item) => item.id !== id);
+      return response(
+        {
+          command: {
+            id: `answer-${id}`,
+            kind: "interaction.answer",
+            status: "queued",
+          },
+        },
+        202,
+      );
+    }
+    if (state.detailError)
+      return response({ error: "Temporary detail outage" }, 503);
+    return response({ interaction: state.details.get(id) || interaction(id) });
+  };
+  return state;
+}
+
+test("current question and choices appear on arrival without opening a dialog, focusing or submitting", async () => {
+  const state = server();
   render(
     <>
-      <input aria-label="当前草稿" defaultValue="继续保留草稿" />
+      <input aria-label="Current draft" defaultValue="keep draft" />
       <InteractionAttention {...props} />
     </>,
   );
   const draft = screen.getByRole("textbox", {
-    name: "当前草稿",
+    name: "Current draft",
   }) as HTMLInputElement;
   draft.focus();
-  await screen.findByRole("region", { name: "待处理提醒" });
-  assert.match(reminder().textContent || "", /2 个问题等待处理/);
-  assert.match(reminder().textContent || "", /任务可以继续运行/);
+  await screen.findByRole("radio", { name: /Proceed/ });
+  assert.ok(within(panel()).getByText("Question one"));
+  assert.match(reminder().textContent || "", /当前轮次的问题，结束后自动收起/);
   assert.equal(document.activeElement, draft);
-  assert.equal(draft.value, "继续保留草稿");
+  assert.equal(draft.value, "keep draft");
   assert.equal(screen.queryByRole("dialog"), null);
-  assert.equal(FakeNotification.instances.length, 0);
-  assert.deepEqual(paths, ["/api/interactions?limit=50&offset=0"]);
-  fireEvent.click(screen.getByRole("button", { name: "回答问题" }));
-  await screen.findByText("Question message");
-  assert.equal(paths.at(-1), "/api/interactions/message");
   assert.ok(
     screen
       .getAllByRole("radio")
       .every((radio) => !(radio as HTMLInputElement).checked),
   );
-  assert.equal(draft.value, "继续保留草稿");
+  assert.deepEqual(state.posts, []);
+  assert.equal(FakeNotification.requests, 0);
+  assert.deepEqual(state.paths, [
+    "/api/interactions?limit=50&offset=0",
+    "/api/interactions/one",
+  ]);
 });
 
-test("a visible reminder summarizes questions and approvals and opens the complete pending list", async () => {
-  globalThis.fetch = async () =>
-    response(
-      page([
-        metadata("questions", { question_count: 2 }),
-        metadata("approval", {
-          method: "item/commandExecution/requestApproval",
-          question_count: 0,
-        }),
-      ]),
-    );
-  render(<InteractionAttention {...props} />);
-  await screen.findByRole("region", { name: "待处理提醒" });
-  assert.match(reminder().textContent || "", /2 个问题、1 项审批等待处理/);
-  fireEvent.click(screen.getByRole("button", { name: "查看待处理" }));
-  assert.ok(screen.getByRole("list", { name: "待处理交互列表" }));
-  assert.ok(screen.getByText("Conversation questions"));
-  assert.ok(screen.getByText("Conversation approval"));
-});
-
-test("pending reminders survive periodic refresh and failed fetches until the server confirms resolution", async () => {
-  let tick: (() => void) | undefined;
-  let failed = false;
-  let resolved = false;
-  let reads = 0;
-  window.setInterval = ((callback: () => void, delay: number) => {
-    assert.equal(delay, 30_000);
-    tick = callback;
-    return 321;
-  }) as typeof window.setInterval;
-  globalThis.fetch = async () => {
-    reads++;
-    return failed
-      ? response({ error: "Temporary outage" }, 503)
-      : response(page(resolved ? [] : [metadata("kept", { blocking: false })]));
-  };
+test("a realtime refresh key loads a newly current question without waiting for the periodic timer", async () => {
+  const state = server([]);
   const view = render(<InteractionAttention {...props} />);
-  await screen.findByRole("region", { name: "待处理提醒" });
-  act(() => {
-    tick?.();
-  });
-  await waitFor(() => assert.equal(reads, 2));
-  assert.match(reminder().textContent || "", /1 个问题等待处理/);
-  assert.equal(screen.queryByRole("dialog"), null);
-  failed = true;
-  act(() => {
-    tick?.();
-  });
-  await waitFor(() =>
-    assert.ok(reminder().classList.contains("has-stale-data")),
-  );
-  assert.match(reminder().textContent || "", /仍保留上次的待处理记录/);
-  assert.ok(screen.getByRole("button", { name: "回答问题" }));
-  failed = false;
+  await waitFor(() => assert.equal(state.paths.length, 1));
+  state.items = [metadata("new")];
   view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await waitFor(() =>
-    assert.ok(!reminder().classList.contains("has-stale-data")),
-  );
-  assert.match(reminder().textContent || "", /1 个问题等待处理/);
-  resolved = true;
+  assert.ok(await screen.findByText("Question new"));
+  assert.ok(screen.getByRole("radio", { name: /Proceed/ }));
+  assert.equal(screen.queryByRole("dialog"), null);
+});
+
+test("a newer current question replaces an untouched selection", async () => {
+  const state = server();
+  const view = render(<InteractionAttention {...props} />);
+  await screen.findByText("Question one");
+  state.items = [
+    metadata("one"),
+    metadata("new", { created_at: "2026-11-02T12:01:00Z" }),
+  ];
   await act(async () => {
-    tick?.();
+    view.rerender(<InteractionAttention {...props} refreshKey={1} />);
   });
+  assert.ok(within(panel()).getByText("Question new"));
+  assert.equal(
+    screen.getAllByRole("region", { name: "当前轮次问题" }).length,
+    1,
+  );
+});
+
+test("new arrivals do not overwrite an answered draft and switching live questions preserves both forms", async () => {
+  const state = server();
+  const view = render(<InteractionAttention {...props} />);
+  fireEvent.click(await screen.findByRole("radio", { name: "自定义回答" }));
+  const draft = within(panel()).getByLabelText(
+    "方案：自定义回答",
+  ) as HTMLInputElement;
+  fireEvent.change(draft, { target: { value: "my live answer" } });
+  state.items = [
+    metadata("one"),
+    metadata("new", { created_at: "2026-11-02T12:01:00Z" }),
+  ];
+  await act(async () => {
+    view.rerender(<InteractionAttention {...props} refreshKey={1} />);
+  });
+  assert.match(reminder().textContent || "", /2 个问题/);
+  assert.equal(draft.value, "my live answer");
+  assert.ok(within(panel()).getByText("Question one"));
+  fireEvent.click(bell());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Conversation new/ }));
+  });
+  assert.ok(within(panel()).getByText("Question new"));
+  assert.equal(screen.queryByRole("dialog"), null);
+  fireEvent.click(bell());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Conversation one/ }));
+  });
+  assert.equal(within(panel()).getByDisplayValue("my live answer"), draft);
+  assert.equal(screen.getAllByRole("radio").length, 3);
+  assert.deepEqual(state.posts, []);
+});
+
+test("authoritative turn-end removal clears the panel and aborts a late detail without reviving old questions", async () => {
+  let items = [metadata("expired")];
+  let resolveDetail!: (result: Response) => void;
+  let signal: AbortSignal | null | undefined;
+  globalThis.fetch = async (input, init) =>
+    String(input).includes("?")
+      ? response(page(items))
+      : new Promise((accept) => {
+          resolveDetail = accept;
+          signal = init?.signal;
+        });
+  const view = render(<InteractionAttention {...props} />);
+  await waitFor(() => assert.ok(resolveDetail));
+  items = [];
+  await act(async () => {
+    view.rerender(<InteractionAttention {...props} refreshKey={1} />);
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.equal(signal?.aborted, true);
+  await act(async () => {
+    resolveDetail(response({ interaction: interaction("expired") }));
+  });
+  assert.equal(screen.queryByText("Question expired"), null);
   assert.equal(screen.queryByRole("region", { name: "待处理提醒" }), null);
 });
-const open = () => fireEvent.click(bell());
 
-test("unseen conversations update the bell and tab title without opening or stealing focus", async () => {
-  document.title = "My workspace";
-  const item = metadata("background", { host_name: "Other machine" });
-  const paths: string[] = [];
-  globalThis.fetch = async (input) => {
-    paths.push(String(input));
-    return response(page([item], 7));
-  };
-  const view = render(
-    <>
-      <input aria-label="Current draft" autoFocus />
-      <InteractionAttention {...props} />
-    </>,
-  );
-  const draft = screen.getByRole("textbox", { name: "Current draft" });
-  await waitFor(() =>
-    assert.equal(document.title, "[7 待处理] Codex Anywhere"),
-  );
-  assert.ok(bell().textContent?.includes("7"));
-  assert.equal(document.activeElement, draft);
-  assert.equal(screen.queryByRole("dialog"), null);
-  assert.ok(screen.getByRole("status").textContent?.includes("7"));
-  assert.deepEqual(paths, ["/api/interactions?limit=50&offset=0"]);
-  assert.equal(FakeNotification.requests, 0);
-  open();
-  assert.ok(await screen.findByText("Conversation background"));
-  assert.ok(screen.getByText("Other machine · 1 个问题"));
-  view.unmount();
-  assert.equal(document.title, "My workspace");
-});
-
-test("pagination remains expanded across refresh and pending metadata never loads full questions automatically", async () => {
-  const paths: string[] = [];
-  globalThis.fetch = async (input) => {
-    const path = String(input);
-    paths.push(path);
-    return response(
-      path.endsWith("offset=50")
-        ? page([metadata("second")], 2)
-        : page([metadata("first")], 2, 50),
-    );
-  };
+test("a stale previous list response cannot restore an expired current panel", async () => {
+  const pending: ((result: Response) => void)[] = [];
+  globalThis.fetch = async () => new Promise((accept) => pending.push(accept));
   const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("2")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
-  assert.ok(await screen.findByText("Conversation second"));
   view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await waitFor(() => assert.equal(paths.length, 4));
-  assert.ok(screen.getByText("Conversation first"));
-  assert.ok(screen.getByText("Conversation second"));
-  assert.ok(paths.every((path) => path.startsWith("/api/interactions?")));
-});
-
-test("selection loads the native form with no preselected answer and optional conversation navigation", async () => {
-  let navigation = "";
-  globalThis.fetch = async (input) =>
-    response(
-      String(input).includes("?")
-        ? page([metadata("one")])
-        : { interaction: interaction("one") },
-    );
-  render(
-    <InteractionAttention
-      {...props}
-      onNavigate={(id) => {
-        navigation = id;
-      }}
-    />,
-  );
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /Conversation one/ }));
-  assert.ok(await screen.findByText("Question one"));
-  assert.ok(
-    screen
-      .getAllByRole("radio")
-      .every((radio) => !(radio as HTMLInputElement).checked),
-  );
-  fireEvent.click(screen.getByRole("button", { name: "打开会话" }));
-  assert.equal(navigation, "thread-one");
-  assert.equal(screen.queryByRole("dialog"), null);
-});
-
-test("an unbound native request is answerable in the panel without a conversation link", async () => {
-  globalThis.fetch = async (input) =>
-    response(
-      String(input).includes("?")
-        ? page([
-            metadata("unbound", {
-              thread_id: null,
-              thread_title: "未关联会话",
-            }),
-          ])
-        : { interaction: { ...interaction("unbound"), thread_id: null } },
-    );
-  render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /未关联会话/ }));
-  await screen.findByText("Question unbound");
-  assert.equal(
-    (screen.getByRole("button", { name: "提交回答" }) as HTMLButtonElement)
-      .disabled,
-    false,
-  );
-  assert.equal(screen.queryByRole("button", { name: "打开会话" }), null);
-});
-
-test("a slow previous detail cannot replace a later selected question", async () => {
-  let resolveFirst!: (value: Response) => void;
-  let firstSignal: AbortSignal | null | undefined;
-  globalThis.fetch = async (input, init) => {
-    const path = String(input);
-    if (path.includes("?"))
-      return response(page([metadata("first"), metadata("second")]));
-    if (path.endsWith("/first")) {
-      firstSignal = init?.signal;
-      return new Promise((resolve) => {
-        resolveFirst = resolve;
-      });
-    }
-    return response({ interaction: interaction("second") });
-  };
-  render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("2")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /Conversation first/ }));
-  await waitFor(() => assert.ok(resolveFirst));
-  fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
-  fireEvent.click(screen.getByRole("button", { name: /Conversation second/ }));
-  await screen.findByText("Question second");
-  assert.equal(firstSignal?.aborted, true);
   await act(async () => {
-    resolveFirst(response({ interaction: interaction("first") }));
+    pending[1](response(page([])));
+    pending[0](response(page([metadata("old")])));
   });
-  assert.equal(screen.queryByText("Question first"), null);
-  assert.ok(screen.getByText("Conversation second"));
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
 });
 
-test("stale list responses are ignored and unmount aborts outstanding refreshes", async () => {
-  const pending: {
-    resolve: (value: Response) => void;
-    signal?: AbortSignal | null;
-  }[] = [];
-  globalThis.fetch = async (_input, init) =>
-    new Promise((resolve) => {
-      pending.push({ resolve, signal: init?.signal });
+test("resolved or missing detail removes its current reminder instead of retaining an old question inbox", async () => {
+  const state = server();
+  state.details.set("one", interaction("one", "expired"));
+  await act(async () => {
+    render(<InteractionAttention {...props} />);
+  });
+  assert.equal(state.paths.length, 2);
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.equal(screen.queryByRole("radio"), null);
+  assert.equal(screen.queryByText("这条请求已处理或已过期。"), null);
+});
+
+for (const failure of ["listError", "detailError"] as const) {
+  test(`${failure} preserves a live draft but requires confirmation before submitting`, async () => {
+    const state = server();
+    const view = render(<InteractionAttention {...props} />);
+    fireEvent.click(await screen.findByRole("radio", { name: "自定义回答" }));
+    const draft = within(panel()).getByLabelText(
+      "方案：自定义回答",
+    ) as HTMLInputElement;
+    fireEvent.change(draft, { target: { value: "do not discard" } });
+    state[failure] = true;
+    await act(async () => {
+      view.rerender(<InteractionAttention {...props} refreshKey={1} />);
     });
-  const view = render(<InteractionAttention {...props} />);
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  assert.equal(pending[0].signal?.aborted, true);
-  await act(async () => {
-    pending[1].resolve(response(page([metadata("new")], 3)));
-  });
-  assert.equal(document.title, "[3 待处理] Codex Anywhere");
-  await act(async () => {
-    pending[0].resolve(response(page([metadata("old")], 1)));
-  });
-  assert.equal(document.title, "[3 待处理] Codex Anywhere");
-  view.rerender(<InteractionAttention {...props} refreshKey={2} />);
-  view.unmount();
-  assert.equal(pending[2].signal?.aborted, true);
-  await act(async () => {
-    pending[2].resolve(response(page([], 0)));
-  });
-  assert.equal(document.title, "Codex Anywhere");
-});
-
-test("transient refresh errors preserve pending entries and clear after recovery", async () => {
-  let failed = false;
-  globalThis.fetch = async () =>
-    failed
-      ? response({ error: "Temporary outage" }, 503)
-      : response(page([metadata("kept")]));
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  failed = true;
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await screen.findByText("Temporary outage");
-  assert.ok(bell().classList.contains("has-error"));
-  assert.ok(bell().getAttribute("title")?.includes("无法更新"));
-  assert.ok(screen.getByText("Conversation kept"));
-  assert.equal(document.title, "[1 待处理] Codex Anywhere");
-  failed = false;
-  view.rerender(<InteractionAttention {...props} refreshKey={2} />);
-  await waitFor(() => assert.ok(!screen.queryByText("Temporary outage")));
-  assert.ok(!bell().classList.contains("has-error"));
-});
-
-test("a non-advancing expanded pagination response preserves the last good list", async () => {
-  let broken = false;
-  let requests = 0;
-  globalThis.fetch = async (input) => {
-    requests++;
-    return response(
-      String(input).endsWith("offset=50")
-        ? broken
-          ? page([], 2, 50)
-          : page([metadata("second")], 2)
-        : page([metadata("first")], 2, 50),
+    assert.ok(screen.getByRole("button", { name: "重新确认当前问题" }));
+    assert.equal(draft.value, "do not discard");
+    assert.equal(
+      (
+        within(panel()).getByRole("button", {
+          name: "提交回答",
+        }) as HTMLButtonElement
+      ).disabled,
+      true,
     );
-  };
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("2")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
-  await screen.findByText("Conversation second");
-  broken = true;
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await screen.findByText("待处理列表正在变化，请刷新后重试。");
-  assert.equal(requests, 4);
-  assert.ok(screen.getByText("Conversation first"));
-  assert.ok(screen.getByText("Conversation second"));
-});
-
-test("a request missing from a complete reminder refresh is read-only until its detail resyncs", async () => {
-  let disappeared = false;
-  let resolveDetail!: (value: Response) => void;
-  globalThis.fetch = async (input) => {
-    if (String(input).includes("?"))
-      return response(page(disappeared ? [] : [metadata("one")]));
-    if (disappeared)
-      return new Promise((resolve) => {
-        resolveDetail = resolve;
-      });
-    return response({ interaction: interaction("one") });
-  };
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /Conversation one/ }));
-  await screen.findByText("Question one");
-  disappeared = true;
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await screen.findByText("同步交互状态");
-  assert.ok(!screen.queryByRole("button", { name: "提交回答" }));
-  assert.ok(screen.getByText("Conversation one"));
-  await act(async () => {
-    resolveDetail(response({ interaction: interaction("one", "resolved") }));
+    state[failure] = false;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "重新确认当前问题" }));
+    });
+    assert.equal(
+      (
+        within(panel()).getByRole("button", {
+          name: "提交回答",
+        }) as HTMLButtonElement
+      ).disabled,
+      false,
+    );
+    assert.equal(draft.value, "do not discard");
+    assert.deepEqual(state.posts, []);
   });
-  await screen.findByText("这条请求已处理或已过期。");
+}
+
+test("periodic confirmation keeps current answer selections and removes them when the turn ends", async () => {
+  let tick: (() => void) | undefined;
+  window.setInterval = ((callback: () => void) => {
+    tick = callback;
+    return 987;
+  }) as typeof window.setInterval;
+  const state = server();
+  render(<InteractionAttention {...props} />);
+  const option = (await screen.findByRole("radio", {
+    name: /Revise/,
+  })) as HTMLInputElement;
+  fireEvent.click(option);
+  await act(async () => {
+    tick?.();
+  });
+  assert.equal(option.checked, true);
+  state.items = [];
+  await act(async () => {
+    tick?.();
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
 });
 
-test("answering and resolved detail resync preserves selected context and never resubmits", async () => {
-  let current = "pending";
-  let posted = 0;
-  let commandCount = 0;
-  globalThis.fetch = async (input, init) => {
-    const path = String(input);
-    if (init?.method === "POST") {
-      posted++;
-      assert.deepEqual(JSON.parse(String(init.body)), {
-        response: { answers: { approach: { answers: ["Proceed"] } } },
-      });
-      current = "answering";
-      return response({
-        command: { id: "answer", kind: "interaction.answer", status: "queued" },
-      });
-    }
-    return response(
-      path.includes("?")
-        ? page(current === "pending" ? [metadata("one")] : [])
-        : { interaction: interaction("one", current) },
-    );
-  };
-  const view = render(
-    <InteractionAttention
-      {...props}
-      onCommand={() => {
-        commandCount++;
-      }}
-    />,
-  );
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /Conversation one/ }));
-  fireEvent.click(await screen.findByRole("radio", { name: /Proceed/ }));
-  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
-  await screen.findByText("已提交，等待远程设备确认");
-  await waitFor(() => assert.equal(document.title, "Codex Anywhere"));
-  assert.ok(screen.getByText("Conversation one"));
-  assert.ok(screen.getByText("Workstation"));
-  assert.equal(posted, 1);
-  assert.equal(commandCount, 1);
-  current = "resolved";
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await screen.findByText("这条请求已处理或已过期。");
-  assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
-  assert.equal(posted, 1);
-});
-
-test("unknown asynchronous answers remain globally visible and cannot be resubmitted", async () => {
-  let status = "answer_unknown";
-  let posts = 0;
-  globalThis.fetch = async (input, init) => {
-    if (init?.method === "POST") posts++;
-    return response(
-      String(input).includes("?")
-        ? page([
-            metadata("unknown", {
-              method: "anywhere/message_questions",
-              blocking: false,
-            }),
-          ])
-        : {
-            interaction: {
-              ...interaction("unknown", status),
-              method: "anywhere/message_questions",
-              params: {
-                ...interaction("unknown").params,
-                isBlocking: false,
-                answerCommandStatus:
-                  status === "answer_unknown" ? "unknown" : "failed",
-              },
-            },
-          },
-    );
-  };
-  const view = render(<InteractionAttention {...props} />);
-  await screen.findByRole("region", { name: "待处理提醒" });
-  fireEvent.click(screen.getByRole("button", { name: "回答问题" }));
-  await screen.findByText("回答结果未知，请先检查对话记录，避免重复提交。");
-  assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
-  assert.ok(reminder());
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await screen.findByText("回答结果未知，请先检查对话记录，避免重复提交。");
-  assert.equal(posts, 0);
-  status = "pending";
-  view.rerender(<InteractionAttention {...props} refreshKey={2} />);
-  await screen.findByRole("radio", { name: /Proceed/ });
-  assert.ok(reminder());
-  assert.equal(posts, 0);
-});
-
-test("offline devices disable submitting an answer while retaining question content", async () => {
-  globalThis.fetch = async (input) =>
-    response(
-      String(input).includes("?")
-        ? page([metadata("offline")])
-        : { interaction: interaction("offline") },
-    );
+test("offline current questions remain visible while answer submission is disabled", async () => {
+  server();
   render(
     <InteractionAttention {...props} hosts={[{ ...host, online: false }]} />,
   );
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  fireEvent.click(screen.getByRole("button", { name: /Conversation offline/ }));
-  await screen.findByText("Question offline");
+  await screen.findByRole("radio", { name: /Proceed/ });
   assert.equal(
     (screen.getByRole("button", { name: "提交回答" }) as HTMLButtonElement)
       .disabled,
     true,
   );
-  assert.ok(screen.getByText("Workstation · 节点离线"));
+  assert.ok(screen.getByText("Workstation · 设备离线"));
 });
 
-test("focus, online, visibility and periodic fallback each refresh attention", async () => {
-  let requests = 0;
-  let timerCallback: (() => void) | undefined;
-  let cleared = false;
-  window.setInterval = ((callback: () => void, delay: number) => {
-    assert.equal(delay, 30_000);
-    timerCallback = callback;
-    return 987;
-  }) as typeof window.setInterval;
-  window.clearInterval = ((id: number) => {
-    assert.equal(id, 987);
-    cleared = true;
-  }) as typeof window.clearInterval;
-  globalThis.fetch = async () => {
-    requests++;
-    return response(page([]));
-  };
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.equal(requests, 1));
-  for (const [target, name] of [
-    [window, "focus"],
-    [window, "online"],
-    [document, "visibilitychange"],
-  ] as const) {
-    const previous = requests;
-    act(() => {
-      target.dispatchEvent(new Event(name));
-    });
-    await waitFor(() => assert.equal(requests, previous + 1));
-  }
-  act(() => {
-    timerCallback?.();
+test("unknown current answers stay read-only and disappear with authoritative current-turn expiry", async () => {
+  const state = server();
+  state.details.set("one", {
+    ...interaction("one", "answer_unknown"),
+    params: { ...interaction("one").params, answerCommandStatus: "unknown" },
   });
-  await waitFor(() => assert.equal(requests, 5));
-  view.unmount();
-  assert.equal(cleared, true);
-  window.dispatchEvent(new Event("online"));
-  assert.equal(requests, 5);
+  const view = render(<InteractionAttention {...props} />);
+  await screen.findByText("回答结果未知，请先检查对话记录，避免重复提交。");
+  assert.equal(screen.queryByRole("button", { name: "提交回答" }), null);
+  state.items = [];
+  await act(async () => {
+    view.rerender(<InteractionAttention {...props} refreshKey={1} />);
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.deepEqual(state.posts, []);
 });
 
-test("desktop notification permission is requested only by explicit enable and messages stay generic", async () => {
+test("an explicit inline answer sends once and the server-confirmed answered question disappears", async () => {
+  const state = server();
+  render(<InteractionAttention {...props} />);
+  fireEvent.click(await screen.findByRole("radio", { name: /Proceed/ }));
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.deepEqual(state.posts, [
+    { response: { answers: { approach: { answers: ["Proceed"] } } } },
+  ]);
+});
+
+test("native approvals retain explicit dialog review without showing an inline question", async () => {
+  const approval = metadata("approval", {
+    method: "item/commandExecution/requestApproval",
+    question_count: 0,
+    blocking: true,
+  });
+  const state = server([approval]);
+  state.details.set("approval", {
+    id: approval.id,
+    thread_id: approval.thread_id,
+    method: approval.method,
+    status: "pending",
+    params: { command: "echo hello" },
+  });
+  render(<InteractionAttention {...props} />);
+  await screen.findByRole("region", { name: "待处理提醒" });
+  assert.equal(state.paths.length, 1);
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  fireEvent.click(screen.getByRole("button", { name: "查看待处理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "允许这一次" }));
+  await waitFor(() => assert.equal(state.posts.length, 1));
+  assert.deepEqual(state.posts[0], { response: { decision: "accept" } });
+});
+
+test("unmount aborts both metadata and current detail requests", async () => {
+  let detailSignal: AbortSignal | null | undefined;
+  let resolve!: (result: Response) => void;
+  globalThis.fetch = async (input, init) =>
+    String(input).includes("?")
+      ? response(page([metadata("one")]))
+      : new Promise((accept) => {
+          resolve = accept;
+          detailSignal = init?.signal;
+        });
+  const view = render(<InteractionAttention {...props} />);
+  await waitFor(() => assert.ok(resolve));
+  view.unmount();
+  assert.equal(detailSignal?.aborted, true);
+  await act(async () => {
+    resolve(response({ interaction: interaction("one") }));
+  });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+});
+
+test("desktop notifications remain generic and permission is requested only explicitly", async () => {
   Object.defineProperty(document, "hidden", {
     configurable: true,
     value: true,
   });
-  globalThis.fetch = async () =>
-    response(
-      page([
-        metadata("sensitive", {
-          thread_title: "PRIVATE SECRET TASK",
-          host_name: "PRIVATE MACHINE",
-        }),
-      ]),
-    );
+  const state = server([
+    metadata("private", {
+      thread_title: "PRIVATE TASK",
+      host_name: "PRIVATE MACHINE",
+    }),
+  ]);
   render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
+  await screen.findByRole("radio", { name: /Proceed/ });
   assert.equal(FakeNotification.requests, 0);
-  assert.equal(FakeNotification.instances.length, 0);
-  open();
+  fireEvent.click(bell());
   fireEvent.click(screen.getByRole("button", { name: "启用桌面提醒" }));
   await waitFor(() => assert.equal(FakeNotification.instances.length, 1));
-  assert.equal(FakeNotification.requests, 1);
-  const notification = FakeNotification.instances[0];
-  assert.equal(notification.title, "Codex Anywhere · 待处理交互");
+  const notice = FakeNotification.instances[0];
   assert.equal(
-    notification.options.body,
+    notice.options.body,
     "有新的问题或审批等待处理，点击打开页面查看。",
   );
-  assert.ok(!JSON.stringify(notification.options).includes("PRIVATE"));
-  assert.ok(screen.getByRole("button", { name: "桌面提醒已启用" }));
+  assert.doesNotMatch(
+    JSON.stringify(notice.options),
+    /PRIVATE|Question private|Proceed/,
+  );
+  assert.deepEqual(state.posts, []);
 });
 
-test("background desktop notifications are deduplicated across event replay and remount", async () => {
+test("background notifications are deduplicated across current refreshes and remounts", async () => {
   FakeNotification.permission = "granted";
   Object.defineProperty(document, "hidden", {
     configurable: true,
     value: true,
   });
-  let items = [metadata("one")];
-  globalThis.fetch = async () => response(page(items));
+  server();
   const view = render(<InteractionAttention {...props} />);
   await waitFor(() => assert.equal(FakeNotification.instances.length, 1));
   view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await waitFor(() =>
-    assert.equal(document.title, "[1 待处理] Codex Anywhere"),
-  );
-  assert.equal(FakeNotification.instances.length, 1);
+  await screen.findByRole("radio", { name: /Proceed/ });
   view.unmount();
-  const remount = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  assert.equal(FakeNotification.instances.length, 1);
-  items = [...items, metadata("two")];
-  remount.rerender(<InteractionAttention {...props} refreshKey={2} />);
-  await waitFor(() => assert.equal(FakeNotification.instances.length, 2));
-  assert.equal(FakeNotification.requests, 0);
-});
-
-test("pending count increases beyond the loaded page trigger one generic reminder and pagination does not notify again", async () => {
-  FakeNotification.permission = "granted";
-  Object.defineProperty(document, "hidden", {
-    configurable: true,
-    value: true,
-  });
-  const firstPage = Array.from({ length: 50 }, (_, index) =>
-    metadata(String(index)),
-  );
-  let total = 51;
-  globalThis.fetch = async (input) =>
-    response(
-      String(input).endsWith("offset=50")
-        ? page([metadata("50"), metadata("51")], total)
-        : page(firstPage, total, 50),
-    );
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.equal(FakeNotification.instances.length, 1));
-  total = 52;
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await waitFor(() => assert.equal(FakeNotification.instances.length, 2));
-  assert.equal(
-    FakeNotification.instances[1].options.body,
-    "有新的问题或审批等待处理，点击打开页面查看。",
-  );
-  view.rerender(<InteractionAttention {...props} refreshKey={2} />);
-  await waitFor(() =>
-    assert.equal(document.title, "[52 待处理] Codex Anywhere"),
-  );
-  open();
-  fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
-  await screen.findByText("Conversation 51");
-  assert.equal(FakeNotification.instances.length, 2);
-});
-
-test("foreground requests use in-page reminders, and notification clicks focus the existing page", async () => {
-  FakeNotification.permission = "granted";
-  let focused = 0;
-  window.focus = () => {
-    focused++;
-  };
-  globalThis.fetch = async () => response(page([metadata("one")]));
-  const view = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  assert.equal(FakeNotification.instances.length, 0);
-  Object.defineProperty(document, "hidden", {
-    configurable: true,
-    value: true,
-  });
-  view.rerender(<InteractionAttention {...props} refreshKey={1} />);
-  await waitFor(() => assert.equal(FakeNotification.instances.length, 1));
-  act(() => {
-    FakeNotification.instances[0].onclick?.();
-  });
-  assert.equal(focused, 1);
-  assert.ok(screen.getByRole("dialog"));
-  assert.equal(screen.queryByRole("radio"), null);
-  assert.equal(FakeNotification.instances[0].closed, true);
-});
-
-test("denied and unsupported desktop notifications retain usable in-page reminders", async () => {
-  FakeNotification.permission = "denied";
-  globalThis.fetch = async () => response(page([metadata("one")]));
-  const denied = render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  assert.ok(screen.getByText("桌面提醒已被浏览器关闭，可在站点设置中开启。"));
-  assert.equal(
-    (screen.getByRole("button", { name: "启用桌面提醒" }) as HTMLButtonElement)
-      .disabled,
-    true,
-  );
-  denied.unmount();
-  Object.defineProperty(globalThis, "Notification", {
-    configurable: true,
-    value: undefined,
-  });
   render(<InteractionAttention {...props} />);
-  await waitFor(() => assert.ok(bell().textContent?.includes("1")));
-  open();
-  assert.ok(screen.getByText("此浏览器不支持桌面提醒，仍会显示页面内提示。"));
-  assert.ok(screen.getByText("Conversation one"));
-  assert.equal(FakeNotification.requests, 0);
+  await screen.findByRole("radio", { name: /Proceed/ });
+  assert.equal(FakeNotification.instances.length, 1);
+});
+
+test("initial list failures remain visible and do not claim there are no current questions", async () => {
+  const state = server();
+  state.listError = true;
+  render(<InteractionAttention {...props} />);
+  await waitFor(() => assert.ok(bell().classList.contains("has-error")));
+  fireEvent.click(bell());
+  assert.ok(screen.getByText("Temporary list outage"));
+  assert.equal(screen.queryByText("当前没有待处理的交互。"), null);
+  state.listError = false;
+  fireEvent.click(screen.getByRole("button", { name: "刷新" }));
+  await screen.findByRole("button", { name: /Conversation one/ });
+  fireEvent.click(screen.getByRole("button", { name: /Conversation one/ }));
+  await screen.findByRole("radio", { name: /Proceed/ });
+  assert.equal(screen.queryByRole("dialog"), null);
 });

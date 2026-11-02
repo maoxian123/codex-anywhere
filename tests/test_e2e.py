@@ -109,6 +109,7 @@ def live_system(tmp_path):
             "node WebSocket handshake",
         )
         yield {
+            "app": app,
             "client": client,
             "post": post,
             "host": host,
@@ -159,7 +160,8 @@ def test_remote_chat_images_approval_references_and_browser_replay(live_system):
     with connect(
         ws_url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
     ) as browser:
-        assert json.loads(browser.recv(timeout=5)) == {"type": "ready"}
+        ready = json.loads(browser.recv(timeout=5))
+        assert ready["type"] == "ready" and type(ready["event_cursor"]) is int
         browser.send(json.dumps({"type": "subscribe", "thread_id": thread_id, "after": 0}))
         upload = post(
             "/api/assets",
@@ -661,7 +663,8 @@ def test_browser_websocket_compacts_large_native_events_and_authenticated_raw_is
     with connect(
         ws_url, origin=system["url"], additional_headers={"Cookie": cookie}, proxy=None
     ) as browser:
-        assert json.loads(browser.recv(timeout=5)) == {"type": "ready"}
+        ready = json.loads(browser.recv(timeout=5))
+        assert ready["type"] == "ready" and type(ready["event_cursor"]) is int
         browser.send(json.dumps({"type": "subscribe", "thread_id": thread_id, "after": 0}))
         event = None
         deadline = time.monotonic() + 10

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import or_
 
-from .async_questions import ASYNC_QUESTION_METHOD, backfill_async_questions
+from .async_questions import ASYNC_QUESTION_METHOD, expire_inactive_async_questions
 from .models import Host, Interaction, Thread, db, iso
 
 USER_INPUT_METHODS = {"item/tool/requestUserInput", "tool/requestUserInput"}
@@ -73,7 +73,7 @@ def validate_user_input(interaction, response):
 
 def pending_interactions(limit, offset):
     """Return bounded metadata without exposing questions, secrets or RPC IDs."""
-    backfill_async_questions()
+    expire_inactive_async_questions()
     db.session.commit()
     query = (
         db.session.query(Interaction, Host.name, Thread.display_title, Thread.title)
@@ -85,10 +85,7 @@ def pending_interactions(limit, offset):
                 (Interaction.method == ASYNC_QUESTION_METHOD)
                 & (Interaction.status == "answer_unknown"),
             ),
-            or_(
-                Interaction.runtime_id == Host.runtime_id,
-                Interaction.method == ASYNC_QUESTION_METHOD,
-            ),
+            Interaction.runtime_id == Host.runtime_id,
         )
     )
     total = query.count()

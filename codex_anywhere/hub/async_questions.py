@@ -6,15 +6,62 @@ import hashlib
 import json
 import math
 
-from sqlalchemy import Text, and_, cast, or_
-
-from .models import Host, Interaction, Item, Thread, db
+from .models import Host, Interaction, Thread, db
 
 ASYNC_QUESTION_METHOD = "anywhere/message_questions"
 QUESTION_SOURCE = "request_user_input_async"
 REPLY_OPEN = "<send_user_message_question_reply>"
 REPLY_CLOSE = "</send_user_message_question_reply>"
-BACKFILL_BATCH_SIZE = 200
+
+
+def is_current_async_question(interaction, thread=None, host=None):
+    """Only a live question from this node's current active turn is actionable."""
+    if interaction.method != ASYNC_QUESTION_METHOD or not interaction.thread_id:
+        return False
+    thread = thread if thread is not None else db.session.get(Thread, interaction.thread_id)
+    host = host if host is not None else db.session.get(Host, interaction.host_id)
+    turn_id = interaction.params.get("sourceTurnId")
+    return bool(
+        thread
+        and host
+        and thread.id == interaction.thread_id
+        and thread.host_id == interaction.host_id == host.id
+        and thread.status in {"active", "waiting"}
+        and isinstance(turn_id, str)
+        and turn_id
+        and turn_id == thread.active_turn_id
+        and host.runtime_id
+        and interaction.runtime_id == host.runtime_id
+    )
+
+
+def expire_inactive_async_questions(thread_id=None):
+    """Expire obsolete prompts without scanning or changing native history."""
+    source_turn = Interaction.params["sourceTurnId"].as_string()
+    current = (
+        db.session.query(Interaction.id)
+        .join(Thread, Interaction.thread_id == Thread.id)
+        .join(Host, Interaction.host_id == Host.id)
+        .filter(
+            Interaction.method == ASYNC_QUESTION_METHOD,
+            Thread.host_id == Host.id,
+            Thread.status.in_(["active", "waiting"]),
+            source_turn.is_not(None),
+            source_turn != "",
+            source_turn == Thread.active_turn_id,
+            Host.runtime_id.is_not(None),
+            Host.runtime_id != "",
+            Interaction.runtime_id == Host.runtime_id,
+        )
+    )
+    stale = Interaction.query.filter(
+        Interaction.method == ASYNC_QUESTION_METHOD,
+        Interaction.status.in_(["pending", "answering", "answer_unknown"]),
+        Interaction.id.not_in(current),
+    )
+    if thread_id is not None:
+        stale = stale.filter(Interaction.thread_id == thread_id)
+    return stale.update({"status": "expired"}, synchronize_session="fetch")
 
 
 def _interaction_id(thread, item_id):
@@ -103,6 +150,10 @@ def _upsert_questions(thread, data, turn_id, created_at=None):
             interaction.created_at = created_at
         db.session.add(interaction)
         return interaction, True
+    if not is_current_async_question(interaction, thread):
+        if interaction.status in {"pending", "answering", "answer_unknown"}:
+            interaction.status = "expired"
+        return None, False
     params = dict(interaction.params)
     existing = params.get("questions", [])
     merged = {
@@ -243,89 +294,22 @@ def reply_display_text(data):
     return "\n\n".join(f"{entry['question']}\n{entry['answer']}" for entry in entries)
 
 
-def project_async_questions(thread, data, turn_id=None, *, created_at=None):
-    """Project native items without changing their raw payload or committing."""
+def project_async_questions(thread, data, turn_id=None, *, created_at=None, live=False):
+    """Only live current-turn items create prompts; native replies remain readable."""
     if not thread or not isinstance(data, dict):
         return None
     if data.get("type") == "agentMessage":
+        if (
+            not live
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or turn_id != thread.active_turn_id
+            or thread.status not in {"active", "waiting"}
+        ):
+            return None
+        host = db.session.get(Host, thread.host_id)
+        if not host or not host.runtime_id:
+            return None
         return _upsert_questions(thread, data, turn_id, created_at)[0]
     changed = _reconcile_replies(thread, data)
     return changed[-1] if changed else None
-
-
-def _batches(query):
-    cursor = None
-    while True:
-        page = query.filter(Item.id > cursor) if cursor is not None else query
-        rows = page.order_by(Item.id).limit(BACKFILL_BATCH_SIZE).all()
-        if not rows:
-            return
-        yield rows
-        cursor = rows[-1].id
-
-
-def backfill_async_questions(thread_id=None):
-    """Scan only question/reply JSON sources, with bounded rows and no Item cache."""
-    questions = db.session.query(
-        Item.id,
-        Item.thread_id,
-        Item.native_id,
-        Item.turn_id,
-        Item.created_at,
-        Item.data["questions"].label("questions"),
-    ).filter(Item.type == "agentMessage", Item.data["questions"].as_string().is_not(None))
-    replies = db.session.query(
-        Item.id,
-        Item.thread_id,
-        Item.type,
-        Item.data["content"].label("content"),
-        Item.data["input"].label("input"),
-        Item.data["status"].label("status"),
-    ).filter(
-        or_(
-            and_(
-                Item.type == "userMessage",
-                cast(Item.data["content"], Text).contains(REPLY_OPEN, autoescape=True),
-            ),
-            and_(
-                Item.type == "steeringUserMessage",
-                Item.data["status"].as_string() == "accepted",
-                cast(Item.data["input"], Text).contains(REPLY_OPEN, autoescape=True),
-            ),
-        )
-    )
-    if thread_id is not None:
-        questions = questions.filter(Item.thread_id == thread_id)
-        replies = replies.filter(Item.thread_id == thread_id)
-    changed = 0
-    for page in _batches(questions):
-        for row in page:
-            thread = db.session.get(Thread, row.thread_id)
-            if thread:
-                _, updated = _upsert_questions(
-                    thread,
-                    {
-                        "id": row.native_id,
-                        "type": "agentMessage",
-                        "questions": row.questions,
-                    },
-                    row.turn_id,
-                    row.created_at,
-                )
-                changed += int(updated)
-    for page in _batches(replies):
-        for row in page:
-            thread = db.session.get(Thread, row.thread_id)
-            if thread:
-                changed += len(
-                    _reconcile_replies(
-                        thread,
-                        {
-                            "type": row.type,
-                            "content": row.content,
-                            "input": row.input,
-                            "status": row.status,
-                        },
-                    )
-                )
-    return changed

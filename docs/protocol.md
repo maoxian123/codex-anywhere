@@ -528,10 +528,12 @@ preserved, including approvals and MCP elicitation.
   when the notification lacks `threadId` or the request has no linked hub thread.
   Turn completion and runtime replacement keep their existing expiry behavior.
 
-The browser exposes a persistent global pending count and a tab-title count, even
+The browser exposes a global current pending count and a tab-title count, even
 outside the affected conversation or on settings/new-conversation pages. WebSocket
-lifecycle changes and periodic/foreground refresh reconcile the count. A question
-arrival never opens a modal, steals draft focus or submits a choice automatically.
+lifecycle changes refresh it immediately; periodic/foreground refresh recovers
+missed updates. Current questions automatically display their content and choices
+in an inline panel without opening a modal, stealing draft focus or submitting a
+choice. Existing drafts are retained while their requests remain current.
 Desktop notifications require an explicit user click and browser permission; they
 contain only a generic reminder, never question/option/answer text. Request IDs are
 used to suppress repeat notifications. Desktop reminders require the page to remain
@@ -545,40 +547,54 @@ Codex 0.163 also emits `agentMessage.questions:[{title,options?:string[]|null}]`
 These are asynchronous message items, not server requests: completing the item
 does not answer the questions, and there is no question RPC ID or
 `serverRequest/resolved` notification. The node forwards the original native item
-unchanged. The hub projects its questions into a durable interaction with method
+unchanged. The hub projects live questions into an interaction with method
 `anywhere/message_questions`, `isBlocking:false`, and source item/turn IDs.
 Question IDs use compact JSON serialization of
 `["request_user_input_async",nativeItemId,zeroBasedQuestionIndex]`. Repeated item
-snapshots and history loads reuse the same interaction without reopening answers.
-Existing cached items are reconciled into this projection, including native
-answers already present in their history.
+snapshots reuse the same interaction without reopening answers. Only live native
+`item/started` and `item/completed` events for the current active turn create a
+question. History imports, cached items, completed-turn snapshots and old runtime
+events preserve their native payloads but never create attention prompts.
 
-The global pending API also includes unanswered async questions from earlier
-turns or runtime epochs, and async answers whose execution outcome is unknown.
-The persistent visible browser banner remains across task progress, navigation,
-refresh and temporary refresh failures. Only explicit answers resolve these
-questions; their reminders do not expire with a turn. Async questions permit work,
+Async questions are actionable only while their source turn is still active on
+the same runtime. Turn completion, replacement, interruption, failure and runtime
+changes expire their prompts. Read endpoints also expire previously accumulated
+obsolete prompts without scanning or deleting native message history. They are
+not a historical question inbox. Unknown answer outcomes remain guarded while
+the source question is current. Async questions permit work,
 normal follow-up queues and completion-based writer release to continue. Native
 RPC approvals and blocking questions retain their original lifecycle.
 
 The existing answer endpoint validates one nonempty answer per async question
-and journals ordinary native user input, never `interaction.answer`. Running
-turns receive `turn.steer` with the expected turn ID; idle threads receive
-`turn.start` with their saved execution settings. These explicit answers bypass
-the normal follow-up queue while respecting unsettled control commands. Text is
+and journals ordinary native user input, never `interaction.answer`. Current
+turns receive `turn.steer` with the expected turn ID, bypassing the normal
+follow-up queue. A stale question is rejected before journaling; an answer never
+revives a completed turn or starts another task. Text is
 the native `<send_user_message_question_reply>` envelope containing a compact
 JSON array of `{questionItemId,question,answer}` objects. The browser displays a
 readable answer rather than that transport envelope. Native `userMessage` and
 accepted `steeringUserMessage` envelopes also reconcile answers from other clients.
 Successful delivery resolves the interaction; a definitive failure permits an
-explicit retry, while an unknown outcome stays visible and cannot be retried
-automatically. Steer failures never silently start a second turn.
+explicit retry while the question remains current; an unknown outcome cannot be
+retried automatically. Steer failures never silently start a second turn.
 
 ## Browser WebSocket
 
 Browser event parameters use the same bounded presentation as paginated items. Large strings, inline images and oversized structures may be summarized with `params._truncated:true` and `params._raw_url:'/api/events/<id>'`. Authenticated `GET /api/events/<id>` returns `{event:originalEvent}`. Raw native events remain unchanged in durable storage. Serialize replay rows one at a time so large events do not accumulate in server memory. Approval interactions retain their full native decision payload in the interactions API.
 
-`/ws/client` uses session cookie; Origin must match request host. Client sends `{type:'subscribe',thread_id?,after:0}`. Server sends `{type:'ready'}` then events `{type:'event',id: integer,thread_id: string|null,method:string,params:object}`. Event IDs are hub-global monotonic cursors. Persist events before live broadcast. Reconnect and subscribe with last cursor. Global subscription (no thread_id) is permitted for the single administrator. UI can re-fetch a thread on lifecycle/item completion; delta events allow incremental rendering.
+`/ws/client` uses session cookie; Origin must match request host. Client sends
+`{type:'subscribe',thread_id?,after:0}`. Server first sends
+`{type:'ready',event_cursor:integer}` with the current committed journal head, then
+events `{type:'event',id:integer,thread_id:string|null,method:string,params:object}`.
+Event IDs are hub-global monotonic cursors. Persist events before live broadcast.
+The browser subscribes from the ready cursor and reloads current thread/list/
+attention projections on each connection, so old journal replay cannot delay new
+questions. Events committed after that boundary still arrive, including during
+snapshot requests. Older servers without a ready cursor retain the previous
+browser cursor fallback. Explicit historical subscriptions and replay from any
+valid supplied cursor remain supported. Global subscription (no thread_id) is
+permitted for the single administrator. UI can re-fetch a thread on lifecycle/
+item completion; delta events allow incremental rendering.
 
 ## Node HTTP and WebSocket
 

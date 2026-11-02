@@ -29,14 +29,17 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from .async_questions import ASYNC_QUESTION_METHOD, backfill_async_questions, encode_reply
+from .async_questions import (
+    ASYNC_QUESTION_METHOD,
+    encode_reply,
+    expire_inactive_async_questions,
+    is_current_async_question,
+)
 from .broker import Broker, install_full_writes
 from .execution import execution_settings, require_runtime_settings
 from .history import history_command_applied
 from .hosts import register_host_routes
 from .message_queue import (
-    CONTROL_KINDS,
-    PENDING_STATUSES,
     cancel_queued,
     dispatch_queue,
     enqueue_prepared,
@@ -1035,7 +1038,7 @@ def create_app(test_config=None):
         with app.extensions["broker"].command_lock:
             db.session.remove()
             thread = _get_thread(thread_id)
-            backfill_async_questions(thread.id)
+            expire_inactive_async_questions(thread.id)
             db.session.commit()
         query = Item.query.filter_by(thread_id=thread.id)
         paging = "item_limit" in request.args or "before_position" in request.args
@@ -1316,7 +1319,10 @@ def create_app(test_config=None):
         return jsonify(pending_interactions(limit, offset))
 
     @app.get("/api/interactions/<interaction_id>")
+    @_projection_locked
     def interaction_detail(interaction_id):
+        expire_inactive_async_questions()
+        db.session.commit()
         interaction = db.session.get(Interaction, _identifier(interaction_id, "interaction_id"))
         if not interaction:
             return jsonify(error="交互请求不存在"), 404
@@ -1373,6 +1379,11 @@ def create_app(test_config=None):
             return jsonify(command=command), 202
 
     def answer_message_questions(interaction, host, response):
+        if not is_current_async_question(interaction, host=host):
+            if interaction.status in {"pending", "answering", "answer_unknown"}:
+                interaction.status = "expired"
+                db.session.commit()
+            return jsonify(error="该问题所属轮次已结束或已失效"), 409
         if not host or interaction.status != "pending":
             return jsonify(error="该问题已处理或提交结果尚未确认，请先查看对话记录"), 409
         if not app.extensions["broker"].is_online(host.id):
@@ -1384,52 +1395,16 @@ def create_app(test_config=None):
             return jsonify(error="请先取消归档再回答问题"), 409
         validate_user_input(interaction, response)
         text, display_text = encode_reply(interaction, response)
-        kind = "turn.steer" if thread.active_turn_id else "turn.start"
         payload = dict(
             native_thread_id=thread.native_id,
+            expected_turn_id=thread.active_turn_id,
             input=[dict(type="text", text=text)],
             _display_text=display_text,
             _async_question_id=interaction.id,
         )
-        if kind == "turn.steer":
-            payload["expected_turn_id"] = thread.active_turn_id
-        else:
-            # An async answer bypasses the follow-up queue, like the native
-            # desktop. It still cannot race an unsettled operation or approval.
-            controls = Command.query.filter(
-                Command.thread_id == thread.id,
-                Command.runtime_id == host.runtime_id,
-                Command.kind.in_(CONTROL_KINDS),
-                Command.status.in_((*PENDING_STATUSES, "unknown")),
-            )
-            unsettled = any(
-                command.status != "unknown" or not command.payload.get("_queue_resume_ack")
-                for command in controls
-            )
-            approval = Interaction.query.filter(
-                Interaction.thread_id == thread.id,
-                Interaction.runtime_id == host.runtime_id,
-                Interaction.method != ASYNC_QUESTION_METHOD,
-                Interaction.status.in_(("pending", "answering")),
-            ).first()
-            if unsettled or approval or thread.status in {
-                "active", "waiting", "starting", "importing"
-            }:
-                return jsonify(error="当前操作尚未确认，请稍后刷新后回答"), 409
-            settings = execution_settings(thread.execution_settings or {})
-            if "runtimeSettings" in (host.capabilities or []):
-                require_runtime_settings(host, settings)
-                payload.update(
-                    execution_settings=settings,
-                    settings_revision=thread.settings_revision or 0,
-                )
-            elif set(settings) - {"model"}:
-                require_runtime_settings(host, settings)
-            thread.status = "active"
-            thread.last_error = None
         interaction.status = "answering"
         interaction.params = dict(interaction.params, answerCommandStatus="queued")
-        command = _issue_command(host, thread, kind, payload)
+        command = _issue_command(host, thread, "turn.steer", payload)
         return jsonify(command=command), 202
 
     @app.post("/api/assets")
@@ -1482,7 +1457,11 @@ def create_app(test_config=None):
         if not origin_valid():
             ws.close()
             return
-        ws.send(json.dumps({"type": "ready"}))
+        # Snapshot clients start at this boundary and fetch current projections.
+        # Replaying the entire event journal can delay live questions by minutes.
+        event_cursor = db.session.query(func.max(Event.id)).scalar() or 0
+        db.session.remove()
+        ws.send(json.dumps({"type": "ready", "event_cursor": event_cursor}))
         cursor = None
         thread_id = None
         while ws.connected:

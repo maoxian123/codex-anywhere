@@ -1,24 +1,25 @@
-"""Async questions are durable messages; replies are ordinary native user input."""
+"""Only live questions in the current turn are actionable user-input requests."""
 
 import asyncio
 import copy
 import json
 import sys
+import time
 from uuid import uuid4
 
 import pytest
 
-from codex_anywhere.hub.models import Command, Interaction, Item, db
+from codex_anywhere.hub.models import Command, Event, Interaction, Item, Thread, db
 from codex_anywhere.hub.transport import handle_node_message
 from codex_anywhere.node.runtime import CodexRuntime
 from codex_anywhere.node.service import NodeService
 
 
-def emit(app, host, thread, method, params, *, rpc_id=None, event_id=None):
+def emit(app, host, thread, method, params, *, rpc_id=None, event_id=None, runtime_id=None):
     frame = {
         "type": "event",
         "event_id": event_id or uuid4().hex,
-        "runtime_id": host["runtime_id"],
+        "runtime_id": runtime_id or host["runtime_id"],
         "seq": 1,
         "method": method,
         "params": {"threadId": thread["native_id"], **params},
@@ -113,9 +114,23 @@ def envelope(item_id="async-item"):
     )
 
 
-def ask(app, host, thread, identifier="async-item", *, method="item/completed"):
+def ask(
+    app,
+    host,
+    thread,
+    identifier="async-item",
+    *,
+    method="item/completed",
+    turn_id="async-turn",
+    runtime_id=None,
+):
     return emit(
-        app, host, thread, method, {"turnId": "async-turn", "item": native_item(identifier)}
+        app,
+        host,
+        thread,
+        method,
+        {"turnId": turn_id, "item": native_item(identifier)},
+        runtime_id=runtime_id,
     )
 
 
@@ -162,13 +177,24 @@ def thread_state(api, thread):
     return api("GET", f"/api/threads/{thread['id']}").get_json()["thread"]
 
 
-def test_async_question_survives_turn_end_and_runtime_change_without_blocking_work(
-    app, api, paired_host, create_thread
+@pytest.mark.parametrize("end", ["turn", "new_turn", "runtime", "stopped", "error"])
+def test_live_question_is_immediate_and_expires_when_its_source_is_no_longer_current(
+    app, api, paired_host, create_thread, end
 ):
     host = paired_host()
     thread = create_thread(host)
     begin(app, api, host, thread)
     ask(app, host, thread)
+    # No GET is needed to create the interaction or publish its refresh event.
+    with app.app_context():
+        saved = Interaction.query.filter_by(
+            thread_id=thread["id"], method="anywhere/message_questions"
+        ).one()
+        assert saved.status == "pending"
+        published = Event.query.filter_by(
+            thread_id=thread["id"], method="anywhere/message_questions"
+        ).all()
+        assert any(event.params.get("interaction_id") == saved.id for event in published)
     pending = one_question(api)
     assert pending["blocking"] is False and pending["question_count"] == 2
     assert thread_state(api, thread)["status"] == "active"
@@ -179,17 +205,36 @@ def test_async_question_survives_turn_end_and_runtime_change_without_blocking_wo
         question_id("async-item", 0),
         question_id("async-item", 1),
     ]
-    finish(app, host, thread)
-    assert one_question(api)["id"] == pending["id"]
-    assert thread_state(api, thread)["status"] == "idle"
-    handle_node_message(
-        app, host["host"]["id"], {"type": "hello", "runtime_id": uuid4().hex, "version": "fake"}
-    )
-    assert one_question(api)["id"] == pending["id"]
-    assert full(api, pending["id"])["status"] == "pending"
+    if end == "turn":
+        finish(app, host, thread)
+    elif end == "new_turn":
+        emit(app, host, thread, "turn/started", {"turn": {"id": "new-turn"}})
+    elif end == "runtime":
+        handle_node_message(
+            app, host["host"]["id"], {"type": "hello", "runtime_id": uuid4().hex, "version": "fake"}
+        )
+    elif end == "stopped":
+        emit(app, host, thread, "anywhere/runtime_stopped", {"returncode": 1})
+    else:
+        emit(
+            app,
+            host,
+            thread,
+            "error",
+            {"turnId": "async-turn", "error": {"message": "Task failed"}},
+        )
+    assert reminders(api)["total"] == 0
+    assert full(api, pending["id"])["status"] == "expired"
+    with app.app_context():
+        assert (
+            Item.query.filter_by(thread_id=thread["id"], native_id="async-item")
+            .one()
+            .data["questions"]
+            == native_item()["questions"]
+        )
 
 
-def test_async_item_start_completion_replay_and_backfill_create_only_one_request(
+def test_async_item_start_completion_and_replay_create_only_one_request_and_do_not_reopen_answers(
     app, api, paired_host, create_thread
 ):
     host = paired_host()
@@ -219,17 +264,19 @@ def test_async_item_start_completion_replay_and_backfill_create_only_one_request
         assert saved.data["futureNativeField"] == {"preserve": True}
 
 
-def test_global_reminders_backfill_old_cached_agent_questions_without_native_rpc(
-    app, api, paired_host, create_thread
+@pytest.mark.parametrize("source_turn", ["finished-turn", "async-turn"])
+def test_get_requests_never_create_questions_from_cached_agent_items(
+    app, api, paired_host, create_thread, source_turn
 ):
     host = paired_host()
     thread = create_thread(host)
+    begin(app, api, host, thread)
     with app.app_context():
         db.session.add(
             Item(
                 thread_id=thread["id"],
                 native_id="old-item",
-                turn_id="finished-turn",
+                turn_id=source_turn,
                 type="agentMessage",
                 data=native_item("old-item"),
                 position=1,
@@ -237,24 +284,170 @@ def test_global_reminders_backfill_old_cached_agent_questions_without_native_rpc
         )
         db.session.commit()
     before = len(wires(host))
-    pending = one_question(api)
-    assert pending["thread_id"] == thread["id"]
-    assert full(api, pending["id"])["params"]["sourceItemId"] == "old-item"
-    assert one_question(api)["id"] == pending["id"]
+    assert reminders(api)["total"] == 0
+    detail = api("GET", f"/api/threads/{thread['id']}").get_json()
+    assert detail["interactions"] == []
+    assert next(item for item in detail["items"] if item["native_id"] == "old-item")[
+        "data"
+    ] == native_item("old-item")
+    assert reminders(api)["total"] == 0
+    with app.app_context():
+        assert Interaction.query.filter_by(thread_id=thread["id"]).count() == 0
     assert len(wires(host)) == before
 
 
-@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.parametrize("source", ["old_turn", "old_runtime", "idle", "turn_snapshot", "import"])
+def test_historical_or_inactive_native_items_are_kept_without_creating_pending_questions(
+    app, api, paired_host, create_thread, source
+):
+    host = paired_host()
+    if source == "import":
+        imported = api(
+            "POST",
+            f"/api/hosts/{host['host']['id']}/imports",
+            json={
+                "native_thread_id": "imported-questions",
+                "title": "History",
+                "cwd": host["root"],
+            },
+        ).get_json()
+        thread = imported["thread"]
+        command_id = imported["command"]["id"]
+        emit(
+            app,
+            host,
+            thread,
+            "anywhere/import_metadata",
+            {
+                "commandId": command_id,
+                "thread": {"id": thread["native_id"], "cwd": host["root"], "name": "History"},
+            },
+        )
+        emit(
+            app,
+            host,
+            thread,
+            "anywhere/import_item",
+            {
+                "commandId": command_id,
+                "position": 1,
+                "turnId": "finished-turn",
+                "item": native_item(),
+            },
+        )
+        emit(
+            app, host, thread, "anywhere/import_complete", {"commandId": command_id, "itemCount": 1}
+        )
+    else:
+        thread = create_thread(host)
+        begin(app, api, host, thread)
+        if source == "idle":
+            finish(app, host, thread)
+            ask(app, host, thread)
+        elif source == "old_turn":
+            ask(app, host, thread, turn_id="finished-turn")
+        elif source == "old_runtime":
+            ask(app, host, thread, runtime_id=uuid4().hex)
+        else:
+            emit(
+                app,
+                host,
+                thread,
+                "turn/completed",
+                {
+                    "turn": {"id": "async-turn", "status": "completed", "items": [native_item()]},
+                },
+            )
+    assert reminders(api)["total"] == 0
+    detail = api("GET", f"/api/threads/{thread['id']}").get_json()
+    assert detail["interactions"] == []
+    saved = next(item for item in detail["items"] if item["native_id"] == "async-item")
+    assert saved["data"] == native_item()
+    with app.app_context():
+        assert Interaction.query.filter_by(thread_id=thread["id"]).count() == 0
+
+
+@pytest.mark.parametrize("route", ["global", "thread"])
+def test_get_cleanup_expires_old_app_pending_questions_without_deleting_native_history(
+    app, api, paired_host, create_thread, route
+):
+    host = paired_host()
+    thread = create_thread(host)
+    begin(app, api, host, thread)
+    ask(app, host, thread)
+    with app.app_context():
+        question = Interaction.query.filter_by(
+            thread_id=thread["id"], method="anywhere/message_questions"
+        ).one()
+        question_id = question.id
+        question.created_at = time.time() - 172800
+        question.params = {**question.params, "sourceTurnId": "old-app-finished-turn"}
+        raw_before = copy.deepcopy(
+            Item.query.filter_by(thread_id=thread["id"], native_id="async-item").one().data
+        )
+        db.session.commit()
+    before = len(wires(host))
+    if route == "global":
+        assert reminders(api)["total"] == 0
+    else:
+        detail = api("GET", f"/api/threads/{thread['id']}").get_json()
+        assert (
+            next(row for row in detail["interactions"] if row["id"] == question_id)["status"]
+            == "expired"
+        )
+    with app.app_context():
+        assert db.session.get(Interaction, question_id).status == "expired"
+        assert Interaction.query.filter_by(thread_id=thread["id"]).count() == 1
+        assert (
+            Item.query.filter_by(thread_id=thread["id"], native_id="async-item").one().data
+            == raw_before
+        )
+    assert len(wires(host)) == before
+
+
+@pytest.mark.parametrize("stale", ["source_turn", "missing_turn", "runtime", "idle"])
+def test_answer_rejects_stale_persisted_source_before_any_get_cleanup_or_command_creation(
+    app, api, paired_host, create_thread, stale
+):
+    host = paired_host()
+    thread = create_thread(host)
+    begin(app, api, host, thread)
+    ask(app, host, thread)
+    with app.app_context():
+        question = Interaction.query.filter_by(
+            thread_id=thread["id"], method="anywhere/message_questions"
+        ).one()
+        interaction_id = question.id
+        assert question.status == "pending"
+        if stale == "runtime":
+            question.runtime_id = uuid4().hex
+        elif stale == "idle":
+            current = db.session.get(Thread, thread["id"])
+            current.status, current.active_turn_id = "idle", None
+        else:
+            question.params = {
+                **question.params,
+                "sourceTurnId": "finished-turn" if stale == "source_turn" else None,
+            }
+        db.session.commit()
+        commands_before = Command.query.count()
+    before = len(wires(host))
+    response = answer(api, interaction_id)
+    assert response.status_code == 409, response.get_json()
+    assert len(wires(host)) == before
+    with app.app_context():
+        assert Command.query.count() == commands_before
+        assert db.session.get(Interaction, interaction_id).status == "expired"
+
+
 def test_answer_uses_ordinary_input_with_exact_native_envelope_and_journals_before_delivery(
-    app, api, paired_host, create_thread, active
+    app, api, paired_host, create_thread
 ):
     host = paired_host()
     thread = create_thread(host)
     begin(app, api, host, thread)
     ask(app, host, thread)
     interaction_id = one_question(api)["id"]
-    if not active:
-        finish(app, host, thread)
     sent = []
     original_send = host["socket"].send
 
@@ -277,11 +470,10 @@ def test_answer_uses_ordinary_input_with_exact_native_envelope_and_journals_befo
     assert accepted.status_code == 202, accepted.get_json()
     assert len(sent) == 1
     command = sent[0]
-    assert command["kind"] == ("turn.steer" if active else "turn.start")
+    assert command["kind"] == "turn.steer"
     assert command["payload"]["input"] == [{"type": "text", "text": envelope()}]
     assert command["payload"]["native_thread_id"] == thread["native_id"]
-    if active:
-        assert command["payload"]["expected_turn_id"] == "async-turn"
+    assert command["payload"]["expected_turn_id"] == "async-turn"
     assert wires(host, "interaction.answer") == []
     assert full(api, interaction_id)["status"] == "answering"
     assert answer(api, interaction_id).status_code == 409
@@ -289,6 +481,25 @@ def test_answer_uses_ordinary_input_with_exact_native_envelope_and_journals_befo
     assert full(api, interaction_id)["status"] == "resolved"
     assert answer(api, interaction_id).status_code == 409
     assert len(sent) == 1
+
+
+def test_late_failed_answer_does_not_reopen_an_expired_source_as_an_idle_task(
+    app, api, paired_host, create_thread
+):
+    host = paired_host()
+    thread = create_thread(host)
+    begin(app, api, host, thread)
+    ask(app, host, thread)
+    interaction_id = one_question(api)["id"]
+    accepted = answer(api, interaction_id)
+    assert accepted.status_code == 202, accepted.get_json()
+    finish(app, host, thread)
+    settle(app, host, accepted.get_json()["command"], error="The source turn has completed")
+    before = len(wires(host))
+    assert full(api, interaction_id)["status"] == "expired"
+    assert reminders(api)["total"] == 0
+    assert answer(api, interaction_id).status_code == 409
+    assert len(wires(host)) == before
 
 
 def test_definitive_steer_failure_returns_pending_without_automatic_start_fallback(
@@ -302,8 +513,7 @@ def test_definitive_steer_failure_returns_pending_without_automatic_start_fallba
     accepted = answer(api, interaction_id)
     assert accepted.status_code == 202, accepted.get_json()
     first = accepted.get_json()["command"]
-    finish(app, host, thread)
-    settle(app, host, first, error="Turn is no longer active")
+    settle(app, host, first, error="Input was rejected before delivery")
     assert full(api, interaction_id)["status"] == "pending"
     assert one_question(api)["id"] == interaction_id
     assert len(wires(host, "turn.start")) == 1
@@ -312,7 +522,7 @@ def test_definitive_steer_failure_returns_pending_without_automatic_start_fallba
     assert len(wires(host, "turn.start")) == 1
     retry = answer(api, interaction_id)
     assert retry.status_code == 202, retry.get_json()
-    assert retry.get_json()["command"]["kind"] == "turn.start"
+    assert retry.get_json()["command"]["kind"] == "turn.steer"
     assert retry.get_json()["command"]["id"] != first["id"]
 
 
@@ -331,8 +541,6 @@ def test_unknown_answer_is_visible_as_uncertain_and_never_automatically_retried(
     assert full(api, interaction_id)["status"] == "answer_unknown"
     assert answer(api, interaction_id).status_code == 409
     before = len(wires(host))
-    finish(app, host, thread)
-    ask(app, host, thread)
     handle_node_message(app, host["host"]["id"], {"type": "ping"})
     handle_node_message(
         app,
@@ -341,10 +549,16 @@ def test_unknown_answer_is_visible_as_uncertain_and_never_automatically_retried(
     )
     api("GET", "/api/interactions")
     assert full(api, interaction_id)["status"] == "answer_unknown"
+    assert one_question(api)["id"] == interaction_id
+    assert len(wires(host)) == before
+    finish(app, host, thread)
+    ask(app, host, thread)
+    assert full(api, interaction_id)["status"] == "expired"
+    assert reminders(api)["total"] == 0
     assert len(wires(host)) == before
 
 
-def test_runtime_restart_marks_inflight_async_reply_unknown_and_late_confirmation_can_settle_it(
+def test_runtime_restart_expires_inflight_question_and_late_confirmation_cannot_reopen_it(
     app, api, paired_host, create_thread
 ):
     host = paired_host()
@@ -362,13 +576,13 @@ def test_runtime_restart_marks_inflight_async_reply_unknown_and_late_confirmatio
         {"type": "hello", "runtime_id": uuid4().hex, "version": "fake"},
     )
     assert api("GET", f"/api/commands/{command['id']}").get_json()["command"]["status"] == "unknown"
-    assert full(api, interaction_id)["status"] == "answer_unknown"
-    assert one_question(api)["id"] == interaction_id
+    assert full(api, interaction_id)["status"] == "expired"
+    assert reminders(api)["total"] == 0
     assert answer(api, interaction_id).status_code == 409
     assert len(wires(host)) == before
     # This is confirmation of the previous command, never a re-delivery.
     settle(app, host, command, result={"accepted": True})
-    assert full(api, interaction_id)["status"] == "resolved"
+    assert full(api, interaction_id)["status"] == "expired"
     assert thread_state(api, thread)["status"] == "interrupted"
     assert len(wires(host)) == before
 
@@ -390,8 +604,8 @@ def test_unanswered_async_question_does_not_block_the_follow_up_fifo(
     finish(app, host, thread)
     api("GET", f"/api/threads/{thread['id']}/queue")
     assert [row["id"] for row in wires(host, "turn.start")][-1] == queued["id"]
-    assert one_question(api)["id"] == interaction_id
-    assert full(api, interaction_id)["status"] == "pending"
+    assert reminders(api)["total"] == 0
+    assert full(api, interaction_id)["status"] == "expired"
 
 
 def test_answering_async_question_preserves_a_separate_native_approval(
@@ -451,11 +665,11 @@ def test_unknown_prior_control_blocks_new_turn_but_a_known_active_turn_can_be_st
         assert len(wires(host)) == before + 1
     else:
         assert response.status_code == 409, response.get_json()
-        assert full(api, interaction_id)["status"] == "pending"
+        assert full(api, interaction_id)["status"] == "expired"
         assert len(wires(host)) == before
 
 
-def test_explicitly_acknowledged_unknown_control_does_not_block_an_idle_async_reply(
+def test_acknowledging_an_unknown_control_never_revives_an_old_question_as_a_new_turn(
     app, api, paired_host, create_thread
 ):
     host = paired_host()
@@ -494,9 +708,11 @@ def test_explicitly_acknowledged_unknown_control_does_not_block_an_idle_async_re
         assert acknowledged.status == "unknown"
         assert acknowledged.payload["_queue_resume_ack"] > 1
     assert thread_state(api, thread)["status"] == "idle"
+    before = len(wires(host))
     accepted = answer(api, interaction_id)
-    assert accepted.status_code == 202, accepted.get_json()
-    assert accepted.get_json()["command"]["kind"] == "turn.start"
+    assert accepted.status_code == 409, accepted.get_json()
+    assert full(api, interaction_id)["status"] == "expired"
+    assert len(wires(host)) == before
 
 
 def test_async_reply_targets_the_correct_machine_even_for_identical_native_item_ids(

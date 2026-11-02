@@ -7,15 +7,15 @@ import json
 import pytest
 from sqlalchemy import event
 
-from codex_anywhere.hub import async_questions
 from codex_anywhere.hub.async_questions import (
     ASYNC_QUESTION_METHOD,
-    backfill_async_questions,
     encode_reply,
+    expire_inactive_async_questions,
+    is_current_async_question,
     project_async_questions,
     reply_display_text,
 )
-from codex_anywhere.hub.models import Interaction, Item, Thread, db
+from codex_anywhere.hub.models import Host, Interaction, Item, Thread, db
 
 
 @pytest.fixture
@@ -23,7 +23,17 @@ def source_thread(app, paired_host, create_thread):
     host = paired_host()
     thread = create_thread(host)
     with app.app_context():
-        yield db.session.get(Thread, thread["id"])
+        current = db.session.get(Thread, thread["id"])
+        current.status = "active"
+        current.active_turn_id = "turn"
+        db.session.commit()
+        yield current
+
+
+def project_current(thread, data, turn_id=None, **kwargs):
+    return project_async_questions(
+        thread, data, thread.active_turn_id if turn_id is None else turn_id, live=True, **kwargs
+    )
 
 
 def source(identifier="agent-question", questions=None):
@@ -99,7 +109,7 @@ def test_question_projection_normalizes_without_mutating_native_payload(source_t
         ]
     )
     original = copy.deepcopy(data)
-    interaction = project_async_questions(source_thread, data, "native-turn", created_at=123.5)
+    interaction = project_current(source_thread, data, "turn", created_at=123.5)
     assert data == original
     assert interaction.method == ASYNC_QUESTION_METHOD
     assert interaction.status == "pending"
@@ -114,7 +124,7 @@ def test_question_projection_normalizes_without_mutating_native_payload(source_t
     ).hexdigest()[:32]
     assert interaction.id == expected_id
     assert interaction.params["sourceItemId"] == "agent-question"
-    assert interaction.params["sourceTurnId"] == "native-turn"
+    assert interaction.params["sourceTurnId"] == "turn"
     assert interaction.params["isBlocking"] is False
     assert interaction.params["questions"] == [
         {
@@ -156,13 +166,13 @@ def test_invalid_questions_are_left_as_native_data_without_actionable_interactio
     data = source()
     data["questions"] = questions
     original = copy.deepcopy(data)
-    assert project_async_questions(source_thread, data) is None
+    assert project_current(source_thread, data) is None
     assert data == original
     assert Interaction.query.count() == 0
 
 
 def test_streaming_and_history_deduplicate_and_preserve_answer_metadata(source_thread):
-    first = project_async_questions(source_thread, source(), "turn")
+    first = project_current(source_thread, source(), "turn")
     first.params = dict(
         first.params, answeredQuestionIds=[question_id()], answerCommandStatus="failed"
     )
@@ -173,7 +183,7 @@ def test_streaming_and_history_deduplicate_and_preserve_answer_metadata(source_t
             {"title": "另一个问题"},
         ]
     )
-    repeated = project_async_questions(source_thread, data, "turn")
+    repeated = project_current(source_thread, data, "turn")
     assert repeated.id == first.id
     assert repeated.status == "answer_unknown"
     assert repeated.params["answerCommandStatus"] == "failed"
@@ -181,16 +191,16 @@ def test_streaming_and_history_deduplicate_and_preserve_answer_metadata(source_t
     assert repeated.params["questions"][0]["question"] == "更新后的标题"
     assert len(repeated.params["questions"]) == 2
     repeated.status = "resolved"
-    project_async_questions(source_thread, data, "turn")
+    project_current(source_thread, data, "turn")
     assert Interaction.query.count() == 1
     assert repeated.status == "resolved"
 
 
 def test_completed_snapshot_restores_original_order_after_partial_questions(source_thread):
     data = source(questions=[None, {"title": "Second?"}])
-    interaction = project_async_questions(source_thread, data)
+    interaction = project_current(source_thread, data)
     assert [value["id"] for value in interaction.params["questions"]] == [question_id(index=1)]
-    project_async_questions(
+    project_current(
         source_thread,
         source(
             questions=[
@@ -207,7 +217,7 @@ def test_completed_snapshot_restores_original_order_after_partial_questions(sour
 
 def test_reply_encoding_preserves_original_title_and_exact_single_answer(source_thread):
     title = "问题\n原始标题"
-    interaction = project_async_questions(source_thread, source(questions=[{"title": title}]))
+    interaction = project_current(source_thread, source(questions=[{"title": title}]))
     text = '  自定义 <tag>\n"answer"  '
     envelope, display = encode_reply(interaction, {"answers": {question_id(): {"answers": [text]}}})
     assert envelope.startswith("<send_user_message_question_reply>\n[")
@@ -220,18 +230,18 @@ def test_reply_encoding_preserves_original_title_and_exact_single_answer(source_
 
 @pytest.mark.parametrize("values", [[], ["one", "two"], "not-array", ["invalid\ud800"]])
 def test_reply_encoder_rejects_ambiguous_or_invalid_answer_strings(source_thread, values):
-    interaction = project_async_questions(source_thread, source())
+    interaction = project_current(source_thread, source())
     with pytest.raises(ValueError):
         encode_reply(interaction, {"answers": {question_id(): {"answers": values}}})
 
 
 @pytest.mark.parametrize("kind", ["userMessage", "steeringUserMessage"])
 def test_confirmed_native_reply_resolves_only_known_question_ids(source_thread, kind):
-    interaction = project_async_questions(source_thread, source(), "turn")
+    interaction = project_current(source_thread, source(), "turn")
     interaction.status = "answer_unknown"
     data = reply([answer(), answer(question_id("unknown-item"))], kind=kind)
     original = copy.deepcopy(data)
-    updated = project_async_questions(source_thread, data, "turn")
+    updated = project_current(source_thread, data, "turn")
     assert updated.id == interaction.id
     assert interaction.status == "resolved"
     assert interaction.params["answeredQuestionIds"] == [question_id()]
@@ -240,7 +250,7 @@ def test_confirmed_native_reply_resolves_only_known_question_ids(source_thread, 
 
 
 def test_partial_replies_accumulate_until_all_questions_are_confirmed(source_thread):
-    interaction = project_async_questions(
+    interaction = project_current(
         source_thread,
         source(
             questions=[
@@ -249,15 +259,15 @@ def test_partial_replies_accumulate_until_all_questions_are_confirmed(source_thr
             ]
         ),
     )
-    project_async_questions(source_thread, reply([answer(question_id(index=0))]))
+    project_current(source_thread, reply([answer(question_id(index=0))]))
     assert interaction.status == "pending"
     assert interaction.params["answeredQuestionIds"] == [question_id(index=0)]
-    project_async_questions(source_thread, source(questions=[{"title": "First?"}]))
+    project_current(source_thread, source(questions=[{"title": "First?"}]))
     assert len(interaction.params["questions"]) == 2
-    project_async_questions(source_thread, reply([answer(question_id(index=1))]))
+    project_current(source_thread, reply([answer(question_id(index=1))]))
     assert interaction.status == "resolved"
     assert interaction.params["answeredQuestionIds"] == [question_id(index=0), question_id(index=1)]
-    project_async_questions(source_thread, source())
+    project_current(source_thread, source())
     assert interaction.status == "resolved"
 
 
@@ -271,8 +281,8 @@ def test_partial_replies_accumulate_until_all_questions_are_confirmed(source_thr
     ],
 )
 def test_nonaccepted_or_nonuser_sources_cannot_resolve_questions(source_thread, kind, status):
-    interaction = project_async_questions(source_thread, source())
-    project_async_questions(source_thread, reply([answer()], kind=kind, status=status))
+    interaction = project_current(source_thread, source())
+    project_current(source_thread, reply([answer()], kind=kind, status=status))
     assert interaction.status == "pending"
     assert "answeredQuestionIds" not in interaction.params
 
@@ -288,23 +298,27 @@ def test_nonaccepted_or_nonuser_sources_cannot_resolve_questions(source_thread, 
     ],
 )
 def test_quoted_or_malformed_reply_text_does_not_answer(source_thread, transform):
-    interaction = project_async_questions(source_thread, source())
+    interaction = project_current(source_thread, source())
     data = reply([answer()])
     data["content"][0]["text"] = transform(data["content"][0]["text"])
-    project_async_questions(source_thread, data)
+    project_current(source_thread, data)
     assert interaction.status == "pending"
 
 
 def test_reply_ids_are_scoped_to_their_original_thread(source_thread):
-    interaction = project_async_questions(source_thread, source())
+    interaction = project_current(source_thread, source())
     other = Thread(
-        host_id=source_thread.host_id, cwd=source_thread.cwd, title="Other", status="idle"
+        host_id=source_thread.host_id,
+        cwd=source_thread.cwd,
+        title="Other",
+        status="active",
+        active_turn_id="turn",
     )
     db.session.add(other)
     db.session.flush()
-    project_async_questions(other, reply([answer()]))
+    project_current(other, reply([answer()]))
     assert interaction.status == "pending"
-    other_interaction = project_async_questions(other, source())
+    other_interaction = project_current(other, source())
     assert interaction.id != other_interaction.id
 
 
@@ -337,89 +351,131 @@ def test_reply_display_text_ignores_unaccepted_or_quoted_native_payloads():
     )
 
 
-def test_backfill_projects_questions_before_earlier_ordered_replies_and_is_idempotent(
-    source_thread, monkeypatch
+@pytest.mark.parametrize(
+    "live,turn_id,status,active_turn",
+    [
+        (False, "turn", "active", "turn"),
+        (True, "old-turn", "active", "turn"),
+        (True, "", "active", "turn"),
+        (True, None, "active", "turn"),
+        (True, "turn", "idle", None),
+        (True, "turn", "error", "turn"),
+    ],
+)
+def test_only_current_live_turn_can_create_actionable_questions(
+    source_thread, live, turn_id, status, active_turn
 ):
-    monkeypatch.setattr(async_questions, "BACKFILL_BATCH_SIZE", 2)
-    entries = []
-    for index in range(5):
-        identifier = f"question-{index}"
-        persist_item(
-            source_thread,
-            source(identifier),
-            identifier=f"item-{index + 1}",
-            position=index + 1,
-            created_at=100 + index,
-        )
-        entries.append(answer(question_id(identifier)))
-    persist_item(source_thread, reply(entries), identifier="item-0", position=6, created_at=50)
-    db.session.commit()
-    assert backfill_async_questions(source_thread.id) == 10
-    interactions = Interaction.query.order_by(Interaction.created_at).all()
-    assert len(interactions) == 5
-    assert [row.created_at for row in interactions] == [100, 101, 102, 103, 104]
-    assert all(row.status == "resolved" for row in interactions)
-    assert backfill_async_questions(source_thread.id) == 0
-
-
-def test_backfill_only_reads_question_json_and_trusted_reply_sources_without_item_cache(
-    source_thread, monkeypatch
-):
-    huge = "unrelated native content " * 30000
+    source_thread.status = status
+    source_thread.active_turn_id = active_turn
     data = source()
-    data["text"] = huge
-    persist_item(source_thread, data, position=1)
-    persist_item(source_thread, {"type": "agentMessage", "text": huge}, position=2)
-    # A quoted envelope in an agent message or rejected steering item must not
-    # be mistaken for a desktop user's accepted reply during backfill.
-    quoted = reply([answer()])["content"][0]["text"]
-    persist_item(source_thread, {"type": "agentMessage", "text": quoted}, position=3)
-    persist_item(
-        source_thread, reply([answer()], kind="steeringUserMessage", status="rejected"), position=4
+    original = copy.deepcopy(data)
+    assert project_async_questions(source_thread, data, turn_id, live=live) is None
+    assert Interaction.query.count() == 0
+    assert data == original
+
+
+def test_history_item_never_creates_a_question_even_when_its_turn_is_active(source_thread):
+    data = source()
+    persist_item(source_thread, data)
+    assert project_async_questions(source_thread, data, "turn") is None
+    assert expire_inactive_async_questions(source_thread.id) == 0
+    assert Interaction.query.count() == 0
+    assert Item.query.one().data == data
+
+
+@pytest.mark.parametrize("status", ["pending", "answering", "answer_unknown"])
+@pytest.mark.parametrize("change", ["ended", "different_turn", "epoch", "error"])
+def test_inactive_turn_or_runtime_expires_outstanding_source_questions(
+    source_thread, status, change
+):
+    data = source()
+    persist_item(source_thread, data)
+    interaction = project_current(source_thread, data)
+    interaction.status = status
+    assert is_current_async_question(interaction, source_thread)
+    if change == "ended":
+        source_thread.status, source_thread.active_turn_id = "idle", None
+    elif change == "different_turn":
+        source_thread.active_turn_id = "next-turn"
+    elif change == "epoch":
+        db.session.get(Host, source_thread.host_id).runtime_id = "new-runtime"
+    else:
+        source_thread.status = "error"
+    assert not is_current_async_question(interaction, source_thread)
+    assert expire_inactive_async_questions(source_thread.id) == 1
+    assert interaction.status == "expired"
+    assert expire_inactive_async_questions(source_thread.id) == 0
+    assert Item.query.one().data == data
+
+
+@pytest.mark.parametrize("status", ["expired", "resolved", "answer_unknown"])
+def test_live_or_history_replay_never_reopens_prior_question(source_thread, status):
+    interaction = project_current(source_thread, source())
+    interaction.status = status
+    project_async_questions(source_thread, source(), "turn")
+    assert interaction.status == status
+    project_current(source_thread, source(), "turn")
+    assert interaction.status == status
+    assert Interaction.query.count() == 1
+
+
+def test_current_questions_survive_cleanup_and_rpc_requests_are_not_touched(source_thread):
+    interaction = project_current(source_thread, source())
+    interaction.status = "answer_unknown"
+    native = Interaction(
+        host_id=source_thread.host_id,
+        thread_id=source_thread.id,
+        runtime_id="old-runtime",
+        rpc_id=17,
+        method="item/tool/requestUserInput",
+        params={"questions": []},
+        status="pending",
     )
-    thread_id = source_thread.id
-    db.session.commit()
-    db.session.expunge_all()
-    received = []
-    original = async_questions._upsert_questions
-
-    def observe(thread, data, turn_id, created_at=None):
-        received.append(copy.deepcopy(data))
-        return original(thread, data, turn_id, created_at)
-
-    monkeypatch.setattr(async_questions, "_upsert_questions", observe)
-    statements = []
-
-    def record(_connection, _cursor, statement, _parameters, _context, _many):
-        if "FROM item" in statement:
-            statements.append(statement)
-
-    event.listen(db.engine, "before_cursor_execute", record)
-    try:
-        assert backfill_async_questions(thread_id) == 1
-    finally:
-        event.remove(db.engine, "before_cursor_execute", record)
-    assert len(received) == 1
-    assert set(received[0]) == {"id", "type", "questions"}
-    assert all("LIMIT" in statement for statement in statements)
-    assert all("item.data AS item_data" not in statement for statement in statements)
-    assert not any(isinstance(value, Item) for value in db.session.identity_map.values())
-    assert Interaction.query.one().status == "pending"
+    db.session.add(native)
+    assert expire_inactive_async_questions() == 0
+    assert interaction.status == "answer_unknown"
+    assert native.status == "pending"
 
 
-def test_backfill_scope_and_accepted_steering_history(source_thread):
+def test_cleanup_is_scoped_and_does_not_query_history_payloads(source_thread):
     other = Thread(
-        host_id=source_thread.host_id, cwd=source_thread.cwd, title="Other", status="idle"
+        host_id=source_thread.host_id,
+        cwd=source_thread.cwd,
+        title="Other",
+        status="active",
+        active_turn_id="turn",
     )
     db.session.add(other)
     db.session.flush()
-    persist_item(source_thread, source(), position=1)
-    persist_item(source_thread, reply([answer()], kind="steeringUserMessage"), position=2)
-    persist_item(other, source(), position=1)
-    db.session.commit()
-    backfill_async_questions(source_thread.id)
+    first = project_current(source_thread, source())
+    second = project_current(other, source())
+    persist_item(source_thread, {**source(), "text": "large historical payload " * 30000})
+    source_thread.status = other.status = "idle"
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", record)
+    try:
+        assert expire_inactive_async_questions(source_thread.id) == 1
+    finally:
+        event.remove(db.engine, "before_cursor_execute", record)
+    assert first.status == "expired"
+    assert second.status == "pending"
+    assert not any("FROM item" in statement or "JOIN item" in statement for statement in statements)
+    assert expire_inactive_async_questions() == 1
+    assert second.status == "expired"
+
+
+def test_confirmed_history_reply_can_resolve_existing_prompt_without_creating_history_prompts(
+    source_thread,
+):
+    interaction = project_current(source_thread, source())
+    source_thread.status, source_thread.active_turn_id = "idle", None
+    expire_inactive_async_questions(source_thread.id)
+    assert interaction.status == "expired"
+    project_async_questions(source_thread, reply([answer()]), "old-turn")
+    assert interaction.status == "resolved"
+    assert project_async_questions(source_thread, source("historical-question"), "old-turn") is None
     assert Interaction.query.count() == 1
-    assert Interaction.query.one().status == "resolved"
-    backfill_async_questions()
-    assert Interaction.query.count() == 2
-    assert Interaction.query.filter_by(thread_id=other.id).one().status == "pending"

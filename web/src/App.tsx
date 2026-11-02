@@ -903,6 +903,18 @@ function Workspace({
         }
         const event = object(value);
         if (event.type === "ready") {
+          if (
+            typeof event.event_cursor === "number" &&
+            Number.isSafeInteger(event.event_cursor) &&
+            event.event_cursor >= 0
+          ) {
+            lastCursor.current = event.event_cursor;
+            try {
+              sessionStorage.setItem(cursorKey, String(event.event_cursor));
+            } catch {
+              /* Live updates still work without browser storage. */
+            }
+          }
           socket?.send(
             JSON.stringify({ type: "subscribe", after: lastCursor.current }),
           );
@@ -1511,7 +1523,11 @@ function Workspace({
               <>
                 <Interactions
                   key={`interactions:${detail.thread.id}`}
-                  interactions={detail.interactions}
+                  interactions={detail.interactions.filter(
+                    (interaction) =>
+                      !Array.isArray(interaction.params.questions) ||
+                      interaction.params.questions.length === 0,
+                  )}
                   hostOnline={!!selectedHost?.online}
                   onResolved={() => {
                     scheduleRefresh();

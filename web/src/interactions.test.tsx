@@ -482,7 +482,7 @@ for (const observedAnswering of [true, false]) {
 test("nonblocking model questions explain that the task continues", () => {
   viewQuestion(question({ isBlocking: false }));
   assert.ok(screen.getByText("Codex 提问"));
-  assert.ok(screen.getByText("任务可继续运行，问题会保留至回答。"));
+  assert.ok(screen.getByText("当前轮次的问题，结束后自动收起。"));
   assert.equal(screen.queryByText("Codex 等待你的回答"), null);
 });
 

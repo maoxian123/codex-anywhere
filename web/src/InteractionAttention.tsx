@@ -26,6 +26,121 @@ const emptyPage: InteractionPage = {
   has_more: false,
   next_offset: null,
 };
+const currentStatuses = [
+  "pending",
+  "open",
+  "waiting",
+  "answering",
+  "answer_unknown",
+];
+
+function CurrentQuestion({
+  metadata,
+  active,
+  revision,
+  hostOnline,
+  stale,
+  onDraftChange,
+  onExpired,
+  onRefresh,
+  onCommand,
+  onNavigate,
+}: {
+  metadata: PendingInteraction;
+  active: boolean;
+  revision: number;
+  hostOnline: boolean;
+  stale: boolean;
+  onDraftChange: () => void;
+  onExpired: (id: string) => void;
+  onRefresh: () => void;
+  onCommand: (command: Command) => void;
+  onNavigate: (threadId: string) => void;
+}) {
+  const [detail, setDetail] = useState<Interaction | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const version = useRef(0);
+  useEffect(() => {
+    if (!active) return;
+    const controller = new AbortController();
+    const current = ++version.current;
+    setLoading(true);
+    void api<{ interaction: Interaction }>(
+      `/interactions/${encodeURIComponent(metadata.id)}`,
+      { signal: controller.signal },
+    )
+      .then((result) => {
+        if (controller.signal.aborted || current !== version.current) return;
+        if (!currentStatuses.includes(result.interaction.status)) {
+          onExpired(metadata.id);
+          return;
+        }
+        setDetail(result.interaction);
+        setError("");
+      })
+      .catch((reason) => {
+        if (controller.signal.aborted || current !== version.current) return;
+        if (reason instanceof ApiError && [404, 409].includes(reason.status))
+          onExpired(metadata.id);
+        else setError(errorText(reason));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted && current === version.current)
+          setLoading(false);
+      });
+    return () => controller.abort();
+  }, [active, metadata.id, revision, onExpired]);
+  return (
+    <section
+      className="interaction-current-question"
+      aria-label="当前轮次问题"
+      hidden={!active}
+    >
+      <div className="interaction-current-question-context">
+        <div>
+          <strong>{metadata.thread_title}</strong>
+          <small>
+            {metadata.host_name}
+            {!hostOnline ? " · 设备离线" : ""}
+          </small>
+        </div>
+        {metadata.thread_id && (
+          <button
+            type="button"
+            className="button button-small button-quiet"
+            onClick={() => onNavigate(metadata.thread_id!)}
+          >
+            <ExternalLink size={14} />
+            打开会话
+          </button>
+        )}
+      </div>
+      {!detail && loading && <Spinner label="读取当前问题" />}
+      {error && <ErrorMessage>{error}</ErrorMessage>}
+      {(error || stale) && (
+        <button
+          type="button"
+          className="button button-small"
+          disabled={loading}
+          onClick={onRefresh}
+        >
+          重新确认当前问题
+        </button>
+      )}
+      {detail && (
+        <Interactions
+          interactions={[detail]}
+          hostOnline={hostOnline}
+          verified={!loading && !error && !stale}
+          onDraftChange={onDraftChange}
+          onCommand={onCommand}
+          onResolved={onRefresh}
+        />
+      )}
+    </section>
+  );
+}
 
 function rememberedNotifications() {
   try {
@@ -63,6 +178,10 @@ export default function InteractionAttention({
 }) {
   const [page, setPage] = useState(emptyPage);
   const pageRef = useRef(emptyPage);
+  const [inlineId, setInlineId] = useState("");
+  const inlineRef = useRef("");
+  const touchedQuestions = useRef(new Set<string>());
+  const [pageRevision, setPageRevision] = useState(0);
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<PendingInteraction | null>(null);
   const selectedRef = useRef<PendingInteraction | null>(null);
@@ -216,6 +335,32 @@ export default function InteractionAttention({
         const next = { ...result, interactions: items };
         pageRef.current = next;
         setPage(next);
+        const previousIds = new Set(
+          previous.interactions.map((item) => item.id),
+        );
+        const questions = items
+          .filter((item) => item.question_count > 0)
+          .sort(
+            (left, right) =>
+              right.created_at.localeCompare(left.created_at) ||
+              Number(previousIds.has(left.id)) -
+                Number(previousIds.has(right.id)),
+          );
+        const currentQuestion = questions.find(
+          (item) => item.id === inlineRef.current,
+        );
+        const nextQuestion =
+          currentQuestion && touchedQuestions.current.has(currentQuestion.id)
+            ? currentQuestion
+            : questions[0];
+        inlineRef.current = nextQuestion?.id || "";
+        setInlineId(inlineRef.current);
+        touchedQuestions.current = new Set(
+          [...touchedQuestions.current].filter((id) =>
+            questions.some((item) => item.id === id),
+          ),
+        );
+        setPageRevision((value) => value + 1);
         setLoadError("");
         setPermission(notificationPermission());
         if (!append)
@@ -292,7 +437,33 @@ export default function InteractionAttention({
     setDetailUnverified(false);
     setDetailLoading(false);
   };
+  const expireInline = useCallback((id: string) => {
+    const current = pageRef.current;
+    if (!current.interactions.some((item) => item.id === id)) return;
+    const interactions = current.interactions.filter((item) => item.id !== id);
+    const next = {
+      ...current,
+      interactions,
+      total: Math.max(0, current.total - 1),
+    };
+    pageRef.current = next;
+    setPage(next);
+    touchedQuestions.current.delete(id);
+    if (inlineRef.current === id) {
+      inlineRef.current =
+        interactions.find((item) => item.question_count > 0)?.id || "";
+      setInlineId(inlineRef.current);
+    }
+  }, []);
   const selectInteraction = (item: PendingInteraction) => {
+    if (item.question_count > 0) {
+      touchedQuestions.current.add(item.id);
+      inlineRef.current = item.id;
+      setInlineId(item.id);
+      setOpen(false);
+      clearSelection();
+      return;
+    }
     selectedRef.current = item;
     setSelected(item);
     setDetail(null);
@@ -305,7 +476,10 @@ export default function InteractionAttention({
     const current = pageRef.current;
     if (current.total === 1 && current.interactions.length === 1)
       selectInteraction(current.interactions[0]);
-    else clearSelection();
+    else {
+      setOpen(true);
+      clearSelection();
+    }
   };
   const close = () => {
     setOpen(false);
@@ -376,21 +550,51 @@ export default function InteractionAttention({
             {loadError
               ? "提醒暂时无法更新，仍保留上次的待处理记录。"
               : nonBlockingQuestions
-                ? "任务可以继续运行；待回答的问题会持续保留。"
+                ? "当前轮次的问题，结束后自动收起。"
                 : "查看问题和操作内容，提交回答或审批后继续。"}
           </p>
         </div>
-        <button
-          type="button"
-          className="button button-small interaction-attention-banner-action"
-          aria-haspopup="dialog"
-          aria-expanded={open}
-          onClick={openPending}
-        >
-          {page.total === 1 && questionCount > 0 ? "回答问题" : "查看待处理"}
-        </button>
+        {(page.total > 1 || !questionCount) && (
+          <button
+            type="button"
+            className="button button-small interaction-attention-banner-action"
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            onClick={openPending}
+          >
+            查看待处理
+          </button>
+        )}
       </section>
     ) : null;
+
+  const inlineContent = (
+    <>
+      {banner}
+      {page.interactions
+        .filter((item) => item.question_count > 0)
+        .map((item) => (
+          <CurrentQuestion
+            key={item.id}
+            metadata={item}
+            active={inlineId === item.id}
+            revision={pageRevision}
+            hostOnline={
+              hosts.find((host) => host.id === item.host_id)?.online === true
+            }
+            stale={Boolean(loadError)}
+            onDraftChange={() => touchedQuestions.current.add(item.id)}
+            onExpired={expireInline}
+            onRefresh={() => void loadPage()}
+            onCommand={(command) => {
+              void loadPage();
+              onCommand(command);
+            }}
+            onNavigate={onNavigate}
+          />
+        ))}
+    </>
+  );
 
   return (
     <>
@@ -429,8 +633,8 @@ export default function InteractionAttention({
             : ""}
       </span>
       {bannerTarget === undefined
-        ? banner
-        : bannerTarget && createPortal(banner, bannerTarget)}
+        ? inlineContent
+        : bannerTarget && createPortal(inlineContent, bannerTarget)}
       {open && (
         <Modal
           title="待处理交互"
