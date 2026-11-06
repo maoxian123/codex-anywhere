@@ -160,6 +160,9 @@ function Workspace({
   const [attentionRefresh, setAttentionRefresh] = useState(0);
   const [attentionBannerTarget, setAttentionBannerTarget] =
     useState<HTMLDivElement | null>(null);
+  const [questionTarget, setQuestionTarget] = useState<HTMLDivElement | null>(
+    null,
+  );
   const [streams, setStreams] = useState<Record<string, StreamItem>>({});
   const selectedRef = useRef(route.id);
   const searchRef = useRef(search);
@@ -1358,6 +1361,8 @@ function Workspace({
               refreshKey={attentionRefresh}
               hosts={hosts}
               bannerTarget={attentionBannerTarget}
+              questionTarget={questionTarget}
+              activeThreadId={route.settings ? null : route.id || null}
               onNavigate={navigate}
               onCommand={(command) => {
                 watchCommand(command);
@@ -1519,26 +1524,34 @@ function Workspace({
               onImage={(src, alt) => setLightbox({ src, alt })}
               onNavigate={navigate}
             />
-            {detail && (
-              <>
-                <Interactions
-                  key={`interactions:${detail.thread.id}`}
-                  interactions={detail.interactions.filter(
-                    (interaction) =>
-                      !Array.isArray(interaction.params.questions) ||
-                      interaction.params.questions.length === 0,
-                  )}
-                  hostOnline={!!selectedHost?.online}
-                  onResolved={() => {
-                    scheduleRefresh();
-                    setAttentionRefresh((value) => value + 1);
-                  }}
-                  onCommand={(command) => {
-                    watchCommand(command, detail.thread.id);
-                    setAttentionRefresh((value) => value + 1);
-                    scheduleRefresh();
-                  }}
+            <div className="conversation-input-area">
+              <div className="conversation-interaction-scroll">
+                <div
+                  className="conversation-question-slot"
+                  ref={setQuestionTarget}
                 />
+                {detail?.thread.id === route.id && (
+                  <Interactions
+                    key={`interactions:${detail.thread.id}`}
+                    interactions={detail.interactions.filter(
+                      (interaction) =>
+                        !Array.isArray(interaction.params.questions) ||
+                        interaction.params.questions.length === 0,
+                    )}
+                    hostOnline={!!selectedHost?.online}
+                    onResolved={() => {
+                      scheduleRefresh();
+                      setAttentionRefresh((value) => value + 1);
+                    }}
+                    onCommand={(command) => {
+                      watchCommand(command, detail.thread.id);
+                      setAttentionRefresh((value) => value + 1);
+                      scheduleRefresh();
+                    }}
+                  />
+                )}
+              </div>
+              {detail?.thread.id === route.id && (
                 <Composer
                   key={detail.thread.id}
                   draftScope={session.username || "admin"}
@@ -1560,8 +1573,8 @@ function Workspace({
                   onInterrupt={interrupt}
                   onNavigate={navigate}
                 />
-              </>
-            )}
+              )}
+            </div>
           </>
         ) : (
           <NewConversation

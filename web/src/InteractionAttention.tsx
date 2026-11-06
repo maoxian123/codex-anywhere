@@ -44,7 +44,6 @@ function CurrentQuestion({
   onExpired,
   onRefresh,
   onCommand,
-  onNavigate,
 }: {
   metadata: PendingInteraction;
   active: boolean;
@@ -55,7 +54,6 @@ function CurrentQuestion({
   onExpired: (id: string) => void;
   onRefresh: () => void;
   onCommand: (command: Command) => void;
-  onNavigate: (threadId: string) => void;
 }) {
   const [detail, setDetail] = useState<Interaction | null>(null);
   const [loading, setLoading] = useState(false);
@@ -76,6 +74,8 @@ function CurrentQuestion({
           onExpired(metadata.id);
           return;
         }
+        if (result.interaction.thread_id !== metadata.thread_id)
+          throw new Error("问题所属会话已变化，请刷新后重试。");
         setDetail(result.interaction);
         setError("");
       })
@@ -105,16 +105,6 @@ function CurrentQuestion({
             {!hostOnline ? " · 设备离线" : ""}
           </small>
         </div>
-        {metadata.thread_id && (
-          <button
-            type="button"
-            className="button button-small button-quiet"
-            onClick={() => onNavigate(metadata.thread_id!)}
-          >
-            <ExternalLink size={14} />
-            打开会话
-          </button>
-        )}
       </div>
       {!detail && loading && <Spinner label="读取当前问题" />}
       {error && <ErrorMessage>{error}</ErrorMessage>}
@@ -169,17 +159,23 @@ export default function InteractionAttention({
   onNavigate,
   onCommand,
   bannerTarget,
+  questionTarget,
+  activeThreadId = null,
 }: {
   refreshKey: number;
   hosts: Host[];
   onNavigate: (threadId: string) => void;
   onCommand: (command: Command) => void;
   bannerTarget?: HTMLElement | null;
+  questionTarget?: HTMLElement | null;
+  activeThreadId?: string | null;
 }) {
   const [page, setPage] = useState(emptyPage);
   const pageRef = useRef(emptyPage);
   const [inlineId, setInlineId] = useState("");
   const inlineRef = useRef("");
+  const activeThreadRef = useRef(activeThreadId);
+  activeThreadRef.current = activeThreadId;
   const touchedQuestions = useRef(new Set<string>());
   const [pageRevision, setPageRevision] = useState(0);
   const [open, setOpen] = useState(false);
@@ -339,7 +335,11 @@ export default function InteractionAttention({
           previous.interactions.map((item) => item.id),
         );
         const questions = items
-          .filter((item) => item.question_count > 0)
+          .filter(
+            (item) =>
+              item.question_count > 0 &&
+              item.thread_id === activeThreadRef.current,
+          )
           .sort(
             (left, right) =>
               right.created_at.localeCompare(left.created_at) ||
@@ -357,7 +357,7 @@ export default function InteractionAttention({
         setInlineId(inlineRef.current);
         touchedQuestions.current = new Set(
           [...touchedQuestions.current].filter((id) =>
-            questions.some((item) => item.id === id),
+            items.some((item) => item.id === id),
           ),
         );
         setPageRevision((value) => value + 1);
@@ -396,6 +396,20 @@ export default function InteractionAttention({
   useEffect(() => {
     void loadPage();
   }, [refreshKey, loadPage]);
+  useEffect(() => {
+    const questions = pageRef.current.interactions
+      .filter(
+        (item) => item.question_count > 0 && item.thread_id === activeThreadId,
+      )
+      .sort((left, right) => right.created_at.localeCompare(left.created_at));
+    const current = questions.find((item) => item.id === inlineRef.current);
+    inlineRef.current =
+      current?.id ||
+      questions.find((item) => touchedQuestions.current.has(item.id))?.id ||
+      questions[0]?.id ||
+      "";
+    setInlineId(inlineRef.current);
+  }, [activeThreadId]);
   useEffect(() => {
     const refresh = () => {
       void loadPage();
@@ -451,17 +465,22 @@ export default function InteractionAttention({
     touchedQuestions.current.delete(id);
     if (inlineRef.current === id) {
       inlineRef.current =
-        interactions.find((item) => item.question_count > 0)?.id || "";
+        interactions.find(
+          (item) =>
+            item.question_count > 0 &&
+            item.thread_id === activeThreadRef.current,
+        )?.id || "";
       setInlineId(inlineRef.current);
     }
   }, []);
   const selectInteraction = (item: PendingInteraction) => {
-    if (item.question_count > 0) {
+    if (item.question_count > 0 && item.thread_id) {
       touchedQuestions.current.add(item.id);
       inlineRef.current = item.id;
       setInlineId(item.id);
       setOpen(false);
       clearSelection();
+      onNavigate(item.thread_id);
       return;
     }
     selectedRef.current = item;
@@ -550,34 +569,35 @@ export default function InteractionAttention({
             {loadError
               ? "提醒暂时无法更新，仍保留上次的待处理记录。"
               : nonBlockingQuestions
-                ? "当前轮次的问题，结束后自动收起。"
-                : "查看问题和操作内容，提交回答或审批后继续。"}
+                ? "问题已保留，请进入对应会话回答。"
+                : "进入对应会话回答问题，或查看待处理审批。"}
           </p>
         </div>
-        {(page.total > 1 || !questionCount) && (
-          <button
-            type="button"
-            className="button button-small interaction-attention-banner-action"
-            aria-haspopup="dialog"
-            aria-expanded={open}
-            onClick={openPending}
-          >
-            查看待处理
-          </button>
-        )}
+        <button
+          type="button"
+          className="button button-small interaction-attention-banner-action"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onClick={openPending}
+        >
+          查看待处理
+        </button>
       </section>
     ) : null;
 
-  const inlineContent = (
+  const questionContent = (
     <>
-      {banner}
       {page.interactions
         .filter((item) => item.question_count > 0)
         .map((item) => (
           <CurrentQuestion
             key={item.id}
             metadata={item}
-            active={inlineId === item.id}
+            active={
+              Boolean(activeThreadId) &&
+              item.thread_id === activeThreadId &&
+              inlineId === item.id
+            }
             revision={pageRevision}
             hostOnline={
               hosts.find((host) => host.id === item.host_id)?.online === true
@@ -590,7 +610,6 @@ export default function InteractionAttention({
               void loadPage();
               onCommand(command);
             }}
-            onNavigate={onNavigate}
           />
         ))}
     </>
@@ -633,12 +652,15 @@ export default function InteractionAttention({
             : ""}
       </span>
       {bannerTarget === undefined
-        ? inlineContent
-        : bannerTarget && createPortal(inlineContent, bannerTarget)}
+        ? banner
+        : bannerTarget && createPortal(banner, bannerTarget)}
+      {questionTarget === undefined
+        ? questionContent
+        : questionTarget && createPortal(questionContent, questionTarget)}
       {open && (
         <Modal
           title="待处理交互"
-          subtitle={`共 ${page.total} 项，支持在这里回答问题和处理审批。`}
+          subtitle={`共 ${page.total} 项，选择问题进入对应会话回答，也可在这里处理审批。`}
           onClose={close}
           wide
         >

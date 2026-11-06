@@ -11,7 +11,7 @@ import {
 import Composer from "./Composer";
 import Interactions from "./Interactions";
 import Timeline from "./Timeline";
-import { Markdown, References } from "./components";
+import { CodeBlock, CopyButton, Markdown, References } from "./components";
 import type { Asset, MessagePayload, Thread } from "./types";
 
 const baseThread: Thread = {
@@ -24,6 +24,226 @@ const baseThread: Thread = {
   updated_at: "2026-10-20T00:00:00Z",
 };
 afterEach(cleanup);
+
+test("highlighted Markdown code copies plain text and wraps independently from inline code", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const copied: string[] = [];
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text: string) => copied.push(text) },
+  });
+  try {
+    const source = 'function greet() {\n  console.log("<hello>");\n}\n';
+    const { container } = render(
+      <Markdown
+        text={`先读 \`inline code\`。\n\n\`\`\`javascript\n${source}\`\`\``}
+        onImage={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+    const block = container.querySelector(".message-code-block")!;
+    assert.equal(container.querySelectorAll(".message-code-block").length, 1);
+    assert.equal(container.querySelector("p code")?.textContent, "inline code");
+    assert.equal(block.getAttribute("data-wrap"), "on");
+    assert.ok(block.querySelector(".hljs-keyword"));
+    assert.equal(block.querySelector("pre")?.textContent, source);
+    assert.ok(screen.getByText("javascript"));
+    const wrap = screen.getByRole("button", { name: "自动换行" });
+    assert.equal(wrap.getAttribute("aria-pressed"), "true");
+    fireEvent.click(wrap);
+    assert.equal(block.getAttribute("data-wrap"), "off");
+    assert.equal(wrap.getAttribute("aria-pressed"), "false");
+    fireEvent.click(screen.getByRole("button", { name: "复制内容" }));
+    await waitFor(() => assert.deepEqual(copied, [source]));
+    await screen.findByRole("button", { name: "已复制" });
+    fireEvent.click(wrap);
+    assert.equal(block.getAttribute("data-wrap"), "on");
+    assert.equal(block.querySelector("pre")?.textContent, source);
+  } finally {
+    if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+test("indented text blocks have their own toolbar and preserve meaningful indentation", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  let copied = "";
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: {
+      writeText: async (text: string) => {
+        copied = text;
+      },
+    },
+  });
+  try {
+    render(
+      <Markdown
+        text={"    first line\n      second line\n\n最后一段。"}
+        onImage={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+    assert.ok(screen.getByText("文本"));
+    fireEvent.click(screen.getByRole("button", { name: "复制内容" }));
+    await waitFor(() => assert.equal(copied, "first line\n  second line\n"));
+  } finally {
+    if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+test("code blocks copy the current streaming value after an update", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const copied: string[] = [];
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text: string) => copied.push(text) },
+  });
+  try {
+    const view = render(<CodeBlock text="partial" language="终端输出" />);
+    view.rerender(
+      <CodeBlock text={"partial\n  completed\n"} language="终端输出" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "复制内容" }));
+    await waitFor(() => assert.deepEqual(copied, ["partial\n  completed\n"]));
+  } finally {
+    if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+test("copy falls back on HTTP, restores focus, and reports failure if copying is blocked", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const commandDescriptor = Object.getOwnPropertyDescriptor(
+    document,
+    "execCommand",
+  );
+  const copied: string[] = [];
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: undefined,
+  });
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    value: (command: string) => {
+      assert.equal(command, "copy");
+      copied.push((document.activeElement as HTMLTextAreaElement).value);
+      return true;
+    },
+  });
+  try {
+    const view = render(
+      <CopyButton text={"  original\n"} label="复制测试" showLabel />,
+    );
+    const button = screen.getByRole("button", { name: "复制测试" });
+    button.focus();
+    fireEvent.click(button);
+    await waitFor(() => assert.deepEqual(copied, ["  original\n"]));
+    assert.equal(document.activeElement, button);
+    assert.equal(document.querySelectorAll("textarea").length, 0);
+    view.unmount();
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: () => false,
+    });
+    render(<CopyButton text="blocked" label="复制测试" showLabel />);
+    fireEvent.click(screen.getByRole("button", { name: "复制测试" }));
+    await screen.findByRole("button", { name: "复制失败，请手动复制" });
+    assert.equal(document.querySelectorAll("textarea").length, 0);
+  } finally {
+    if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+    else Reflect.deleteProperty(navigator, "clipboard");
+    if (commandDescriptor)
+      Object.defineProperty(document, "execCommand", commandDescriptor);
+    else Reflect.deleteProperty(document, "execCommand");
+  }
+});
+
+test("messages and native terminal output expose separate copies of the original content", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const copied: string[] = [];
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text: string) => copied.push(text) },
+  });
+  try {
+    const userText = "  保留用户输入\n以及换行";
+    const reply = "**回复**\n\n原始 Markdown";
+    const output = "  success\n\tfinal\n";
+    const { container } = render(
+      <Timeline
+        items={[
+          {
+            id: "u",
+            native_id: "u",
+            thread_id: "t1",
+            type: "userMessage",
+            data: { text: userText },
+          },
+          {
+            id: "a",
+            native_id: "a",
+            thread_id: "t1",
+            type: "agentMessage",
+            data: { text: reply },
+          },
+          {
+            id: "c",
+            native_id: "c",
+            thread_id: "t1",
+            type: "commandExecution",
+            data: { command: "npm run build", aggregatedOutput: output },
+          },
+        ]}
+        targetItem="c"
+        streams={{}}
+        busy={false}
+        loading={false}
+        onImage={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "复制消息" }));
+    fireEvent.click(screen.getByRole("button", { name: "复制回复" }));
+    fireEvent.click(screen.getByRole("button", { name: "复制内容" }));
+    await waitFor(() =>
+      assert.deepEqual(copied, [userText, reply, `npm run build\n\n${output}`]),
+    );
+    assert.equal(
+      container.querySelector(".terminal-output")?.textContent,
+      `$ npm run build\n\n${output}`,
+    );
+  } finally {
+    if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+test("Markdown reading controls preserve HTML and unsafe-link protections", () => {
+  const { container } = render(
+    <Markdown
+      text={
+        "<script>alert(1)</script>\n\n[危险](javascript:alert%281%29)\n\n```html\n<img src=x onerror=alert(1)>\n```\n\n| 名称 | 内容 |\n| --- | --- |\n| a | b |"
+      }
+      onImage={() => {}}
+      onNavigate={() => {}}
+    />,
+  );
+  assert.equal(
+    container.querySelectorAll("script, img, a[href^='javascript:']").length,
+    0,
+  );
+  assert.equal(
+    container.querySelector("pre")?.textContent,
+    "<img src=x onerror=alert(1)>\n",
+  );
+  assert.ok(screen.getByRole("region", { name: "表格（可横向滚动）" }));
+  assert.equal(
+    container.querySelector(".table-scroll")?.getAttribute("tabindex"),
+    "0",
+  );
+});
 
 test("compact composer keeps runtime settings available behind its toolbar disclosure", () => {
   render(

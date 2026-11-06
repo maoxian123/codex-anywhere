@@ -75,6 +75,7 @@ test("native question options show descriptions without choosing or submitting a
       .getAllByRole("radio")
       .every((input) => !(input as HTMLInputElement).checked),
   );
+  assert.equal(screen.queryByRole("textbox"), null);
   fireEvent.click(screen.getByRole("radio", { name: /完整实现/ }));
   assert.equal(calls.length, 0);
   fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
@@ -124,23 +125,46 @@ test("every question must be answered and whitespace-only free text is rejected 
       ],
     }),
   );
-  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  assert.ok(screen.getByText("问题 1 / 2"));
+  assert.equal(screen.queryByRole("textbox"), null);
+  fireEvent.click(screen.getByRole("button", { name: "下一题" }));
+  assert.equal(calls.length, 0);
+  assert.equal(screen.queryByRole("radio"), null);
+  fireEvent.click(screen.getByRole("button", { name: "提交全部回答" }));
   assert.ok(screen.getByRole("alert"));
   assert.equal(calls.length, 0);
+  assert.ok(screen.getByText("问题 1 / 2"));
   assert.equal(
     document.activeElement,
     screen.getByRole("radio", { name: "__other__" }),
   );
   fireEvent.click(screen.getByRole("radio", { name: "__other__" }));
+  fireEvent.click(screen.getByRole("button", { name: "下一题" }));
   fireEvent.change(screen.getByRole("textbox", { name: "请填写细节" }), {
     target: { value: "   " },
   });
-  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交全部回答" }));
   assert.equal(calls.length, 0);
+  assert.equal(
+    document.activeElement,
+    screen.getByRole("textbox", { name: "请填写细节" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "上一题" }));
+  assert.equal(
+    (screen.getByRole("radio", { name: "__other__" }) as HTMLInputElement)
+      .checked,
+    true,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "下一题" }));
+  assert.equal(
+    (screen.getByRole("textbox", { name: "请填写细节" }) as HTMLTextAreaElement)
+      .value,
+    "   ",
+  );
   fireEvent.change(screen.getByRole("textbox", { name: "请填写细节" }), {
     target: { value: "  保留两侧空格  " },
   });
-  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交全部回答" }));
   await screen.findByText("已提交，等待远程设备确认");
   assert.deepEqual(calls[0].body, {
     response: {
@@ -150,6 +174,63 @@ test("every question must be answered and whitespace-only free text is rejected 
       },
     },
   });
+});
+
+test("custom answers stay discoverable, focus a multiline control, and preserve the native answer", async () => {
+  const calls = capturePosts();
+  let draftChanges = 0;
+  render(
+    <Interactions
+      interactions={[
+        question({
+          questions: [
+            {
+              id: "approach",
+              header: "实现方式",
+              isOther: true,
+              options: [{ label: "完整实现" }],
+            },
+          ],
+        }),
+      ]}
+      onCommand={() => {}}
+      onDraftChange={() => {
+        draftChanges++;
+      }}
+    />,
+  );
+  const input = screen.getByRole("textbox", {
+    name: "实现方式：自定义回答",
+  }) as HTMLTextAreaElement;
+  assert.equal(input.tagName, "TEXTAREA");
+  assert.equal(input.rows, 3);
+  fireEvent.click(screen.getByRole("radio", { name: "自定义回答" }));
+  assert.equal(document.activeElement, input);
+  fireEvent.change(input, { target: { value: "第一行\n第二行" } });
+  assert.ok(draftChanges > 0);
+  assert.equal(calls.length, 0);
+  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  await screen.findByText("已提交，等待远程设备确认");
+  assert.deepEqual(calls[0].body, {
+    response: { answers: { approach: { answers: ["第一行\n第二行"] } } },
+  });
+});
+
+test("native questions that prohibit other answers only expose their options", () => {
+  viewQuestion(
+    question({
+      questions: [
+        {
+          id: "choice",
+          question: "选择一项",
+          isOther: false,
+          options: [{ label: "已有选项" }],
+        },
+      ],
+    }),
+  );
+  assert.equal(screen.queryByRole("textbox"), null);
+  assert.equal(screen.queryByRole("radio", { name: "自定义回答" }), null);
 });
 
 test("custom secret answers use password controls and remain only in transient form state", async () => {

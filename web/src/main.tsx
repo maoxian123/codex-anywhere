@@ -12,6 +12,7 @@ import "./Composer.css";
 import "./Interactions.css";
 import "./InteractionAttention.css";
 import "highlight.js/styles/github-dark-dimmed.css";
+import "./message-readability.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

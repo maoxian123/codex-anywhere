@@ -10,6 +10,35 @@ body {
 }
 .main-panel {
   min-width: 0;
+  min-height: 0;
+}
+.conversation-input-area {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 76dvh;
+  overflow: visible;
+}
+.conversation-interaction-scroll {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scroll-padding-block: 12px;
+}
+.conversation-interaction-scroll > .interactions {
+  max-width: 860px;
+  max-height: none;
+  overflow: visible;
+  padding-inline: 24px;
+}
+.main-panel > .timeline-scroll {
+  min-height: 0;
+}
+.conversation-question-slot:empty {
+  display: none;
 }
 .topbar {
   min-height: 80px;
@@ -266,6 +295,9 @@ body {
   }
 }
 @media (max-width: 680px) {
+  .conversation-interaction-scroll > .interactions {
+    padding-inline: 12px;
+  }
   .sidebar {
     width: min(350px, 92vw);
   }

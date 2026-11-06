@@ -8,6 +8,7 @@ import {
   FileCode2,
   ImageIcon,
   LoaderCircle,
+  WrapText,
   X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -114,7 +115,54 @@ export function Modal({
     </dialog>
   );
 }
-export function CopyButton({ text }: { text: string }) {
+async function copyTextToClipboard(text: string) {
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Older browsers and HTTP deployments can still copy during a button click.
+  }
+  const activeElement = document.activeElement;
+  const selection = window.getSelection();
+  const ranges = selection
+    ? Array.from({ length: selection.rangeCount }, (_, index) =>
+        selection.getRangeAt(index).cloneRange(),
+      )
+    : [];
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.readOnly = true;
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  input.style.top = "0";
+  document.body.append(input);
+  try {
+    input.focus({ preventScroll: true });
+    input.select();
+    if (!document.execCommand?.("copy"))
+      throw new Error("Clipboard unavailable");
+  } finally {
+    input.remove();
+    if (activeElement instanceof HTMLElement)
+      activeElement.focus({ preventScroll: true });
+    if (selection) {
+      selection.removeAllRanges();
+      ranges.forEach((range) => selection.addRange(range));
+    }
+  }
+}
+
+export function CopyButton({
+  text,
+  label = "复制",
+  showLabel = false,
+}: {
+  text: string;
+  label?: string;
+  showLabel?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -126,24 +174,80 @@ export function CopyButton({ text }: { text: string }) {
   );
   return (
     <button
-      className="copy-button"
-      title={error ? "无法访问剪贴板，请手动复制" : copied ? "已复制" : "复制"}
-      aria-label={error ? "复制失败，请手动复制" : copied ? "已复制" : "复制"}
+      type="button"
+      className={`copy-button${showLabel ? " copy-button-labeled" : ""}`}
+      title={error ? "无法访问剪贴板，请手动复制" : copied ? "已复制" : label}
+      aria-label={error ? "复制失败，请手动复制" : copied ? "已复制" : label}
       onClick={() => {
-        void navigator.clipboard
-          ?.writeText(text)
+        void copyTextToClipboard(text)
           .then(() => {
             setCopied(true);
             setError(false);
+            if (timer.current) clearTimeout(timer.current);
             timer.current = setTimeout(() => setCopied(false), 2000);
           })
           .catch(() => setError(true));
-        if (!navigator.clipboard) setError(true);
       }}
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
+      {showLabel && (
+        <span>{error ? "复制失败" : copied ? "已复制" : label}</span>
+      )}
     </button>
   );
+}
+
+/** One reading/copying surface for Markdown code and native tool output. */
+export function CodeBlock({
+  text,
+  language,
+  children,
+  className = "",
+}: {
+  text: string;
+  language?: string;
+  children?: ReactNode;
+  className?: string;
+}) {
+  const [wrapped, setWrapped] = useState(true);
+  return (
+    <div className="message-code-block" data-wrap={wrapped ? "on" : "off"}>
+      <div className="message-code-toolbar">
+        <span className="message-code-language">{language || "文本"}</span>
+        <div className="message-code-actions">
+          <button
+            type="button"
+            className="message-code-wrap"
+            aria-label="自动换行"
+            aria-pressed={wrapped}
+            title={wrapped ? "关闭自动换行，保留原始行宽" : "开启自动换行"}
+            onClick={() => setWrapped((value) => !value)}
+          >
+            <WrapText size={14} aria-hidden="true" />
+            <span>换行</span>
+          </button>
+          <CopyButton text={text} label="复制内容" showLabel />
+        </div>
+      </div>
+      <pre className={`message-code-content ${className}`} tabIndex={0}>
+        {children ?? <code>{text}</code>}
+      </pre>
+    </div>
+  );
+}
+
+type CodeNode = {
+  type?: string;
+  value?: string;
+  properties?: { className?: unknown };
+  children?: CodeNode[];
+};
+
+// Read text nodes after syntax highlighting so copied output never contains HTML.
+function codeNodeText(node: CodeNode): string {
+  return node.type === "text"
+    ? node.value || ""
+    : (node.children || []).map(codeNodeText).join("");
 }
 export function ImagePreview({
   src,
@@ -229,9 +333,31 @@ export function Markdown({
                 {alt || "图片"} · 等待节点上传
               </span>
             ),
-          pre: ({ children }) => <pre tabIndex={0}>{children}</pre>,
+          pre: ({ children, node }) => {
+            const classes =
+              node?.children[0]?.type === "element"
+                ? node.children[0].properties.className
+                : [];
+            const language = (Array.isArray(classes) ? classes : [])
+              .map(String)
+              .find((name) => name.startsWith("language-"))
+              ?.slice(9);
+            return (
+              <CodeBlock
+                text={node ? codeNodeText(node) : ""}
+                language={language}
+              >
+                {children}
+              </CodeBlock>
+            );
+          },
           table: ({ children }) => (
-            <div className="table-scroll">
+            <div
+              className="table-scroll"
+              tabIndex={0}
+              role="region"
+              aria-label="表格（可横向滚动）"
+            >
               <table>{children}</table>
             </div>
           ),

@@ -96,7 +96,7 @@ const metadata = (
   overrides: Partial<PendingInteraction> = {},
 ): PendingInteraction => ({
   id,
-  thread_id: `thread-${id}`,
+  thread_id: "thread-one",
   host_id: "h1",
   thread_title: `Conversation ${id}`,
   host_name: "Workstation",
@@ -108,7 +108,7 @@ const metadata = (
 });
 const interaction = (id: string, status = "pending"): Interaction => ({
   id,
-  thread_id: `thread-${id}`,
+  thread_id: "thread-one",
   method: "anywhere/message_questions",
   status,
   params: {
@@ -140,6 +140,7 @@ const page = (
 const response = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status });
 const props = {
+  activeThreadId: "thread-one",
   refreshKey: 0,
   hosts: [host],
   onNavigate: (_id: string) => {},
@@ -200,7 +201,7 @@ test("current question and choices appear on arrival without opening a dialog, f
   draft.focus();
   await screen.findByRole("radio", { name: /Proceed/ });
   assert.ok(within(panel()).getByText("Question one"));
-  assert.match(reminder().textContent || "", /当前轮次的问题，结束后自动收起/);
+  assert.match(reminder().textContent || "", /进入对应会话回答/);
   assert.equal(document.activeElement, draft);
   assert.equal(draft.value, "keep draft");
   assert.equal(screen.queryByRole("dialog"), null);
@@ -215,6 +216,72 @@ test("current question and choices appear on arrival without opening a dialog, f
     "/api/interactions?limit=50&offset=0",
     "/api/interactions/one",
   ]);
+});
+
+test("other conversations only show a reminder until the user opens the owning conversation", async () => {
+  const state = server([metadata("other", { thread_id: "thread-other" })]);
+  state.details.set("other", {
+    ...interaction("other"),
+    thread_id: "thread-other",
+  });
+  const navigations: string[] = [];
+  const view = render(
+    <InteractionAttention
+      {...props}
+      onNavigate={(id) => navigations.push(id)}
+    />,
+  );
+  await screen.findByRole("region", { name: "待处理提醒" });
+  assert.equal(screen.queryByRole("radio"), null);
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.deepEqual(state.paths, ["/api/interactions?limit=50&offset=0"]);
+  fireEvent.click(bell());
+  fireEvent.click(
+    await screen.findByRole("button", { name: /Conversation other/ }),
+  );
+  assert.deepEqual(navigations, ["thread-other"]);
+  assert.equal(screen.queryByRole("dialog"), null);
+  assert.equal(screen.queryByRole("radio"), null);
+  view.rerender(
+    <InteractionAttention {...props} activeThreadId="thread-other" />,
+  );
+  await screen.findByRole("radio", { name: /Proceed/ });
+  view.rerender(<InteractionAttention {...props} activeThreadId={null} />);
+  assert.equal(screen.queryByRole("radio"), null);
+  assert.ok(reminder());
+  assert.deepEqual(state.posts, []);
+});
+
+test("switching conversations hides their forms and restores the previous custom answer", async () => {
+  const state = server([
+    metadata("one"),
+    metadata("two", { thread_id: "thread-two" }),
+  ]);
+  state.details.set("two", { ...interaction("two"), thread_id: "thread-two" });
+  const view = render(<InteractionAttention {...props} />);
+  fireEvent.click(await screen.findByRole("radio", { name: "自定义回答" }));
+  fireEvent.change(within(panel()).getByLabelText("方案：自定义回答"), {
+    target: { value: "keep my answer" },
+  });
+  view.rerender(
+    <InteractionAttention {...props} activeThreadId="thread-two" />,
+  );
+  await within(panel()).findByText("Question two");
+  assert.equal(within(panel()).queryByText("Question one"), null);
+  assert.equal(
+    screen
+      .queryByRole("textbox", { name: "方案：自定义回答" })
+      ?.getAttribute("value"),
+    null,
+  );
+  view.rerender(<InteractionAttention {...props} />);
+  await within(panel()).findByText("Question one");
+  assert.equal(
+    (within(panel()).getByLabelText("方案：自定义回答") as HTMLTextAreaElement)
+      .value,
+    "keep my answer",
+  );
+  assert.deepEqual(state.posts, []);
 });
 
 test("a realtime refresh key loads a newly current question without waiting for the periodic timer", async () => {

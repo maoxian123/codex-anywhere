@@ -301,13 +301,14 @@ function questionServer(
   pathname = "/tasks/t1",
   linked = true,
   method = "item/tool/requestUserInput",
+  ownerId = "t1",
 ) {
   const server = setup({}, pathname);
   let pending = false;
   const answers: unknown[] = [];
   const interaction: Interaction = {
     id: "model-question",
-    thread_id: linked ? "not-in-loaded-list" : null,
+    thread_id: linked ? ownerId : null,
     method,
     status: "pending",
     params: {
@@ -409,7 +410,7 @@ function questionServer(
   };
 }
 
-test("global model questions can be answered without changing conversations or clearing composer drafts", async () => {
+test("current conversation questions appear above the composer without clearing its draft", async () => {
   const server = questionServer();
   const composer = await screen.findByRole("textbox", {
     name: "发送消息给 Codex",
@@ -428,6 +429,9 @@ test("global model questions can be answered without changing conversations or c
   assert.ok(banner.closest("main"));
   assert.equal(banner.closest("header"), null);
   const panel = await screen.findByRole("region", { name: "当前轮次问题" });
+  assert.ok(panel.closest(".conversation-input-area"));
+  assert.ok(panel.closest(".conversation-input-area")!.contains(composer));
+  assert.equal(panel.closest(".interaction-attention-banner-slot"), null);
   const option = await within(panel).findByRole("radio", { name: /方案 B/ });
   assert.equal(server.answers.length, 0);
   fireEvent.click(option);
@@ -442,6 +446,29 @@ test("global model questions can be answered without changing conversations or c
   await waitFor(() => assert.doesNotMatch(document.title, /待处理/));
 });
 
+test("questions belonging to another conversation only show a global reminder", async () => {
+  const server = questionServer(
+    "/tasks/t1",
+    true,
+    "anywhere/message_questions",
+    "another-thread",
+  );
+  const composer = await screen.findByRole("textbox", {
+    name: "发送消息给 Codex",
+  });
+  fireEvent.change(composer, { target: { value: "当前草稿" } });
+  composer.focus();
+  server.announce();
+  await screen.findByRole("region", { name: "待处理提醒" });
+  assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+  assert.equal(screen.queryByRole("radio"), null);
+  assert.equal(screen.queryByRole("dialog"), null);
+  assert.equal(document.activeElement, composer);
+  assert.equal((composer as HTMLTextAreaElement).value, "当前草稿");
+  assert.equal(window.location.pathname, "/tasks/t1");
+  assert.deepEqual(server.answers, []);
+});
+
 for (const pathname of ["/", "/settings", "/new"]) {
   test(`unlinked native questions stay reachable from ${pathname}`, async () => {
     const server = questionServer(pathname, false);
@@ -450,11 +477,14 @@ for (const pathname of ["/", "/settings", "/new"]) {
     await waitFor(() => assert.match(document.title, /1.*待处理/));
     const banner = screen.getByRole("region", { name: "待处理提醒" });
     assert.ok(banner.closest("main"));
-    const panel = await screen.findByRole("region", { name: "当前轮次问题" });
-    assert.ok(await within(panel).findByRole("radio", { name: /方案 A/ }));
-    assert.equal(
-      within(panel).queryByRole("button", { name: "打开会话" }),
-      null,
+    assert.equal(screen.queryByRole("region", { name: "当前轮次问题" }), null);
+    assert.equal(screen.queryByRole("radio"), null);
+    fireEvent.click(screen.getByRole("button", { name: "待处理交互" }));
+    fireEvent.click(await screen.findByRole("button", { name: /未关联会话/ }));
+    assert.ok(
+      await within(screen.getByRole("dialog")).findByRole("radio", {
+        name: /方案 A/,
+      }),
     );
     await act(async () => {
       server.resolve();
@@ -478,7 +508,7 @@ test("message questions appear immediately and collapse at their current turn en
   draft.focus();
   server.announce();
   const banner = await screen.findByRole("region", { name: "待处理提醒" });
-  assert.match(banner.textContent || "", /当前轮次的问题/);
+  assert.match(banner.textContent || "", /进入对应会话回答/);
   assert.equal(document.activeElement, draft);
   assert.equal(screen.queryByRole("dialog"), null);
   assert.ok(await screen.findByRole("radio", { name: /方案 A/ }));

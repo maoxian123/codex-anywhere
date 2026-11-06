@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import {
   AssetGallery,
+  CodeBlock,
   CopyButton,
   Disclosure,
   Markdown,
@@ -139,6 +140,7 @@ function NativeTimelineItem({
           <span className="avatar avatar-user">你</span>
           <span>你</span>
           <time>{timeLabel(item.created_at)}</time>
+          <CopyButton text={messageText(item)} label="复制消息" showLabel />
         </div>
         <div className="user-bubble">
           <p className="user-text">{messageText(item)}</p>
@@ -180,7 +182,7 @@ function NativeTimelineItem({
           ) : (
             <time>{timeLabel(item.created_at)}</time>
           )}
-          <CopyButton text={text} />
+          <CopyButton text={text} label="复制回复" showLabel />
         </div>
         <div className="agent-body">
           <Markdown text={text} assets={assets} {...common} />
@@ -210,13 +212,21 @@ function NativeTimelineItem({
         >
           <div className="command-header">
             <span>{string(data.cwd)}</span>
-            <CopyButton text={string(data.command)} />
+            <CopyButton
+              text={string(data.command)}
+              label="复制命令"
+              showLabel
+            />
           </div>
-          <pre className="terminal-output">
+          <CodeBlock
+            language="终端输出"
+            className="terminal-output"
+            text={`${string(data.command)}\n\n${string(data.aggregatedOutput || data.output)}${stream?.text || ""}`}
+          >
             <span className="terminal-prompt">$ </span>
             {string(data.command)}
             {`\n\n${string(data.aggregatedOutput || data.output)}${stream?.text || ""}`}
-          </pre>
+          </CodeBlock>
         </Disclosure>
       );
     if (type === "fileChange" || type === "file_change")
@@ -229,6 +239,8 @@ function NativeTimelineItem({
         >
           {list(data.changes).map((change, index) => {
             const entry = object(change);
+            const diff = string(entry.diff);
+            const lines = diff.split("\n");
             return (
               <section className="diff-file" key={index}>
                 <h4>
@@ -236,25 +248,23 @@ function NativeTimelineItem({
                   {string(entry.path)}
                   <span>{string(object(entry.kind).type || entry.kind)}</span>
                 </h4>
-                <pre className="diff-output">
-                  {string(entry.diff)
-                    .split("\n")
-                    .map((line, lineIndex) => (
-                      <span
-                        key={lineIndex}
-                        className={
-                          line.startsWith("+") && !line.startsWith("+++")
-                            ? "diff-added"
-                            : line.startsWith("-") && !line.startsWith("---")
-                              ? "diff-removed"
-                              : ""
-                        }
-                      >
-                        {line || " "}
-                        {"\n"}
-                      </span>
-                    ))}
-                </pre>
+                <CodeBlock text={diff} language="diff" className="diff-output">
+                  {lines.map((line, lineIndex) => (
+                    <span
+                      key={lineIndex}
+                      className={
+                        line.startsWith("+") && !line.startsWith("+++")
+                          ? "diff-added"
+                          : line.startsWith("-") && !line.startsWith("---")
+                            ? "diff-removed"
+                            : ""
+                      }
+                    >
+                      {line}
+                      {lineIndex < lines.length - 1 ? "\n" : ""}
+                    </span>
+                  ))}
+                </CodeBlock>
               </section>
             );
           })}
@@ -312,7 +322,7 @@ function NativeTimelineItem({
           )}
           <details className="raw-details">
             <summary>操作详情</summary>
-            <pre>{formattedJson(data)}</pre>
+            <CodeBlock text={formattedJson(data)} language="json" />
           </details>
         </Disclosure>
       );
@@ -361,15 +371,19 @@ function NativeTimelineItem({
           error={Boolean(data.error)}
         >
           <p className="eyebrow">输入</p>
-          <pre>{formattedJson(data.arguments)}</pre>
+          <CodeBlock text={formattedJson(data.arguments)} language="json" />
           {data.result != null && (
             <>
               <p className="eyebrow">结果</p>
-              <pre>{formattedJson(data.result)}</pre>
+              <CodeBlock text={formattedJson(data.result)} language="json" />
             </>
           )}
           {data.error != null && (
-            <pre className="text-error">{formattedJson(data.error)}</pre>
+            <CodeBlock
+              text={formattedJson(data.error)}
+              language="json"
+              className="text-error"
+            />
           )}
         </Disclosure>
       );
@@ -380,13 +394,14 @@ function NativeTimelineItem({
         meta={string(data.status)}
         running={running}
       >
-        <pre>
-          {formattedJson(
+        <CodeBlock
+          language="json"
+          text={formattedJson(
             Object.fromEntries(
               Object.entries(data).filter(([key]) => !key.startsWith("_")),
             ),
           )}
-        </pre>
+        />
       </Disclosure>
     );
   })();

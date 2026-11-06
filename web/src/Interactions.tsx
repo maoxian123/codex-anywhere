@@ -194,42 +194,109 @@ function Questions({
   const questions = list(interaction.params.questions).map(object);
   const groupId = useId();
   const form = useRef<HTMLFormElement>(null);
-  const [choices, setChoices] = useState<Record<string, number | "other">>({});
-  const [text, setText] = useState<Record<string, string>>({});
+  const [choices, setChoices] = useState<Record<string, number | "other">>(() =>
+    Object.create(null),
+  );
+  const [text, setText] = useState<Record<string, string>>(() =>
+    Object.create(null),
+  );
   const [missing, setMissing] = useState<number[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [focusRequest, setFocusRequest] = useState(0);
+  const focusTarget = useRef<"question" | "answer" | "custom" | null>(null);
+  const answerFor = (question: JsonObject, index: number) => {
+    const id = string(question.id, String(index));
+    const options = list(question.options).map(object);
+    const choice = choices[id];
+    return !options.length || choice === "other"
+      ? string(text[id])
+      : typeof choice === "number"
+        ? string(options[choice]?.label)
+        : "";
+  };
+  const requestFocus = (target: "question" | "answer" | "custom") => {
+    focusTarget.current = target;
+    setFocusRequest((current) => current + 1);
+  };
+  const navigate = (index: number) => {
+    setActiveIndex(index);
+    requestFocus("question");
+  };
+  useEffect(() => {
+    if (!focusTarget.current) return;
+    const fieldset = form.current?.querySelector<HTMLElement>("fieldset");
+    const target =
+      focusTarget.current === "question"
+        ? fieldset
+        : focusTarget.current === "custom"
+          ? fieldset?.querySelector<HTMLElement>(
+              ".question-answer input, .question-answer textarea",
+            )
+          : fieldset?.querySelector<HTMLElement>("input:checked") ||
+            fieldset?.querySelector<HTMLElement>("input, textarea");
+    focusTarget.current = null;
+    target?.focus({ preventScroll: true });
+    target?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [activeIndex, focusRequest]);
+  useEffect(() => {
+    const textarea = form.current?.querySelector("textarea");
+    if (textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.max(78, textarea.scrollHeight)}px`;
+    }
+  }, [activeIndex, text]);
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    if (sending || locked) return;
+    if (activeIndex < questions.length - 1) {
+      navigate(activeIndex + 1);
+      return;
+    }
     if (!canSubmit || sending) return;
     const result: Record<string, { answers: string[] }> = Object.create(null);
     const unanswered: number[] = [];
     questions.forEach((question, index) => {
       const id = string(question.id, String(index));
-      const options = list(question.options).map(object);
-      const choice = choices[id];
-      const value =
-        !options.length || choice === "other"
-          ? text[id] || ""
-          : typeof choice === "number"
-            ? string(options[choice]?.label)
-            : "";
+      const value = answerFor(question, index);
       if (!value.trim()) unanswered.push(index);
       result[id] = { answers: [value] };
     });
     setMissing(unanswered);
     if (unanswered.length) {
-      form.current
-        ?.querySelector<HTMLElement>(
-          `[data-question-index="${unanswered[0]}"] input`,
-        )
-        ?.focus();
+      const index = unanswered[0];
+      const question = questions[index];
+      const id = string(question.id, String(index));
+      setActiveIndex(index);
+      requestFocus(
+        !list(question.options).length || choices[id] === "other"
+          ? "custom"
+          : "answer",
+      );
       return;
     }
     onAnswer({ answers: result });
   };
   return (
     <form ref={form} onSubmit={submit} className="questions-form" noValidate>
+      {questions.length > 1 && (
+        <div className="questions-progress" role="status" aria-label="答题进度">
+          <strong>
+            问题 {activeIndex + 1} / {questions.length}
+          </strong>
+          <span>
+            已回答{" "}
+            {
+              questions.filter((question, index) =>
+                answerFor(question, index).trim(),
+              ).length
+            }{" "}
+            项
+          </span>
+        </div>
+      )}
       <div className="questions-scroll">
         {questions.map((question, index) => {
+          if (index !== activeIndex) return null;
           const id = string(question.id, String(index));
           const options = list(question.options).map(object);
           const inputName = `${groupId}-question-${index}`;
@@ -239,10 +306,34 @@ function Questions({
             `问题 ${index + 1}`,
           );
           const hasError = missing.includes(index);
-          const customInput = !options.length || choices[id] === "other";
+          const customInput = !options.length || question.isOther === true;
+          const inputProps = {
+            placeholder: options.length
+              ? "也可以在这里填写自己的回答"
+              : "输入你的回答",
+            autoComplete: "off",
+            autoCapitalize: "off",
+            spellCheck: question.isSecret === true ? false : undefined,
+            value: string(text[id]),
+            onFocus: () => {
+              if (options.length)
+                setChoices((current) => ({ ...current, [id]: "other" }));
+            },
+            onChange: (
+              event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
+            ) => {
+              setText((current) => ({ ...current, [id]: event.target.value }));
+              if (options.length)
+                setChoices((current) => ({ ...current, [id]: "other" }));
+              setMissing((current) => current.filter((item) => item !== index));
+            },
+            "aria-invalid": hasError || undefined,
+            "aria-describedby": hasError ? errorId : undefined,
+          };
           return (
             <fieldset
               key={id}
+              tabIndex={-1}
               disabled={sending || locked}
               data-question-index={index}
               aria-describedby={hasError ? errorId : undefined}
@@ -267,12 +358,15 @@ function Questions({
                         name={inputName}
                         value={string(option.label)}
                         checked={choices[id] === optionIndex}
-                        onChange={() =>
+                        onChange={() => {
                           setChoices((current) => ({
                             ...current,
                             [id]: optionIndex,
-                          }))
-                        }
+                          }));
+                          setMissing((current) =>
+                            current.filter((item) => item !== index),
+                          );
+                        }}
                         aria-invalid={hasError || undefined}
                       />
                       <span>
@@ -294,12 +388,13 @@ function Questions({
                         type="radio"
                         name={inputName}
                         checked={choices[id] === "other"}
-                        onChange={() =>
+                        onChange={() => {
                           setChoices((current) => ({
                             ...current,
                             [id]: "other",
-                          }))
-                        }
+                          }));
+                          requestFocus("custom");
+                        }}
                         aria-invalid={hasError || undefined}
                       />
                       <span>自定义回答</span>
@@ -314,22 +409,11 @@ function Questions({
                       ? `${title}：自定义回答`
                       : string(question.question, title)}
                   </span>
-                  <input
-                    type={question.isSecret === true ? "password" : "text"}
-                    placeholder="输入你的回答"
-                    autoComplete="off"
-                    autoCapitalize="off"
-                    spellCheck={question.isSecret === true ? false : undefined}
-                    value={text[id] || ""}
-                    onChange={(event) =>
-                      setText((current) => ({
-                        ...current,
-                        [id]: event.target.value,
-                      }))
-                    }
-                    aria-invalid={hasError || undefined}
-                    aria-describedby={hasError ? errorId : undefined}
-                  />
+                  {question.isSecret === true ? (
+                    <input {...inputProps} type="password" />
+                  ) : (
+                    <textarea {...inputProps} rows={3} />
+                  )}
                 </label>
               )}
               {hasError && (
@@ -347,15 +431,43 @@ function Questions({
             请回答全部 {questions.length} 个问题后再提交。
           </ErrorMessage>
         )}
-        <button
-          type="submit"
-          className="button button-primary button-small"
-          disabled={sending || !canSubmit}
-        >
-          {sending ? <Spinner label="提交中" /> : "提交回答"}
-        </button>
+        {questions.length > 1 && (
+          <button
+            type="button"
+            className="button button-quiet button-small"
+            disabled={sending || locked || activeIndex === 0}
+            onClick={() => navigate(activeIndex - 1)}
+          >
+            上一题
+          </button>
+        )}
+        {activeIndex < questions.length - 1 ? (
+          <button
+            type="submit"
+            className="button button-primary button-small"
+            disabled={sending || locked}
+          >
+            下一题
+          </button>
+        ) : (
+          <button
+            type="submit"
+            className="button button-primary button-small"
+            disabled={sending || !canSubmit}
+          >
+            {sending ? (
+              <Spinner label="提交中" />
+            ) : questions.length > 1 ? (
+              "提交全部回答"
+            ) : (
+              "提交回答"
+            )}
+          </button>
+        )}
         <span className="questions-submit-hint">
-          选择后点击提交，Codex 才会收到回答。
+          {questions.length > 1
+            ? "答案会保留，全部提交后 Codex 才会收到。"
+            : "选择后点击提交，Codex 才会收到回答。"}
         </span>
       </div>
     </form>
