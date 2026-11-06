@@ -12,17 +12,21 @@
   font-size: 15px;
 }
 
-.copy-button.copy-button-labeled {
-  gap: 5px;
-  width: auto;
-  min-height: 34px;
-  height: auto;
-  padding: 4px 8px;
-  font-size: 12px;
-  white-space: nowrap;
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  flex: none;
 }
 
 .message .message-heading .copy-button {
+  width: 32px;
+  height: 32px;
   opacity: 1;
   color: #96b3be;
   background: #ffffff04;
@@ -280,7 +284,14 @@
 }
 
 @media (pointer: coarse), (max-width: 680px) {
-  .copy-button.copy-button-labeled,
+  .copy-button,
+  .message .message-heading .copy-button {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+
   .message-code-wrap {
     min-height: 44px;
   }

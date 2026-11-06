@@ -157,11 +157,9 @@ async function copyTextToClipboard(text: string) {
 export function CopyButton({
   text,
   label = "复制",
-  showLabel = false,
 }: {
   text: string;
   label?: string;
-  showLabel?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState(false);
@@ -175,7 +173,7 @@ export function CopyButton({
   return (
     <button
       type="button"
-      className={`copy-button${showLabel ? " copy-button-labeled" : ""}`}
+      className="copy-button"
       title={error ? "无法访问剪贴板，请手动复制" : copied ? "已复制" : label}
       aria-label={error ? "复制失败，请手动复制" : copied ? "已复制" : label}
       onClick={() => {
@@ -190,9 +188,6 @@ export function CopyButton({
       }}
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
-      {showLabel && (
-        <span>{error ? "复制失败" : copied ? "已复制" : label}</span>
-      )}
     </button>
   );
 }
@@ -226,7 +221,7 @@ export function CodeBlock({
             <WrapText size={14} aria-hidden="true" />
             <span>换行</span>
           </button>
-          <CopyButton text={text} label="复制内容" showLabel />
+          <CopyButton text={text} label="复制内容" />
         </div>
       </div>
       <pre className={`message-code-content ${className}`} tabIndex={0}>

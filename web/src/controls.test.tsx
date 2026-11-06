@@ -133,9 +133,7 @@ test("copy falls back on HTTP, restores focus, and reports failure if copying is
     },
   });
   try {
-    const view = render(
-      <CopyButton text={"  original\n"} label="复制测试" showLabel />,
-    );
+    const view = render(<CopyButton text={"  original\n"} label="复制测试" />);
     const button = screen.getByRole("button", { name: "复制测试" });
     button.focus();
     fireEvent.click(button);
@@ -147,7 +145,7 @@ test("copy falls back on HTTP, restores focus, and reports failure if copying is
       configurable: true,
       value: () => false,
     });
-    render(<CopyButton text="blocked" label="复制测试" showLabel />);
+    render(<CopyButton text="blocked" label="复制测试" />);
     fireEvent.click(screen.getByRole("button", { name: "复制测试" }));
     await screen.findByRole("button", { name: "复制失败，请手动复制" });
     assert.equal(document.querySelectorAll("textarea").length, 0);

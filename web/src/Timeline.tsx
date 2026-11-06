@@ -140,7 +140,7 @@ function NativeTimelineItem({
           <span className="avatar avatar-user">你</span>
           <span>你</span>
           <time>{timeLabel(item.created_at)}</time>
-          <CopyButton text={messageText(item)} label="复制消息" showLabel />
+          <CopyButton text={messageText(item)} label="复制消息" />
         </div>
         <div className="user-bubble">
           <p className="user-text">{messageText(item)}</p>
@@ -182,7 +182,7 @@ function NativeTimelineItem({
           ) : (
             <time>{timeLabel(item.created_at)}</time>
           )}
-          <CopyButton text={text} label="复制回复" showLabel />
+          <CopyButton text={text} label="复制回复" />
         </div>
         <div className="agent-body">
           <Markdown text={text} assets={assets} {...common} />
@@ -212,11 +212,7 @@ function NativeTimelineItem({
         >
           <div className="command-header">
             <span>{string(data.cwd)}</span>
-            <CopyButton
-              text={string(data.command)}
-              label="复制命令"
-              showLabel
-            />
+            <CopyButton text={string(data.command)} label="复制命令" />
           </div>
           <CodeBlock
             language="终端输出"
