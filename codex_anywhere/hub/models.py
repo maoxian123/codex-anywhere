@@ -165,6 +165,18 @@ class Thread(db.Model):
 
 
 class Command(db.Model):
+    __table_args__ = (
+        db.Index(
+            "ix_command_reference_metadata",
+            "host_id",
+            "thread_id",
+            sqlite_where=db.text(
+                "CASE WHEN json_valid(payload) THEN "
+                "(json_array_length(payload, '$._assets') > 0 OR "
+                "json_array_length(payload, '$._references') > 0) ELSE 1 END = 1"
+            ),
+        ).ddl_if(dialect="sqlite"),
+    )
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     host_id = db.Column(db.String(32), db.ForeignKey("host.id"), nullable=False, index=True)
     thread_id = db.Column(db.String(32), db.ForeignKey("thread.id"), nullable=True)
@@ -236,6 +248,15 @@ class Item(db.Model):
     __table_args__ = (
         db.UniqueConstraint("thread_id", "native_id"),
         db.Index("ix_item_thread_position", "thread_id", "position", "id"),
+        db.Index(
+            "ix_item_reference_metadata",
+            "thread_id",
+            sqlite_where=db.text(
+                "CASE WHEN json_valid(data) THEN "
+                "(json_array_length(data, '$._assets') > 0 OR "
+                "json_array_length(data, '$._references') > 0) ELSE 1 END = 1"
+            ),
+        ).ddl_if(dialect="sqlite"),
     )
     id = db.Column(db.String(32), primary_key=True, default=new_id)
     native_id = db.Column(db.String(250), nullable=False)

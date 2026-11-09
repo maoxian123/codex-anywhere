@@ -1,15 +1,19 @@
 """Deleting a machine removes only its hub projection, using fake nodes."""
 
 import io
+import json
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from PIL import Image
-from sqlalchemy import func
+from sqlalchemy import event, func, text
 
-from codex_anywhere.hub import _identifier, _json
-from codex_anywhere.hub.hosts import register_host_routes
+from codex_anywhere.cli import upgrade_database
+from codex_anywhere.hub import _identifier, _json, create_app
+from codex_anywhere.hub.hosts import _references, register_host_routes
 from codex_anywhere.hub.models import (
     Asset,
     Command,
@@ -44,6 +48,14 @@ def asset(app, *, host_id=None, thread_id=None, name="image.png", size=7, path=N
     db.session.add(record)
     db.session.flush()
     return record
+
+
+def reference_predicate(column):
+    return (
+        f"CASE WHEN json_valid({column}) THEN ("
+        f"json_array_length({column}, '$._assets') > 0 OR "
+        f"json_array_length({column}, '$._references') > 0) ELSE 1 END = 1"
+    )
 
 
 def test_host_settings_and_delete_require_authentication_and_csrf(
@@ -299,6 +311,377 @@ def test_shared_attachment_survives_and_deleted_host_associations_are_removed(
         retained = Command.query.filter_by(host_id=kept["host"]["id"], kind="turn.start").one()
         assert retained.payload["_assets"][0]["id"] == asset_id
     assert api("GET", f"/api/assets/{asset_id}").status_code == 200
+
+
+@pytest.mark.parametrize("kind", ["command", "item"])
+def test_shared_references_in_legacy_nan_json_are_preserved_on_delete(
+    app, api, paired_host, create_thread, kind
+):
+    removed = paired_host("legacy-source")
+    kept = paired_host("legacy-reader")
+    first, second = create_thread(removed), create_thread(kept)
+    with app.app_context():
+        shared = asset(app, host_id=removed["host"]["id"], thread_id=first["id"])
+        snapshot = Snapshot(kind="web", title="Shared reference", excerpt="shared")
+        db.session.add(snapshot)
+        db.session.flush()
+        references = {"_assets": [shared.as_dict()], "_references": [snapshot.as_dict()]}
+        db.session.add(
+            Command(
+                host_id=removed["host"]["id"],
+                thread_id=first["id"],
+                kind="turn.start",
+                payload=references,
+            )
+        )
+        if kind == "command":
+            db.session.add(
+                Command(
+                    host_id=kept["host"]["id"],
+                    thread_id=second["id"],
+                    kind="turn.start",
+                    payload={**references, "legacy_number": float("nan")},
+                )
+            )
+        else:
+            db.session.add(
+                Item(
+                    thread_id=second["id"],
+                    native_id="legacy-nan-item",
+                    type="agentMessage",
+                    data={**references, "legacy_number": float("nan")},
+                )
+            )
+        db.session.commit()
+        asset_id, path, snapshot_id = shared.id, Path(shared.path), snapshot.id
+        table, column = ("command", "payload") if kind == "command" else ("item", "data")
+        filter_kind = " AND kind = 'turn.start'" if kind == "command" else ""
+        assert db.session.execute(
+            text(f"SELECT json_valid({column}) FROM {table} WHERE thread_id = :thread{filter_kind}"),
+            {"thread": second["id"]},
+        ).scalar() == 0
+
+    settings = api("GET", "/api/settings/hosts")
+    assert settings.status_code == 200
+    kept_data = next(row["data"] for row in settings.json["hosts"] if row["id"] == kept["host"]["id"])
+    assert kept_data["attachments"] == 1
+    response = api(
+        "DELETE", f"/api/hosts/{removed['host']['id']}", json={"confirm_name": "legacy-source"}
+    )
+    assert response.status_code == 200
+    assert path.exists()
+    with app.app_context():
+        value = db.session.get(Asset, asset_id)
+        assert value is not None and value.host_id is None and value.thread_id is None
+        assert db.session.get(Snapshot, snapshot_id) is not None
+
+
+def test_deleting_without_attachment_candidates_does_not_parse_other_hosts_messages(
+    app, api, paired_host, create_thread
+):
+    removed = paired_host("empty-source")
+    kept = paired_host("unrelated-history")
+    first, second = create_thread(removed), create_thread(kept)
+    with app.app_context():
+        kept_asset = asset(app, host_id=kept["host"]["id"], thread_id=second["id"])
+        db.session.add_all(
+            [
+                Command(
+                    host_id=kept["host"]["id"],
+                    thread_id=second["id"],
+                    kind="turn.start",
+                    payload={
+                        "_test_payload_owner": "kept",
+                        "input": "unrelated history",
+                        "_assets": [kept_asset.as_dict()],
+                    },
+                ),
+                Item(
+                    thread_id=second["id"],
+                    native_id="unrelated-item",
+                    type="agentMessage",
+                    data={
+                        "_test_payload_owner": "kept",
+                        "text": "unrelated history",
+                        "_assets": [kept_asset.as_dict()],
+                    },
+                ),
+            ]
+        )
+        db.session.commit()
+        raw_connection = db.engine.raw_connection()
+        unrelated_reads = []
+
+        def count_json_extractions(value, path):
+            # The target has no metadata. Count extraction of unrelated rows;
+            # those should never be evaluated for an empty candidate set.
+            data = json.loads(value) if value is not None else None
+            if isinstance(data, dict) and data.get("_test_payload_owner") == "kept":
+                unrelated_reads.append(path)
+            return None
+
+        raw_connection.driver_connection.create_function("json_extract", 2, count_json_extractions)
+        try:
+            response = api(
+                "DELETE",
+                f"/api/hosts/{removed['host']['id']}",
+                json={"confirm_name": "empty-source"},
+            )
+        finally:
+            raw_connection.close()
+        assert response.status_code == 200
+        assert unrelated_reads == []
+        assert db.session.get(Thread, first["id"]) is None
+        assert db.session.get(Thread, second["id"]) is not None
+
+
+def test_reference_indexes_upgrade_existing_rows_and_track_metadata_updates(tmp_path):
+    app = create_app(
+        {
+            "SECRET_KEY": "test-migration-secret",
+            "ADMIN_PASSWORD": "test-migration-password",
+            "SQLALCHEMY_DATABASE_URI": "sqlite:///" + str(tmp_path / "references.db"),
+            "ASSET_DIR": str(tmp_path / "assets"),
+        }
+    )
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(__file__).parents[1] / "codex_anywhere" / "migrations")
+    )
+    try:
+        with app.app_context(), db.engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0007_thread_preferences")
+        with app.app_context():
+            host = Host(name="old-host", platform="test", token_hash="old-token")
+            db.session.add(host)
+            db.session.flush()
+            thread = Thread(host_id=host.id, title="old thread", cwd="/tmp", status="idle")
+            db.session.add(thread)
+            db.session.flush()
+            item = Item(
+                thread_id=thread.id,
+                native_id="old-item",
+                type="agentMessage",
+                data={"text": "old content"},
+            )
+            saved_command = Command(
+                host_id=host.id, thread_id=thread.id, kind="turn.start", payload={"input": []}
+            )
+            db.session.add_all([item, saved_command])
+            db.session.commit()
+            item_id, command_id, host_id = item.id, saved_command.id, host.id
+
+        upgrade_database(app)
+
+        with app.app_context():
+            for table, column, name in (
+                ("item", "data", "ix_item_reference_metadata"),
+                ("command", "payload", "ix_command_reference_metadata"),
+            ):
+                predicate = reference_predicate(column)
+                sql = f"SELECT id FROM {table} WHERE {predicate}"
+                plan = db.session.execute(text("EXPLAIN QUERY PLAN " + sql)).all()
+                assert any(name in row[3] for row in plan)
+                assert db.session.execute(text(sql)).all() == []
+
+            item_join_plan = db.session.execute(
+                text(
+                    "EXPLAIN QUERY PLAN SELECT item.id FROM item JOIN thread "
+                    "ON item.thread_id = thread.id WHERE " + reference_predicate("item.data")
+                )
+            ).all()
+            assert any("ix_item_reference_metadata" in row[3] for row in item_join_plan)
+
+            item = db.session.get(Item, item_id)
+            saved_command = db.session.get(Command, command_id)
+            assert item.data == {"text": "old content"}
+            item.data = {"text": "old content", "_assets": [{"id": "asset"}]}
+            saved_command.payload = {"_references": [{"snapshot_id": "snapshot"}]}
+            db.session.commit()
+            statements = []
+
+            def capture_query(_conn, _cursor, statement, parameters, _context, _many):
+                if "json_extract" in statement.lower():
+                    statements.append((statement, parameters))
+
+            event.listen(db.engine, "before_cursor_execute", capture_query)
+            try:
+                assert list(_references())
+                assert list(_references(host_id))
+            finally:
+                event.remove(db.engine, "before_cursor_execute", capture_query)
+            assert len(statements) == 4
+            plans = [
+                db.session.connection()
+                .exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+                .all()
+                for statement, parameters in statements
+            ]
+            assert any("ix_command_reference_metadata" in row[3] for row in plans[0])
+            assert any("ix_item_reference_metadata" in row[3] for row in plans[1])
+            assert any("ix_command_reference_metadata" in row[3] for row in plans[2])
+            assert any("ix_item_reference_metadata" in row[3] for row in plans[3])
+            assert db.session.execute(
+                text("SELECT id FROM item WHERE " + reference_predicate("data"))
+            ).scalars().all() == [item_id]
+            assert db.session.execute(
+                text("SELECT id FROM command WHERE " + reference_predicate("payload"))
+            ).scalars().all() == [command_id]
+            item.data = {"text": "old content"}
+            saved_command.payload = {"input": []}
+            db.session.commit()
+            assert db.session.execute(
+                text("SELECT id FROM item WHERE " + reference_predicate("data"))
+            ).all() == []
+            assert db.session.execute(
+                text("SELECT id FROM command WHERE " + reference_predicate("payload"))
+            ).all() == []
+    finally:
+        with app.app_context():
+            db.session.remove()
+            db.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "existing_index,expected_success",
+    [
+        (
+            "CREATE INDEX ix_command_reference_metadata ON command (host_id, thread_id) "
+            + "WHERE " + reference_predicate("payload"),
+            True,
+        ),
+        (
+            "CREATE INDEX ix_command_reference_metadata ON command (host_id, thread_id) "
+            "WHERE json_array_length(payload, '$._assets') > 0",
+            False,
+        ),
+        (
+            "CREATE INDEX ix_command_reference_metadata ON command (thread_id) "
+            + "WHERE " + reference_predicate("payload"),
+            False,
+        ),
+        (
+            "CREATE INDEX ix_command_reference_metadata ON item (thread_id) "
+            + "WHERE " + reference_predicate("data"),
+            False,
+        ),
+        (
+            "CREATE INDEX ix_command_reference_metadata ON command (host_id, thread_id) "
+            + "WHERE " + reference_predicate("payload") + ";"
+            + "CREATE INDEX ix_item_reference_metadata ON item (thread_id) "
+            + "WHERE " + reference_predicate("data").replace("> 0", "> 1", 1),
+            False,
+        ),
+        (
+            "CREATE INDEX ix_command_reference_metadata ON command (host_id, thread_id) "
+            + "WHERE " + reference_predicate("payload") + ";"
+            + "CREATE INDEX ix_item_reference_metadata ON item (thread_id) "
+            + "WHERE " + reference_predicate("data"),
+            True,
+        ),
+    ],
+    ids=[
+        "interrupted-after-first-index",
+        "wrong-predicate",
+        "wrong-columns",
+        "wrong-table",
+        "wrong-second-index",
+        "interrupted-after-both-indexes",
+    ],
+)
+def test_reference_index_migration_recovers_partial_creation_or_rejects_mismatch(
+    tmp_path, existing_index, expected_success
+):
+    app = create_app(
+        {
+            "SECRET_KEY": "test-migration-secret",
+            "ADMIN_PASSWORD": "test-migration-password",
+            "SQLALCHEMY_DATABASE_URI": "sqlite:///" + str(tmp_path / "partial.db"),
+            "ASSET_DIR": str(tmp_path / "assets"),
+        }
+    )
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(__file__).parents[1] / "codex_anywhere" / "migrations")
+    )
+    try:
+        with app.app_context(), db.engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0007_thread_preferences")
+            for statement in existing_index.split(";"):
+                connection.exec_driver_sql(statement)
+        if expected_success:
+            upgrade_database(app)
+        else:
+            with pytest.raises(RuntimeError):
+                upgrade_database(app)
+        with app.app_context(), db.engine.connect() as connection:
+            revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            if expected_success:
+                assert revision == "0008_reference_indexes"
+                indexes = connection.execute(
+                    text(
+                        "SELECT name FROM sqlite_master WHERE type='index' "
+                        "AND name IN ('ix_command_reference_metadata', 'ix_item_reference_metadata')"
+                    )
+                ).scalars().all()
+                assert len(indexes) == 2
+            else:
+                assert revision == "0007_thread_preferences"
+    finally:
+        with app.app_context():
+            db.session.remove()
+            db.engine.dispose()
+
+
+def test_reference_index_migration_accepts_existing_nan_json(tmp_path):
+    app = create_app(
+        {
+            "SECRET_KEY": "test-migration-secret",
+            "ADMIN_PASSWORD": "test-migration-password",
+            "SQLALCHEMY_DATABASE_URI": "sqlite:///" + str(tmp_path / "legacy-nan.db"),
+            "ASSET_DIR": str(tmp_path / "assets"),
+        }
+    )
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(__file__).parents[1] / "codex_anywhere" / "migrations")
+    )
+    try:
+        with app.app_context(), db.engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0007_thread_preferences")
+        with app.app_context():
+            host = Host(name="nan-host", platform="test", token_hash="nan-token")
+            db.session.add(host)
+            db.session.flush()
+            thread = Thread(host_id=host.id, title="legacy", cwd="/tmp", status="idle")
+            db.session.add(thread)
+            db.session.flush()
+            references = {"value": float("nan"), "_assets": [{"id": "legacy-asset"}]}
+            item = Item(thread_id=thread.id, native_id="nan-item", type="native", data=references)
+            saved = Command(host_id=host.id, thread_id=thread.id, kind="legacy", payload=references)
+            db.session.add_all([item, saved])
+            db.session.commit()
+            item_id, command_id = item.id, saved.id
+
+        upgrade_database(app)
+
+        with app.app_context():
+            for table, column, expected_id in (
+                ("item", "data", item_id), ("command", "payload", command_id)
+            ):
+                query = f"SELECT id FROM {table} WHERE {reference_predicate(column)}"
+                assert db.session.execute(text(query)).scalars().all() == [expected_id]
+            item = db.session.get(Item, item_id)
+            item.data = {**item.data, "other": "updated after migration"}
+            db.session.commit()
+            assert db.session.get(Item, item_id).data["_assets"][0]["id"] == "legacy-asset"
+    finally:
+        with app.app_context():
+            db.session.remove()
+            db.engine.dispose()
 
 
 @pytest.mark.parametrize("kind", ["missing", "outside", "directory", "symlink"])

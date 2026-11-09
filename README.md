@@ -72,6 +72,8 @@ cd ..
 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 用作初始登录凭据；在设置页面保存过账号后，数据库中的配置优先于这些环境变量，重启后仍然有效。
 部署升级时先运行 `codex-anywhere db-upgrade`，再重启管理中心并构建新版前端；本地 `server` 命令会自动执行数据库迁移。
 
+SQLite 的机器数据管理使用稀疏引用索引，避免每次打开机器设置或删除机器都解析全部消息。首次升级到包含该索引的版本时，需要扫描已有指令和消息建立索引；历史数据较多时，首次数据库迁移可能较慢，应预留启动时间与磁盘空间并先完整备份数据库及附件。后续写入会自动维护索引。PostgreSQL 保留原有引用查询方式。
+
 前端修改后重新运行 `npm run build`。使用 `npm run dev` 热更新开发时，将 `.env` 中的 `PUBLIC_URL` 设为实际 Vite 地址（例如 `http://localhost:5173`），重启 Flask 后从该地址访问。前后端开发、构建和检查脚本以 [web/package.json](web/package.json) 为准。
 
 ## 连接工作电脑

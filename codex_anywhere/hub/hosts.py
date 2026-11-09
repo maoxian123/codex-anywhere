@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from flask import abort, jsonify
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, literal, or_, select, text
 
 from .models import Asset, Command, Event, Host, Interaction, Item, Project, Snapshot, Thread, db
 from .transport import emit
@@ -25,24 +25,60 @@ def _ids(value, key="id"):
     }
 
 
-def _references():
+def _references(host_id=None):
     """Read only small metadata fragments, never full native input/base64 JSON."""
+    sqlite = db.session.get_bind().dialect.name == "sqlite"
+
+    def fragments(column):
+        if not sqlite:
+            return column["_assets"], column["_references"], literal(True)
+        valid = func.json_valid(column)
+        # Python's JSON serializer can preserve NaN/Infinity, which older SQLite
+        # JSON1 cannot parse. Fetch those rare rows as JSON for Python to decode.
+        return (
+            case((valid, column["_assets"]), else_=column),
+            case((valid, column["_references"]), else_=column),
+            valid,
+        )
+
     commands = db.session.query(
         Command.host_id,
         Command.thread_id,
-        Command.payload["_assets"],
-        Command.payload["_references"],
-    ).yield_per(BATCH_SIZE)
-    for host_id, thread_id, assets, references in commands:
-        yield host_id, thread_id, _ids(assets), _ids(references, "snapshot_id")
-    items = (
-        db.session.query(
-            Thread.host_id, Item.thread_id, Item.data["_assets"], Item.data["_references"]
-        )
-        .join(Thread, Item.thread_id == Thread.id)
-        .yield_per(BATCH_SIZE)
+        *fragments(Command.payload),
     )
-    for host_id, thread_id, assets, references in items:
+    items = db.session.query(
+        Thread.host_id, Item.thread_id, *fragments(Item.data)
+    ).join(Thread, Item.thread_id == Thread.id)
+    if host_id is not None:
+        threads = select(Thread.id).where(Thread.host_id == host_id)
+        commands = commands.filter(or_(Command.host_id == host_id, Command.thread_id.in_(threads)))
+        items = items.filter(Thread.host_id == host_id)
+    if sqlite:
+        # These predicates match the sparse indexes in migration 0008. Non-array
+        # values cannot contain references recognized by _ids either.
+        commands = commands.filter(text(
+            "CASE WHEN json_valid(command.payload) THEN "
+            "(json_array_length(command.payload, '$._assets') > 0 OR "
+            "json_array_length(command.payload, '$._references') > 0) ELSE 1 END = 1"
+        ))
+        items = items.filter(text(
+            "CASE WHEN json_valid(item.data) THEN "
+            "(json_array_length(item.data, '$._assets') > 0 OR "
+            "json_array_length(item.data, '$._references') > 0) ELSE 1 END = 1"
+        ))
+    commands = commands.yield_per(BATCH_SIZE)
+    for host_id, thread_id, assets, references, valid in commands:
+        if not valid:
+            assets, references = (
+                assets.get("_assets"), references.get("_references")
+            ) if isinstance(assets, dict) and isinstance(references, dict) else (None, None)
+        yield host_id, thread_id, _ids(assets), _ids(references, "snapshot_id")
+    items = items.yield_per(BATCH_SIZE)
+    for host_id, thread_id, assets, references, valid in items:
+        if not valid:
+            assets, references = (
+                assets.get("_assets"), references.get("_references")
+            ) if isinstance(assets, dict) and isinstance(references, dict) else (None, None)
         yield host_id, thread_id, _ids(assets), _ids(references, "snapshot_id")
 
 
@@ -111,18 +147,21 @@ def _purge(host_id):
     other_assets = set()
     target_snapshots = set()
     other_snapshots = set()
-    for owner, thread_id, assets, snapshots in _references():
-        if owner == host_id or thread_id in thread_ids:
-            target_assets.update(assets)
-            target_snapshots.update(snapshots)
-        else:
-            other_assets.update(assets)
-            other_snapshots.update(snapshots)
+    for _owner, _thread_id, assets, snapshots in _references(host_id):
+        target_assets.update(assets)
+        target_snapshots.update(snapshots)
     target_assets.update(
         db.session.scalars(
             select(Asset.id).where(or_(Asset.host_id == host_id, Asset.thread_id.in_(thread_query)))
         )
     )
+    if target_assets or target_snapshots:
+        for owner, thread_id, assets, snapshots in _references():
+            if owner != host_id and thread_id not in thread_ids:
+                other_assets.update(assets & target_assets)
+                other_snapshots.update(snapshots & target_snapshots)
+                if other_assets == target_assets and other_snapshots == target_snapshots:
+                    break
     files = []
     for batch in _batches(target_assets):
         for asset in Asset.query.filter(Asset.id.in_(batch)).all():
