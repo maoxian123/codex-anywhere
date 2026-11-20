@@ -575,6 +575,41 @@ test("history failure exposes a button that explicitly retries native history", 
   );
 });
 
+test("reopening a failed history snapshot offers an explicit latest-page refresh", async () => {
+  const failure =
+    "History changed while loading this page; refresh the latest page";
+  const server = setup({
+    status: "error",
+    history_loaded: false,
+    last_error: failure,
+  });
+  const requests: unknown[] = [];
+  server.intercept((path, init) => {
+    if (path !== "/api/threads/t1/history") return;
+    requests.push(JSON.parse(String(init?.body)));
+    Object.assign(server.thread, {
+      status: "idle",
+      history_loaded: true,
+      history_stale: false,
+      last_error: null,
+    });
+    return response({ thread: server.thread, command: null });
+  });
+  const refresh = await screen.findByRole("button", { name: "刷新最新历史" });
+  assert.equal(requests.length, 0);
+  assert.ok(
+    screen.getByText(
+      "历史记录在读取期间已更新，请刷新最新历史；若会话仍在运行，请等待结束后再试。",
+    ),
+  );
+  assert.equal(screen.queryByText(failure), null);
+  fireEvent.click(refresh);
+  await waitFor(() => assert.deepEqual(requests, [{ retry: true }]));
+  await waitFor(() =>
+    assert.equal(screen.queryByRole("button", { name: "刷新最新历史" }), null),
+  );
+});
+
 function ownershipServer(
   initial: ThreadOwnership,
   releaseResult?: Record<string, unknown>,
@@ -2225,3 +2260,111 @@ test("older native history waits for cursor projection and preserves the loaded 
     true,
   );
 });
+
+for (const status of ["failed", "unknown"]) {
+  test(`a ${status} older snapshot refreshes from the latest page only after a click`, async () => {
+    const server = setup({
+      history_loaded: true,
+      history_complete: false,
+      history_cursor: "cursor-1",
+      history_generation: "generation-1",
+      history_synced_at: "first-sync",
+    });
+    const requests: unknown[] = [];
+    let refreshed = false;
+    server.intercept((path, init) => {
+      if (path === "/api/threads/t1/history") {
+        const body = JSON.parse(String(init?.body));
+        requests.push(body);
+        if (requests.length === 1)
+          return response({
+            thread: server.thread,
+            command: {
+              id: "stale-older-command",
+              kind: "thread.history",
+              status,
+              error:
+                "History changed while loading this page; refresh the latest page",
+            },
+          });
+        if (requests.length === 2) {
+          assert.deepEqual(body, { retry: true });
+          refreshed = true;
+          Object.assign(server.thread, {
+            history_cursor: "cursor-2",
+            history_generation: "generation-2",
+            history_synced_at: "latest-sync",
+          });
+          return response({
+            thread: server.thread,
+            command: {
+              id: "latest-command",
+              kind: "thread.history",
+              status: "completed",
+              result: { itemCount: 1 },
+            },
+          });
+        }
+        assert.deepEqual(body, { cursor: "cursor-2", limit: 50 });
+        Object.assign(server.thread, {
+          history_cursor: null,
+          history_complete: true,
+          history_synced_at: "older-sync",
+        });
+        return response({
+          thread: server.thread,
+          command: {
+            id: "new-older-command",
+            kind: "thread.history",
+            status: "completed",
+            result: { itemCount: 1 },
+          },
+        });
+      }
+      if (path.split("?")[0] !== "/api/threads/t1") return;
+      const query = new URLSearchParams(path.split("?")[1]);
+      const older = query.has("before_position");
+      const id = older ? "new-older" : refreshed ? "new-tail" : "old-tail";
+      return response({
+        thread: server.thread,
+        interactions: [],
+        items:
+          query.get("item_limit") === "1"
+            ? []
+            : [
+                {
+                  id,
+                  native_id: id,
+                  thread_id: "t1",
+                  type: "agentMessage",
+                  position: older ? 50 : 100,
+                  data: { text: id },
+                },
+              ],
+        has_more_items: false,
+        next_before_position: null,
+      });
+    });
+    await screen.findByText("old-tail");
+    fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
+    const refresh = await screen.findByRole("button", { name: "刷新最新历史" });
+    assert.deepEqual(requests, [{ cursor: "cursor-1", limit: 50 }]);
+    assert.ok(screen.getByText("old-tail"));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    assert.equal(requests.length, 1);
+    fireEvent.click(refresh);
+    await screen.findByText("new-tail");
+    assert.equal(screen.queryByText("old-tail"), null);
+    assert.deepEqual(requests, [
+      { cursor: "cursor-1", limit: 50 },
+      { retry: true },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
+    await screen.findByText("new-older");
+    assert.ok(screen.getByText("new-tail"));
+    assert.equal(screen.queryByText("old-tail"), null);
+    assert.deepEqual(requests.at(-1), { cursor: "cursor-2", limit: 50 });
+  });
+}

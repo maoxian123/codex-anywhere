@@ -129,6 +129,119 @@ test("explicit history retry bypasses the blocked version and sends retry:true",
   assert.deepEqual(bodies, [{}, { retry: true }]);
   assert.equal(screen.queryByRole("alert"), null);
 });
+
+test("refreshing cached native history waits for the new snapshot projection", async () => {
+  const cached: Thread = {
+    ...thread,
+    history_loaded: true,
+    history_stale: false,
+    history_generation: "old-generation",
+  };
+  const bodies: unknown[] = [];
+  let metadataReads = 0,
+    refreshed = 0;
+  let finishProjection!: (value: Response) => void;
+  const projected = new Promise<Response>((resolve) => {
+    finishProjection = resolve;
+  });
+  globalThis.fetch = async (input, init) => {
+    const path = String(input);
+    if (path === "/api/threads/t1/history") {
+      bodies.push(JSON.parse(String(init?.body)));
+      return response({
+        thread: cached,
+        command: {
+          id: "latest-page",
+          kind: "thread.history",
+          status: "completed",
+          result: { itemCount: 1 },
+        },
+      });
+    }
+    assert.equal(path, "/api/threads/t1?item_limit=1");
+    metadataReads += 1;
+    return metadataReads === 1
+      ? response({ thread: cached, items: [], interactions: [] })
+      : projected;
+  };
+  const refresh = async () => {
+    refreshed += 1;
+  };
+  render(<Harness current={cached} refresh={refresh} />);
+  assert.equal(bodies.length, 0);
+  fireEvent.click(screen.getByRole("button", { name: "重试历史读取" }));
+  await waitFor(() => assert.equal(metadataReads, 2));
+  assert.deepEqual(bodies, [{ retry: true }]);
+  assert.equal(refreshed, 0);
+  assert.ok(screen.getByText("同步中"));
+  assert.equal(
+    (screen.getByRole("button", { name: "重试历史读取" }) as HTMLButtonElement)
+      .disabled,
+    true,
+  );
+  await act(async () => {
+    finishProjection(
+      response({
+        thread: { ...cached, history_generation: "new-generation" },
+        items: [],
+        interactions: [],
+      }),
+    );
+    await projected;
+  });
+  await waitFor(() => assert.equal(refreshed, 1));
+  assert.ok(screen.getByText("同步已结束"));
+  assert.equal(metadataReads, 2);
+});
+
+test("a reused older-page command offers another explicit refresh instead of waiting for a new generation", async () => {
+  const cached = {
+    ...thread,
+    history_loaded: true,
+    history_generation: "old-generation",
+  };
+  const bodies: unknown[] = [];
+  let refreshed = 0;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).endsWith("/history")) {
+      bodies.push(JSON.parse(String(init?.body)));
+      return response({
+        thread: cached,
+        command: {
+          id: `page-${bodies.length}`,
+          kind: "thread.history",
+          status: "completed",
+          result: {
+            generation:
+              bodies.length === 1 ? "old-generation" : "new-generation",
+          },
+        },
+      });
+    }
+    assert.equal(String(input), "/api/threads/t1?item_limit=1");
+    return response({
+      thread: { ...cached, history_generation: "new-generation" },
+      items: [],
+      interactions: [],
+    });
+  };
+  render(
+    <Harness
+      current={cached}
+      refresh={async () => {
+        refreshed += 1;
+      }}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "重试历史读取" }));
+  await screen.findByText("更早历史正在由其他页面同步，请稍后重试历史读取。");
+  assert.deepEqual(bodies, [{ retry: true }]);
+  assert.equal(refreshed, 0);
+  fireEvent.click(screen.getByRole("button", { name: "重试历史读取" }));
+  await waitFor(() => assert.equal(refreshed, 1));
+  assert.deepEqual(bodies, [{ retry: true }, { retry: true }]);
+});
+
 test("409 unknown imports stop automatic retries even after unchanged catalog scans and route switches", async () => {
   let requests = 0;
   const refresh = async () => {};

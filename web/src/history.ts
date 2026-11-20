@@ -1,5 +1,23 @@
 import type { Item, Thread, ThreadDetail } from "./types";
 
+export function historyNeedsRefresh(message?: string | null): boolean {
+  return Boolean(
+    message &&
+    [
+      "History changed while loading this page",
+      "History changed since this cursor was created",
+      "Native history page anchor is no longer cached",
+      "历史已更新，请刷新最近消息后继续加载",
+    ].some((text) => message.includes(text)),
+  );
+}
+
+export function historyErrorText(message: string): string {
+  return historyNeedsRefresh(message)
+    ? "历史记录在读取期间已更新，请刷新最新历史；若会话仍在运行，请等待结束后再试。"
+    : message;
+}
+
 export type HistoryCache = {
   id: string;
   version: string;

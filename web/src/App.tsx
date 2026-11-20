@@ -28,6 +28,8 @@ import OwnershipPanel from "./OwnershipPanel";
 import { useThreadOwnership, writerConflict } from "./useThreadOwnership";
 import { commandFailure, eventFailure } from "./runtime-errors";
 import {
+  historyErrorText,
+  historyNeedsRefresh,
   latestHistory,
   olderHistory,
   withHistory,
@@ -565,6 +567,13 @@ function Workspace({
             request === threadFetchRef.current
           ) {
             const cache = latestHistory(historyCache.current, value);
+            if (
+              historyCache.current?.id === id &&
+              historyCache.current.version !== cache.version
+            ) {
+              setOlderError("");
+              setHistoryError("");
+            }
             historyCache.current = cache;
             setDetail((current) =>
               withHistory(
@@ -706,8 +715,11 @@ function Workspace({
           !controller.signal.aborted &&
           selectedRef.current === id &&
           liveRef.current
-        )
+        ) {
           setOlderError(errorText(reason));
+          if (historyNeedsRefresh(errorText(reason)))
+            setHistoryError(errorText(reason));
+        }
       } finally {
         if (olderRequest.current === controller) {
           olderRequest.current = null;
@@ -1172,6 +1184,11 @@ function Workspace({
     refresh: refreshThread,
     onError: setHistoryError,
   });
+  const historyFailure =
+    historyError ||
+    (historyNeedsRefresh(detail?.thread.last_error)
+      ? detail?.thread.last_error || ""
+      : "");
   useEffect(() => {
     const key = `${route.id}:${route.item || ""}`;
     if (referencePages.current.key !== key)
@@ -1468,21 +1485,29 @@ function Workspace({
           />
         ) : route.id ? (
           <>
-            {detail?.thread.last_error && (
+            {detail?.thread.last_error &&
+              !historyNeedsRefresh(detail.thread.last_error) && (
+                <div className="thread-error">
+                  <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
+                </div>
+              )}
+            {historyFailure && (
               <div className="thread-error">
-                <ErrorMessage>{detail.thread.last_error}</ErrorMessage>
-              </div>
-            )}
-            {historyError && (
-              <div className="thread-error">
-                <ErrorMessage>{historyError}</ErrorMessage>
+                <ErrorMessage>{historyErrorText(historyFailure)}</ErrorMessage>
                 <button
                   className="button button-small"
-                  disabled={historyBusy || !selectedHost?.online}
+                  disabled={
+                    historyBusy ||
+                    loadingOlder ||
+                    !selectedHost?.online ||
+                    !["idle", "error"].includes(detail?.thread.status || "")
+                  }
                   onClick={retryHistory}
                 >
                   <RefreshCw size={14} />
-                  重试历史读取
+                  {historyNeedsRefresh(historyFailure)
+                    ? "刷新最新历史"
+                    : "重试历史读取"}
                 </button>
               </div>
             )}
@@ -1507,13 +1532,17 @@ function Workspace({
               streams={streams}
               busy={busyStatus(detail?.thread.status)}
               loading={loadingThread}
-              hasMore={Boolean(
-                detail?.has_more_items ||
-                (detail?.thread.history_complete === false &&
-                  detail.thread.history_cursor),
-              )}
-              loadingOlder={loadingOlder}
-              olderError={olderError}
+              hasMore={
+                !historyNeedsRefresh(historyFailure) &&
+                !historyNeedsRefresh(olderError) &&
+                Boolean(
+                  detail?.has_more_items ||
+                  (detail?.thread.history_complete === false &&
+                    detail.thread.history_cursor),
+                )
+              }
+              loadingOlder={loadingOlder || historyBusy}
+              olderError={historyNeedsRefresh(olderError) ? "" : olderError}
               onLoadOlder={() => void loadOlder(Boolean(olderError))}
               importing={
                 historyBusy ||

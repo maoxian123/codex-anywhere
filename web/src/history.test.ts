@@ -1,7 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { latestHistory, olderHistory } from "./history";
+import {
+  historyErrorText,
+  historyNeedsRefresh,
+  latestHistory,
+  olderHistory,
+} from "./history";
 import type { Item, ThreadDetail } from "./types";
+
+test("history snapshot failures request a new tail while unrelated failures retain their details", () => {
+  for (const message of [
+    "History changed while loading this page; refresh the latest page",
+    "History changed since this cursor was created; refresh the latest page",
+    "Native history page anchor is no longer cached; refresh the latest page",
+    "历史已更新，请刷新最近消息后继续加载",
+    "上次历史读取失败或结果未知，请显式手动重试：History changed while loading this page; refresh the latest page",
+  ]) {
+    assert.equal(historyNeedsRefresh(message), true);
+    assert.match(historyErrorText(message), /请刷新最新历史/);
+  }
+  for (const message of ["Permission denied", "指令执行结果未知", ""]) {
+    assert.equal(historyNeedsRefresh(message), false);
+    assert.equal(historyErrorText(message), message);
+  }
+  assert.equal(historyNeedsRefresh(null), false);
+});
 
 const item = (id: string, position: number, text = id): Item => ({
   id,

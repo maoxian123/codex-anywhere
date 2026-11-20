@@ -313,6 +313,14 @@ Cursor tokens are opaque, bounded continuations containing native cursor, genera
 
 Threads add `history_cursor` (string/null), `history_complete` (boolean) and `history_generation` (string/null). `history_loaded:true` means a usable cached page exists; `history_complete:true` means the native continuation has reached its end. Successful older pages update `history_synced_at` while retaining their generation. Later catalog versions/fingerprints remain stale rather than being overwritten by an older snapshot. Native/history fingerprints are internal and are not exposed in the browser thread DTO. Late old pages cannot replace newer pages, a full import or a newly started live turn.
 
+When a page fails because the native snapshot changed or its cached anchor is gone,
+the browser offers an explicit latest-history refresh, including after reopening
+a thread with a persisted snapshot error. That action posts `{retry:true}` without
+the expired cursor, then waits for a new `history_generation` before replacing the
+page cache and offering older-page navigation again. It does not automatically
+retry failed or unknown commands; continued native writes may require waiting
+until the conversation settles before refreshing.
+
 `GET /api/threads/<id>?item_limit=100[&before_position=N]` pages only the hub's cached items. If more native history is needed, POST the stored `history_cursor`, wait for cursor advancement or `history_complete`, then read cached pages again. Paginated GET responses use compact item DTOs: image data URLs are replaced by attachment placeholders and oversized text/structures are bounded, setting `data._truncated:true` when necessary. Original data remains stored. `GET /api/threads/<thread_id>/items/<hub_item_id>` -> `{item}` returns one complete authenticated raw item. The no-pagination GET response remains compatible with older clients. Task-reference navigation can follow existing cached/native pages until the source item is available.
 
 ### Background project inventory

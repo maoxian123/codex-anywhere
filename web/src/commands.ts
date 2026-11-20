@@ -71,11 +71,12 @@ export async function remoteCommand<T>(
   return waitForCommand<T>(command, signal);
 }
 
-/** Command completion means the node journal is written; import projection may lag. */
+/** Command completion means the node journal is written; history projection may lag. */
 export async function waitForImportedThread(
   id: string,
   signal?: AbortSignal,
   timeout = 180000,
+  previousGeneration?: string | null,
 ): Promise<Thread> {
   const deadline = Date.now() + timeout;
   while (true) {
@@ -99,7 +100,9 @@ export async function waitForImportedThread(
       );
     if (
       detail.thread.history_loaded === true &&
-      detail.thread.status !== "importing"
+      detail.thread.status !== "importing" &&
+      (previousGeneration === undefined ||
+        (detail.thread.history_generation ?? null) !== previousGeneration)
     )
       return detail.thread;
     if (Date.now() >= deadline)

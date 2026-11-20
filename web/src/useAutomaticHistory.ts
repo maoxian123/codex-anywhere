@@ -81,8 +81,24 @@ export function useAutomaticHistory({
         );
         if (controller.signal.aborted) return;
         if (result.command) {
-          await waitForCommand(result.command, controller.signal);
-          await waitForImportedThread(thread.id, controller.signal);
+          const page = await waitForCommand<{ generation?: string } | null>(
+            result.command,
+            controller.signal,
+          );
+          if (
+            result.command.kind === "thread.history" &&
+            thread.history_generation &&
+            page?.generation === thread.history_generation
+          )
+            throw new Error("更早历史正在由其他页面同步，请稍后重试历史读取。");
+          await waitForImportedThread(
+            thread.id,
+            controller.signal,
+            undefined,
+            result.command.kind === "thread.history"
+              ? (thread.history_generation ?? null)
+              : undefined,
+          );
         }
         if (!controller.signal.aborted && currentId.current === thread.id)
           await refresh(thread.id);
